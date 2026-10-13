@@ -1,4 +1,4 @@
-"""``vox`` command line: convert | models | bench | env (run / calibrate / devices come later).
+"""``vox`` command line: run | devices | convert | models | bench | env (calibrate comes later).
 
 Heavy imports happen inside the handlers so ``vox --help`` stays instant.
 """
@@ -8,13 +8,22 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODELS = REPO_ROOT / "models"
 DEFAULT_PROFILE = REPO_ROOT / "profiles" / "default"
-LATER = {"run": "Phase 3 (live audio)", "devices": "Phase 3 (live audio)",
-         "calibrate": "Phase 5 (calibration)"}
+LATER = {"calibrate": "Phase 5 (calibration)"}
+
+RUN_HELP = """\
+live commands (type and press Enter):
+  pitch N | index X | protect X | envelope X   hot parameters, applied before the next hop
+  gate on|off                                  silence gate
+  hop MS | extra MS | crossfade MS | f0 rmvpe|fcpe   restart-class: brief gated pause
+  stats                                        print one stats line now
+  q                                            stop"""
 
 
 def _add_engine_args(p: argparse.ArgumentParser) -> None:
@@ -34,6 +43,21 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--crossfade-ms", type=float, default=None)
     p.add_argument("--extra-ms", type=float, default=None)
     p.add_argument("--hubert-fp16", action="store_true")
+    p.add_argument("--graphs", choices=("on", "off", "auto"), default=None,
+                   help="CUDA graphs: on (fail if capture fails), off (eager), auto "
+                        "(capture, verify against eager, else eager; the default)")
+    p.add_argument("--gate", choices=("on", "off"), default=None,
+                   help="silence gate (energy + Silero VAD, hangover from the profile)")
+
+
+def gate_config(profile, args: argparse.Namespace):
+    """``GateConfig`` from calibration.json, with the CLI on/off switch."""
+    from vox.engine.gate import GateConfig
+
+    cal = profile.calibration
+    return GateConfig(enabled=args.gate != "off", threshold_dbfs=cal.silence_gate_dbfs,
+                      vad_threshold=cal.vad.threshold, hangover_ms=cal.vad.release_ms,
+                      use_vad=cal.vad.engine == "silero")
 
 
 def resolve(args: argparse.Namespace):
@@ -44,6 +68,7 @@ def resolve(args: argparse.Namespace):
     from vox.models.registry import ModelRegistry
 
     profile = load_profile(args.profile)
+    args.gate_config = gate_config(profile, args)
     config = ModelRegistry(args.models_dir).config(args.model)
     params = resolve_runtime_params(profile, config, vars(args))
     shape = profile.runtime.shape()
@@ -53,6 +78,8 @@ def resolve(args: argparse.Namespace):
     precision = profile.runtime.precision()
     if args.hubert_fp16:
         precision = dataclasses.replace(precision, hubert_fp16=True)
+    if getattr(args, "graphs", None):
+        precision = dataclasses.replace(precision, graphs=args.graphs)
     return shape, params, precision
 
 
@@ -62,7 +89,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
 
     shape, params, precision = resolve(args)
     summary = convert_file(args.input, args.output, args.models_dir, args.model, args.mode,
-                           shape, params, precision, args.device, args.out_sr)
+                           shape, params, precision, args.device, args.out_sr,
+                           gate=args.gate_config)
     print(f"wrote {summary['path']} ({summary['seconds']:.2f} s @ {summary['sr']} Hz, "
           f"mode={args.mode})")
     result = summary.get("result")
@@ -74,8 +102,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
             notes={"overlap": f"{plan.overlap_ms:.0f} ms", "search": f"{plan.search_ms:.0f} ms",
                    "extra": f"{plan.extra_ms:.0f} ms", "f0": params.f0_method},
             alloc=result.alloc, sola_offsets_ms=result.sola_offsets_ms))
-        print(f"RTF {result.rtf:.3f}   algorithmic latency {plan.algorithmic_latency_ms:.0f} ms"
-              f" (hop + overlap + search; device and ring terms come with live audio)")
+        print(f"RTF {result.rtf:.3f}   mode {engine.mode}   algorithmic latency "
+              f"{plan.algorithmic_latency_ms:.0f} ms (hop + overlap + search; device and "
+              f"ring terms come with live audio)")
     return 0
 
 
@@ -123,6 +152,115 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_devices(args: argparse.Namespace) -> int:
+    from vox.audio.devices import format_table, list_devices
+
+    print(format_table(list_devices(None if args.all else args.hostapi)))
+    print("\n* = host API default (input / output). Use the idx with 'vox run --input/--output'.")
+    return 0
+
+
+def _run_command(session, line: str) -> bool:
+    """One typed command. Returns False to stop."""
+    parts = line.strip().split()
+    if not parts:
+        return True
+    cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else None)
+    try:
+        if cmd in ("q", "quit", "exit"):
+            return False
+        if cmd == "stats":
+            print(session.stats_line())
+        elif cmd == "pitch":
+            print("params:", session.set_params(f0_up_key=float(arg)))
+        elif cmd == "index":
+            print("params:", session.set_params(index_rate=float(arg)))
+        elif cmd == "protect":
+            print("params:", session.set_params(protect=float(arg)))
+        elif cmd == "envelope":
+            print("params:", session.set_params(volume_envelope=float(arg)))
+        elif cmd == "unvoiced":
+            print("params:", session.set_params(f0_unvoiced=arg))
+        elif cmd == "gate":
+            print("gate:", session.set_gate(enabled=arg == "on"))
+        elif cmd == "hop":
+            print("shape:", session.set_shape(block_ms=float(arg)))
+        elif cmd == "extra":
+            print("shape:", session.set_shape(extra_ms=float(arg)))
+        elif cmd == "crossfade":
+            print("shape:", session.set_shape(crossfade_ms=float(arg)))
+        elif cmd == "f0":
+            print("shape:", session.set_shape(f0_method=arg))
+        elif cmd in ("help", "?"):
+            print(RUN_HELP)
+        else:
+            print(f"unknown command {cmd!r}; type 'help'")
+    except (TypeError, ValueError) as err:
+        print(f"bad argument: {err}")
+    return True
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from vox.api.control import LiveConfig, LiveSession
+    from vox.profiling.report import write_jsonl
+
+    shape, params, precision = resolve(args)
+    cfg = LiveConfig(model=args.model, models_dir=args.models_dir, shape=shape, params=params,
+                     precision=precision, gate=args.gate_config, input=args.input,
+                     output=args.output, exclusive=args.exclusive,
+                     exclusive_input=args.exclusive_input, callback_ms=args.callback_ms,
+                     fill_target_ms=args.fill_ms, input_file=args.input_file,
+                     loop_file=args.loop_file, device=args.device)
+    session = LiveSession(cfg)
+    session.start()
+    print(RUN_HELP)
+    stop = threading.Event()
+
+    def stdin_loop() -> None:
+        try:
+            for line in sys.stdin:
+                if not _run_command(session, line):
+                    break
+        except (EOFError, ValueError):
+            pass
+        else:
+            stop.set()
+            return
+        stop.set()
+
+    if not args.no_stdin:
+        threading.Thread(target=stdin_loop, name="vox-stdin", daemon=True).start()
+    deadline = time.perf_counter() + args.minutes * 60.0 if args.minutes else None
+    snaps = []
+    try:
+        while not stop.is_set():
+            time.sleep(1.0)
+            snap = session.snapshot()
+            snaps.append(snap)
+            print(session.stats_line(snap), flush=True)
+            if args.stats_log:
+                write_jsonl(args.stats_log, snap)
+            if snap["errors"]:
+                print("errors:", snap["errors"], file=sys.stderr)
+                break
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        session.stop()
+    if snaps:
+        last = snaps[-1]
+        totals = [s["total"]["p99"] for s in snaps if s["total"]["p99"] == s["total"]["p99"]]
+        print(f"\nsession {last['t']:.0f} s: {last['hops']} hops ({last['gated_hops']} gated), "
+              f"underruns {last['underruns']} (status flags {last['status_output_underflow']}),"
+              f" refills {last['underrun_refills']}, drift trims {last['drift_trims']}, input "
+              f"overruns {last['input_overruns']}, rebuilds {last['rebuilds']}; hop p99 over "
+              f"windows: max {max(totals):.1f} ms; latency estimate {last['latency']['total']:.0f}"
+              f" ms")
+    return 0
+
+
 def cmd_later(args: argparse.Namespace) -> int:
     print(f"'vox {args.command}' is not implemented yet: {LATER[args.command]}.",
           file=sys.stderr)
@@ -156,6 +294,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("env", help="print the environment fingerprint")
     p.set_defaults(func=cmd_env)
+
+    p = sub.add_parser("devices", help="list audio devices (WASAPI by default)")
+    p.add_argument("--hostapi", default="Windows WASAPI")
+    p.add_argument("--all", action="store_true", help="every host API")
+    p.set_defaults(func=cmd_devices)
+
+    p = sub.add_parser("run", help="live: microphone -> engine -> output device")
+    _add_engine_args(p)
+    p.add_argument("--input", default=None, help="input device index or name fragment")
+    p.add_argument("--output", default=None, help="output device index or name fragment")
+    p.add_argument("--exclusive", action="store_true",
+                   help="WASAPI exclusive mode on the output stream (~5 ms instead of 22)")
+    p.add_argument("--exclusive-input", action="store_true",
+                   help="WASAPI exclusive on the input too; watch the INPUT RATE warning")
+    p.add_argument("--callback-ms", type=float, default=10.0, help="device block (transport)")
+    p.add_argument("--fill-ms", type=float, default=None,
+                   help="output ring fill target (default: two hops + callback block)")
+    p.add_argument("--minutes", type=float, default=None, help="stop after this long")
+    p.add_argument("--input-file", type=Path, default=None,
+                   help="software microphone: feed this WAV at real-time pace instead")
+    p.add_argument("--loop-file", action="store_true")
+    p.add_argument("--stats-log", type=Path, default=None, help="append 1 Hz snapshots (jsonl)")
+    p.add_argument("--no-stdin", action="store_true", help="do not read commands from stdin")
+    p.set_defaults(func=cmd_run)
 
     for name, phase in LATER.items():
         p = sub.add_parser(name, help=f"(not yet: {phase})")

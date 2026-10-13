@@ -97,3 +97,168 @@ considering 1000 ms extra (bias +0.16 instead of +0.40).
 
 Both renders are written to `out/ab_reference_rvc_webui.wav` and `out/ab_ours_full.wav` for
 the manual listening check.
+
+## 4. Phase 3 reorder (2026-10-13): CUDA graphs first, silence gate second, then live audio
+
+R1/R2 made the roadmap order untenable: eager compute (~40 ms per hop, launch-bound) cannot
+meet any small hop, and the per-stage graph probes said graphs would. So the Phase 6
+capture work moved ahead of live audio, and the Phase 4 gate came with it (it fixes R4 and
+idles the GPU in pauses). Same machine and environment as above.
+
+### 4.1 Deviations
+
+| # | Doc says | What was built | Why |
+|---|---|---|---|
+| D16 | CUDA graphs in Phase 6; capture the *whole* hop as one graph (doc 06 §2.4, doc 12 `graphs.py`) | Phase 3, **per-stage graphs**: resample_in, F0, ContentVec, index, synth, post and SOLA are seven `torch.cuda.CUDAGraph`s replayed in sequence; `graphs: on / off / auto` (auto = capture, verify ten replayed hops against eager on a synthetic voiced signal, else eager with the reason logged) | Whole-hop replay hung on this machine (R2); per-stage replay is what the probes measured. Timers and CUDA events stay outside the graphs (events cannot be captured), so the profiler still reports per stage. |
+| D17 | Hot parameters may skip stages (`index_rate == 0` skips retrieval, `protect >= 0.5` skips the protect blend, `volume_envelope == 1` skips the RMS mix) | The op sequence of a stage depends only on the static configuration (index loaded, extractor present, `f0_unvoiced`). A disabled feature is a numerically exact no-op: `lerp` with weight 0, protect weight 1, RMS exponent 0 | A captured graph is a fixed op sequence. This way every hot parameter is a value in a device scalar and never invalidates a graph; only `f0_unvoiced`, index load/unload and shape changes recapture. |
+| D18 | Decoder noise drawn inside the synthesizer (`torch.randn_like`, upstream) | Pre-filled per hop into two pointer-stable buffers (`noise_z`, `noise_src`) outside any graph; the synthesizer accepts them as optional arguments and draws itself only when they are absent (the full-file path, so the Phase 1 parity holds) | Nothing random may run inside a captured region (the prime suspect for the R2 hang). Statistically identical output. |
+| D19 | `extra = 500 ms` default (Phase 2 provisional) | **1000 ms** | R4: quiet-frame level bias +0.16 vs +0.40 nepers. Under graphs the cost is flat (R5), so the latency/compute argument against it is gone. |
+| D20 | Gate protocol: on close zero the context rings and refill them at onset (doc 03 §5, Applio) | On close: zero the pitch cache and feature buffers, fade the SOLA tail out exactly once (`Sola.drain_step`), emit silence. The 16 kHz context ring is **advanced every closed hop** (resample stage only, ~0.3 ms) instead of being zeroed and refilled | A ring that is always the true recent input can never replay stale speech and is already full at onset, so there is no refill stall and the model sees the same context the full-file render sees. Hangover 200 ms (the profile's 400 ms release became 200, Applio's value). |
+| D21 | Pinned upload with `non_blocking=True` (Phase 2) | Same, but the staging buffer waits on a CUDA event before it is rewritten | Latent race: under graph replay the host launches a hop in ~1 ms, so the next block could overwrite the pinned buffer while the previous DMA was still queued. Found by `test_pitch_cache_matches_full_window_f0` the moment graphs went on. |
+| D22 | `RuntimeProfile.use_cuda_graphs: bool` | `graphs: "auto"` string in the profile and in `PrecisionParams` | Three modes, not two. |
+| D23 | Silero VAD on the hop's 16 kHz window (GPU) | Silero on the **CPU**, on a host-side FIR decimation of the device-rate block, in 512-sample (32 ms) chunks | ~0.3 ms per chunk on this CPU and no GPU sync in the gate; the VAD can lag the hop by at most one hop. |
+| D24 | `api/control.py` minimal start/stop in Phase 3; runtime changes via the Phase 8 API | `LiveSession` with hot params, gate switch and restart-class changes (hop / extra / crossfade / F0 method rebuild in place: drain, replan, recapture, resume); `vox run` reads those commands from stdin | Needed now to exercise the rebuild path; the socket API can wrap the same object later. |
+
+### 4.2 R5. Per-stage graphs: the hop is now GPU-bound at ~16 ms, with no eager tail
+
+`vox bench perf --sweep benchmarks/sweeps/perf_graphs.yaml` (throughput mode, 20 s clip,
+first 50 hops discarded, RMVPE, same process for all eight points):
+
+| hop | extra | mode | total p50 | p95 | p99 | RTF | headroom (hop / p99) |
+|---|---|---|---|---|---|---|---|
+| 20 ms | 500 | eager | 46.2 | 104.9 | 118.4 | 2.82 | 0.17x |
+| 30 ms | 500 | eager | 48.8 | 103.6 | 120.3 | 1.98 | 0.25x |
+| 20 ms | 1000 | eager | 41.7 | 95.3 | 114.0 | 2.53 | 0.18x |
+| 30 ms | 1000 | eager | 42.4 | 91.0 | 97.6 | 1.60 | 0.31x |
+| 20 ms | 500 | **graphs** | **16.9** | 18.3 | **19.1** | 0.85 | 1.04x |
+| 30 ms | 500 | **graphs** | **16.2** | 19.0 | **20.8** | 0.55 | 1.44x |
+| 20 ms | 1000 | **graphs** | **15.3** | 17.5 | **20.7** | 0.78 | 0.96x |
+| 30 ms | 1000 | **graphs** | **15.3** | 17.7 | **20.1** | 0.52 | 1.49x |
+
+- Acceptance for Step 1 (p50 <= 18 ms, p99 <= 25 ms at hop 20-30 ms, extra 1000, RMVPE)
+  is met at every graphed point. The eager tail is gone: p99 - p50 is 2-5 ms instead of
+  50-70 ms.
+- Where the time goes under replay (CUDA events, `vox bench accept --graphs on`, hop 20 ms):
+  RMVPE 7.9 ms, ContentVec 3.0 ms, synth 4.8 ms, SOLA 0.2 ms, resample/index/post < 0.1 ms
+  each: **~16 ms of GPU time per hop**. The host now launches the hop in ~0.6 ms and waits
+  in `download` for the rest. The hop is GPU-bound; the next lever is per-stage GPU time
+  (RMVPE first), not launch count.
+- `pool allocs/hop = 0` under replay (eager: ~1,700). Driver mallocs, reserved growth and
+  live drift stay 0.
+- Replay vs eager from identical state and noise: log-mel L1 0.0006-0.0011 over ten hops,
+  relative RMS difference ~2e-4 (TF32 kernel rounding). The `auto` tolerance is 0.05.
+- Capture costs ~1.2 s (3 warmups + capture for seven stages + the 10-hop verification).
+- Eager in this run is ~20% slower than the Phase 2 table at every stage (46 vs 38 ms p50);
+  the ratio between stages is unchanged, so it is host-side launch cost varying between
+  sessions, not the engine. Eager is the fallback and is not tuned further.
+- At a 20 ms hop the graphed p99 sits at the hop (headroom ~1.0x). Live audio therefore
+  needs the output ring to absorb ~1 hop of jitter at 20 ms, or a 30 ms hop (1.45x).
+- GPU clocks are not the lever (Q16 power-state theory): with the SM clock locked at
+  2000-3090 MHz (`nvidia-smi -lgc`, P1 under load) the graphed hop is 16.3 / 19.1 ms
+  (p50 / p99) against 16.1 / 20.5 unlocked; eager 41.2 / 90.5 against 40.9 / 90.4.
+
+### 4.3 R6. The gate: pauses go quiet, closed hops cost 0.4 ms, transitions are seamless
+
+`vox bench gate` (20 s LibriSpeech clip, hop 20 ms, extra 1000 ms, graphs, gate threshold
+-48 dBFS + Silero 0.5, hangover 200 ms):
+
+| render | pause-region level (input < -48 dBFS) | speech-region level |
+|---|---|---|
+| full-file | -43.1 dBFS | -21.0 dBFS |
+| stream, gate off | -41.6 dBFS (+1.5 dB) | -21.0 dBFS |
+| stream, gate on | -44.9 dBFS (-1.8 dB) | -21.1 dBFS |
+
+- 11.6% of hops closed on this clip, 7 transitions; closed hops cost **0.41 ms host p50**
+  (the 16 kHz ring advance, 0.04 ms of GPU time): the GPU is idle in gated silence.
+- Click ratio at gate transitions 0.00 (edges are smoother than mid-hop audio: the drain
+  fades the SOLA tail out, the onset fades in through the crossfade); hop boundaries 1.01.
+- Speech-frame log-mel distance to the full-file render is identical with and without the
+  gate (0.545). Gating changes nothing while speech is on.
+- The "within +-1 dB of the full-file render" target reads differently on each side of the
+  gate. **Ungated pauses** (within the 200 ms hangover) at extra 1000 ms sit +1.5 dB above
+  the full-file render (R4 measured +2.8 dB at 500 ms). **Gated pauses** are digital
+  silence, so the pause region as a whole lands 1.8 dB *below* the reference. The engine
+  never renders louder than the reference in pauses, which was R4's complaint; the exact
+  1 dB figure is set by how much of a pause the hangover leaves ungated.
+- R4 re-measured with the new engine (`vox bench extra`, hop 20 ms, graphs), level bias in
+  nepers over all frames after 3.1 s: gate off 100/300/500/1000/2500 ms = +1.05 / +0.63 /
+  +0.38 / **+0.13** / -0.12 (Phase 2: +1.06 / +0.65 / +0.40 / +0.16 / -0.09, so graphs and
+  the always-on post chain changed nothing); gate on = +0.32 / +0.01 / -0.15 / **-0.32** /
+  -0.50. Quiet-frame L1 at 1000 ms: 0.731 gate off, 1.342 gate on (zeros vs the reference's
+  noise floor: the metric penalises silence, the ear does not). Speech-frame L1 is 0.540-0.545
+  either way. Hop p50 is 16-17 ms at every extra, as R5 predicts.
+- The default is now extra = 1000 ms with the gate on (D19, D20).
+
+### 4.4 R7. Live audio: 10 minutes, 30,047 hops, zero underruns; the latency budget is in the periphery
+
+`vox run --model base_f0_48k_v2 --input 22 --output 19 --gate off --minutes 10` (Realtek
+microphone -> engine -> Virtual Audio Cable, WASAPI shared, callback 10 ms, hop 20 ms,
+overlap 30, search 10, extra 1000, graphs, fill target 50 ms; gate off so every hop runs
+the model). 600 one-second windows:
+
+| | p50 | p95 | p99 |
+|---|---|---|---|
+| hop compute, median window | 15.7 ms | 16.7 ms | 17.1 ms |
+| hop compute, worst window | 18.4 ms | 22.5 ms | **23.7 ms** |
+
+- **0 output underruns** (ring) and **0 PortAudio status flags** (output underflow, input
+  overflow), 0 refills, 0 drift trims, 0 input overruns, over 30,047 hops. The output ring
+  fill stayed between 20 and 60 ms around its 50 ms target; the two devices did not drift
+  measurably against each other in 10 minutes.
+- Host time per hop is ~0.6 ms of launches plus the wait for the GPU in `download`: the
+  worker thread is idle most of the hop, so the GIL is not a factor at this hop size.
+- The microphone sat at silence during the soak (nobody was speaking; input peak 0.00),
+  which exercises the compute path but not the gate. The gated path is measured in the RTT
+  runs below and in `tests/engine/test_worker.py`.
+- **End-to-end estimate 143-159 ms**, and that is the real finding: hop 20 + compute 17 +
+  output ring 22-39 + SOLA 40 (overlap 30 + search 10) + **devices 44 (PortAudio reports
+  22 ms for each shared-mode WASAPI stream at "low" latency)**. Compute is 12% of it.
+
+### 4.5 R8. Loopback round trip confirms the estimate; exclusive mode and a 20 ms crossfade reach ~90 ms
+
+`scripts/measure_rtt.py` plays eight speech bursts from a file-backed input (perf_counter
+stamped as they enter the input ring), renders to the Virtual Audio Cable and records the
+cable's capture end; round trip = recorded onset - injected onset - recorder input latency.
+
+| configuration | measured median (p95) | engine estimate | delta |
+|---|---|---|---|
+| shared, overlap 30, fill 50 (the soak setup) | **110 ms** (125) | 122 ms | -13 |
+| shared, overlap 20, fill 40 | **88 ms** (114) | 102 ms | -14 |
+| **exclusive**, overlap 20, fill 40 | **72 ms** (96) | 90 ms | -18 |
+
+- The estimate is consistently ~13-18 ms conservative: the output-ring term is the fill
+  *before* the hop is written (the wait of the hop's first sample), and PortAudio's device
+  latency figure is an upper bound. Within the +-15 ms acceptance for the shared-mode runs,
+  2.6 ms outside for exclusive mode.
+- Where the 90 ms target lives: exclusive WASAPI takes the two device buffers from 22 ms
+  each to ~5 ms each (PortAudio reports 10.7 ms for the pair), and overlap 20 instead of 30
+  saves 10 ms at ~1% on the Q7 metric. Compute (16-17 ms) and the hop (20 ms) are now the
+  minority of the budget. The remaining lever is the output fill target (40 ms here, of
+  which ~29 ms is waited on average): it must cover compute p99 (24 ms worst window) plus
+  one callback block; 30 ms is the floor at this hop and GPU.
+- A click burst is not a usable probe through an RVC model with the gate off: the model
+  renders digital silence as a -30 dBFS hiss (R4) and the onset detector cannot find the
+  converted burst reliably. The speech bursts with the gate on are the realistic path and
+  include the gate's own onset lag (one VAD chunk, <= 32 ms, inside the measured numbers).
+- Not measured: a physical microphone's own capture buffer (the file-backed input replaces
+  it). PortAudio reports it as 22 ms shared / ~5 ms exclusive; `vox run` adds it to `dev`.
+
+### 4.6 R9. WASAPI exclusive mode: fine on the cable output, broken on the Realtek microphone
+
+A 2-minute gated soak with `--exclusive` on both streams produced 8,630 hops in 120 s (50/s
+expected) and 1,630 "drift trims". Measured directly with a bare `sounddevice.InputStream`:
+the Realtek microphone opened in exclusive mode at a nominal 48,000 Hz **delivers 72,045
+samples/s** (750 callbacks of 480 frames in 5 s; shared mode: 48,016). The output side of
+the Virtual Audio Cable is correct in both modes (48,138-48,181 samples/s; latency 22.0 ms
+shared, 10.7 ms exclusive) and the microphone's exclusive latency reads 13.0 ms.
+
+| D25 | `--exclusive` meant both streams | `--exclusive` is the **output** stream only; `--exclusive-input` is separate, and the stats line prints `INPUT RATE ... != 48000` whenever the delivered input rate is off by more than 2% | A 1.5x input rate is inaudible in the counters (no flags, no overruns: everything is "working", just at the wrong speed) and only shows as pitch-shifted, time-compressed output. The check is cheap and permanent. |
+
+The RTT table in R8 used a file-backed input, so its exclusive row is unaffected (the
+output path was exclusive). Re-run with the output exclusive and the microphone shared
+(`--exclusive --crossfade-ms 20 --fill-ms 40 --gate on`, 2 minutes): 6,009 hops in 120 s,
+0 underruns, 0 flags, 0 trims; device latency 22.0 in + 10.7 out; estimate 108 ms with the
+gate closed on a silent microphone (the output-ring term reads the full fill target while
+gated). For the microphone the shared-mode 22 ms stands until the
+driver's exclusive format is understood (PortAudio may be opening a different native rate
+and not converting); a USB microphone or ASIO would be the way around it.
