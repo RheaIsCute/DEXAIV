@@ -46,7 +46,7 @@ def _engine(args, registry, cache, shape_kw=None, **param_kw):
 
     shape = dataclasses.replace(defaults.DEFAULT_SHAPE, **(shape_kw or {}))
     params = RuntimeParams(f0_up_key=args.pitch, **param_kw)
-    precision = PrecisionParams(hubert_fp16=args.hubert_fp16)
+    precision = PrecisionParams(hubert_fp16=args.hubert_fp16, graphs=args.graphs)
     return load_engine(args.models_dir, args.model, shape, params, precision,
                        registry=registry, cache=cache)
 
@@ -128,8 +128,12 @@ def cmd_accept(args) -> int:
             and alloc.get("live_drift_bytes", 0) == 0,
     }
     print(report)
-    print(f"\nRTF {result.rtf:.3f}   warmup estimate {engine.warmup_ms:.1f} ms   "
-          f"algorithmic latency {plan.algorithmic_latency_ms:.0f} ms")
+    print(f"\nRTF {result.rtf:.3f}   mode {engine.mode}   eager warmup estimate "
+          f"{engine.warmup_ms:.1f} ms   algorithmic latency {plan.algorithmic_latency_ms:.0f} ms")
+    if engine.graphs.report.verify:
+        v = engine.graphs.report.verify
+        print(f"graph replay vs eager (same state, same noise): log-mel L1 {v['log_mel_l1']:.4f}"
+              f"  rel rms {v['rel_rms_diff']:.2e}  max |diff| {v['max_abs_diff']:.2e}")
     print(f"\nlog-mel L1 after {start_s:.1f} s settle   {'all':>7} {'speech':>7} {'quiet':>7} "
           f"{'bias':>7}")
     for label, m in (("stream vs full", quality), ("full vs full (noise floor)", floor),
@@ -147,6 +151,7 @@ def cmd_accept(args) -> int:
     print(f"  [info] strict equivalence target (<= 1.5x floor): {met} at {ratio:.2f}x; "
           "see docs/research/14 Q14")
     _record("accept", {"model": args.model, "plan": dataclasses.asdict(plan), "rtf": result.rtf,
+                       "mode": engine.mode, "graphs": dataclasses.asdict(engine.graphs.report),
                        "noise_floor": floor, "stream_floor": stream_floor,
                        "quality": quality,
                        "full_click_ratio": full_click, "alloc": alloc,
@@ -168,34 +173,43 @@ def cmd_perf(args) -> int:
     grid = yaml.safe_load(Path(args.sweep).read_text())
     audio, registry, cache = _setup(args)
     rows = []
-    print(f"{'block':>5} {'extra':>5} {'f0':>6} | {'f0':>6} {'embed':>6} {'synth':>6} "
-          f"{'total p50':>9} {'p95':>7} {'p99':>7} | {'RTF':>5} {'headroom':>8}  verdict")
-    for method in grid["f0_method"]:
-        for extra in grid["extra_ms"]:
-            for block in grid["block_ms"]:
-                engine = _engine(args, registry, cache,
-                                 {"block_ms": block, "extra_ms": extra}, f0_method=method)
-                result = StreamSimulator(engine).run(audio)
-                table = stage_table(engine.timers, SKIP)
-                total = table["total"]["host"]
-                room = headroom(engine.plan.block_ms, total["p99"])
-                verdict = "pass" if room >= 1.5 else "marginal" if room >= 1.0 else "fail"
-                p50 = {k: v["host"]["p50"] for k, v in table.items()}
-                print(f"{block:>5} {extra:>5} {method:>6} | {p50['f0']:>6.2f} "
-                      f"{p50['embed']:>6.2f} {p50['synth']:>6.2f} {total['p50']:>9.2f} "
-                      f"{total['p95']:>7.2f} {total['p99']:>7.2f} | {result.rtf:>5.2f} "
-                      f"{room:>7.2f}x  {verdict}")
-                row = {"block_ms": block, "extra_ms": extra, "f0_method": method,
-                       "stage_p50_ms": p50, "total": total, "rtf": result.rtf,
-                       "headroom": room, "verdict": verdict, "mode": "eager"}
-                rows.append(row)
-                _record("perf", {"model": args.model, **row})
-                del engine
-    stable = [r for r in rows if r["verdict"] == "pass"]
-    best = min(stable, key=lambda r: r["block_ms"]) if stable else None
-    print("\nsmallest hop with p99 headroom >= 1.5x (eager, throughput mode): "
-          + (f"{best['block_ms']} ms (extra {best['extra_ms']} ms, {best['f0_method']})"
-             if best else "none in this grid"))
+    # YAML reads bare on/off as booleans; accept both spellings.
+    modes = [{True: "on", False: "off"}.get(m, str(m)) for m in grid.get("graphs", [args.graphs])]
+    print(f"{'block':>5} {'extra':>5} {'f0':>6} {'mode':>6} | {'f0':>6} {'embed':>6} "
+          f"{'synth':>6} {'total p50':>9} {'p95':>7} {'p99':>7} | {'RTF':>5} {'headroom':>8}"
+          "  verdict")
+    for mode in modes:
+        args.graphs = mode
+        for method in grid["f0_method"]:
+            for extra in grid["extra_ms"]:
+                for block in grid["block_ms"]:
+                    engine = _engine(args, registry, cache,
+                                     {"block_ms": block, "extra_ms": extra}, f0_method=method)
+                    result = StreamSimulator(engine).run(audio)
+                    table = stage_table(engine.timers, SKIP)
+                    total = table["total"]["host"]
+                    room = headroom(engine.plan.block_ms, total["p99"])
+                    verdict = "pass" if room >= 1.5 else "marginal" if room >= 1.0 else "fail"
+                    p50 = {k: v["host"]["p50"] for k, v in table.items()}
+                    print(f"{block:>5} {extra:>5} {method:>6} {engine.mode:>6} | "
+                          f"{p50['f0']:>6.2f} {p50['embed']:>6.2f} {p50['synth']:>6.2f} "
+                          f"{total['p50']:>9.2f} {total['p95']:>7.2f} {total['p99']:>7.2f} | "
+                          f"{result.rtf:>5.2f} {room:>7.2f}x  {verdict}", flush=True)
+                    row = {"block_ms": block, "extra_ms": extra, "f0_method": method,
+                           "stage_p50_ms": p50, "total": total, "rtf": result.rtf,
+                           "headroom": room, "verdict": verdict, "mode": engine.mode,
+                           "graphs_requested": mode,
+                           "graphs": dataclasses.asdict(engine.graphs.report)}
+                    rows.append(row)
+                    _record("perf", {"model": args.model, **row})
+                    engine.graphs.release()
+                    del engine
+    for mode in sorted({r["mode"] for r in rows}):
+        stable = [r for r in rows if r["verdict"] == "pass" and r["mode"] == mode]
+        best = min(stable, key=lambda r: r["block_ms"]) if stable else None
+        print(f"\nsmallest hop with p99 headroom >= 1.5x ({mode}, throughput mode): "
+              + (f"{best['block_ms']} ms (extra {best['extra_ms']} ms, {best['f0_method']})"
+                 if best else "none in this grid"))
     return 0
 
 
@@ -221,7 +235,7 @@ def _quality_sweep(args, name: str, points: list[dict], label) -> int:
     print(f"{'point':<26} {'L1 all':>7} {'speech':>7} {'/floor':>6} {'quiet':>6} {'bias':>6} "
           f"{'click':>6} {'offs p50':>8} {'p95':>5} {'hop p50 ms':>10}")
     for point, engine in zip(points, engines):
-        result = StreamSimulator(engine).run(audio, seed=0)
+        result = StreamSimulator(engine).run(audio, seed=0, gate=args.gate == "on")
         quality = _quality(full, result, sr, start_s)
         offsets = result.sola_offsets_ms
         o50, o95 = np.percentile(offsets, [50, 95]) if offsets.size else (np.nan, np.nan)
@@ -231,7 +245,7 @@ def _quality_sweep(args, name: str, points: list[dict], label) -> int:
               f"{quality['bias']:>+6.2f} {quality['click_ratio']:>6.3f} {o50:>8.2f} "
               f"{o95:>5.2f} {total:>10.2f}")
         _record(name, {"model": args.model, **point, "noise_floor": floor, "start_s": start_s,
-                       **quality,
+                       "gate": args.gate, "mode": engine.mode, **quality,
                        "sola_offset_p50_ms": float(o50), "sola_offset_p95_ms": float(o95),
                        "total_p50_ms": total})
     return 0
@@ -269,6 +283,108 @@ def cmd_sola(args) -> int:
     return _quality_sweep(
         args, "sola", points,
         lambda p: f"overlap {p['shape']['crossfade_ms']} ms {p['params']['sola_mode']}")
+
+
+# --------------------------------------------------------------------------------- gate
+
+
+def cmd_gate(args) -> int:
+    """Step 2 acceptance: the silence gate over the LibriSpeech clip.
+
+    Pause-region loudness (input below the gate threshold) of the gated stream vs the
+    full-file render and the ungated stream; clicks at gate transitions; cost of a closed
+    hop (the GPU-idle claim); speech-frame distance unchanged by gating.
+    """
+    from vox.audio.resample import save_audio
+    from vox.offline.convert import render_full
+    from vox.offline.metrics import (
+        boundary_click_ratio,
+        compare,
+        frame_rms_dbfs,
+        transition_click_ratio,
+    )
+    from vox.offline.simulate import StreamSimulator
+    from vox.profiling.report import stage_table
+
+    audio, registry, cache = _setup(args)
+    engine = _engine(args, registry, cache)
+    plan, sr = engine.plan, engine.plan.device_sr
+    gate = engine.gate
+    sim = StreamSimulator(engine)
+    start_s = _settle_s(plan)
+    full = render_full(engine, audio, seed=0)
+    open_result = sim.run(audio, seed=0)
+    gated = sim.run(audio, seed=0, gate=True)
+    gated_table = stage_table(engine.timers, 0)
+
+    n = len(audio)
+    begin = int(start_s * sr)
+    level_in = frame_rms_dbfs(audio[begin:n], sr)
+    pause = level_in < gate.config.threshold_dbfs
+    speech = level_in >= gate.config.threshold_dbfs + 10
+
+    def region_dbfs(x: np.ndarray, mask: np.ndarray) -> float:
+        frames = frame_rms_dbfs(x[begin:n], sr)
+        m = mask[:len(frames)]
+        power = np.mean(10 ** (frames[m] / 10.0)) if m.any() else 1e-12
+        return float(10 * np.log10(power + 1e-12))
+
+    rows = {"full-file": full, "stream (gate off)": open_result.aligned[:n],
+            "stream (gate on)": gated.aligned[:n]}
+    loud = {k: {"pause_dbfs": region_dbfs(v, pause), "speech_dbfs": region_dbfs(v, speech)}
+            for k, v in rows.items()}
+    q_open = compare(full, open_result.aligned[:n], sr, lag_search_ms=15.0, start_s=start_s)
+    q_gated = compare(full, gated.aligned[:n], sr, lag_search_ms=15.0, start_s=start_s)
+
+    toggles = np.flatnonzero(np.diff(gated.gate_open.astype(np.int8)) != 0) + 1
+    # transitions in the emitted stream: a closed hop emits the drain (first) or zeros
+    positions = toggles * plan.block
+    click_transitions = transition_click_ratio(gated.audio, positions, plan.block)
+    click_hops = boundary_click_ratio(gated.audio, plan.block)
+    closed = gated.closed_hop_ms
+    closed_share = 1.0 - gated.gate_open.mean()
+    closed_p50 = float(np.median(closed)) if closed.size else float("nan")
+    gpu_closed = gated_table.get("resample_in", {}).get("gpu", {}).get("p50", float("nan"))
+
+    out = ROOT / "out"
+    save_audio(out / "gate_full.wav", full, sr)
+    save_audio(out / "gate_off.wav", open_result.aligned[:n], sr)
+    save_audio(out / "gate_on.wav", gated.aligned[:n], sr)
+
+    print(f"gate: threshold {gate.config.threshold_dbfs} dBFS, VAD {'on' if gate.vad else 'off'} "
+          f"(thr {gate.config.vad_threshold}), hangover {gate.config.hangover_ms:.0f} ms, "
+          f"extra {plan.extra_ms:.0f} ms, mode {engine.mode}")
+    print(f"hops {gated.hops}: closed {closed_share * 100:.1f}%, transitions "
+          f"{gated.gate_transitions}; closed-hop host p50 {closed_p50:.2f} ms "
+          f"(ring advance GPU p50 {gpu_closed:.2f} ms)")
+    print(f"{'render':<20} {'pause dBFS':>11} {'speech dBFS':>12}")
+    for k, v in loud.items():
+        print(f"{k:<20} {v['pause_dbfs']:>11.1f} {v['speech_dbfs']:>12.1f}")
+    print(f"speech-frame log-mel L1 vs full: gate off {q_open['l1_speech']:.3f}, "
+          f"gate on {q_gated['l1_speech']:.3f}; level bias gate off {q_open['bias']:+.3f}, "
+          f"gate on {q_gated['bias']:+.3f} nepers")
+    print(f"click ratio: gate transitions {click_transitions:.3f}, hop boundaries {click_hops:.3f}")
+    pause_delta = loud["stream (gate on)"]["pause_dbfs"] - loud["full-file"]["pause_dbfs"]
+    checks = {
+        "gate closes and reopens on this clip (>= 2 transitions)": gated.gate_transitions >= 2,
+        "no clicks at gate transitions (ratio <= 1.25)": click_transitions <= 1.25,
+        "no clicks at hop boundaries (ratio <= 1.25)": click_hops <= 1.25,
+        "pause-region loudness not above full-file + 1 dB": pause_delta <= 1.0,
+        "closed hop costs < 2 ms host (GPU idle)": closed_p50 < 2.0,
+        "speech frames unchanged by gating (<= 5%)":
+            q_gated["l1_speech"] <= q_open["l1_speech"] * 1.05,
+    }
+    print()
+    for label, ok in checks.items():
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
+    _record("gate", {"model": args.model, "plan": dataclasses.asdict(plan), "mode": engine.mode,
+                     "gate": dataclasses.asdict(gate.config), "loudness": loud,
+                     "quality_open": q_open, "quality_gated": q_gated,
+                     "click_transitions": click_transitions, "click_hops": click_hops,
+                     "closed_share": closed_share, "closed_hop_p50_ms": closed_p50,
+                     "transitions": gated.gate_transitions,
+                     "checks": {k: bool(v) for k, v in checks.items()}})
+    return 0 if all(checks.values()) else 1
 
 
 # -------------------------------------------------------------------------- graph probe
@@ -345,7 +461,7 @@ def cmd_graph_probe(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="vox bench", description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("accept", "perf", "extra", "sola", "block", "decctx",
-                                            "envelope", "graph-probe"))
+                                            "envelope", "gate", "graph-probe"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--audio", type=Path,
@@ -353,6 +469,10 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--pitch", type=float, default=0.0)
     parser.add_argument("--hubert-fp16", action="store_true")
+    parser.add_argument("--graphs", choices=("on", "off", "auto"), default="auto",
+                        help="CUDA graphs mode for the engine under test")
+    parser.add_argument("--gate", choices=("on", "off"), default="off",
+                        help="quality sweeps (extra, block, ...): run the silence gate too")
     parser.add_argument("--block-ms", type=float, default=20.0)
     parser.add_argument("--stage", choices=("f0", "embed", "synth", "sola", "hop"),
                         default="synth", help="graph-probe: which stage to capture")
@@ -363,7 +483,7 @@ def main() -> int:
         print("warning: no CUDA device; timings describe the CPU fallback", file=sys.stderr)
     handler = {"accept": cmd_accept, "perf": cmd_perf, "extra": cmd_extra, "sola": cmd_sola,
                "block": cmd_block, "decctx": cmd_decctx, "envelope": cmd_envelope,
-               "graph-probe": cmd_graph_probe}[args.command]
+               "gate": cmd_gate, "graph-probe": cmd_graph_probe}[args.command]
     return handler(args)
 
 

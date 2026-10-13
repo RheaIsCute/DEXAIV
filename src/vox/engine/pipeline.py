@@ -4,13 +4,25 @@
            -> ContentVec over the full window -> x2 to 100 Hz -> [index + protect]
            -> tail-only synthesis -> resample to device rate -> post chain
 
-Design constraints, because this function is the future CUDA-graph capture target:
-static shapes, every persistent buffer allocated once in ``realloc`` and never replaced,
-scalars that may change between hops held in 0-dim device tensors, and no ``.item()``,
-``.cpu()`` or boolean-mask indexing anywhere in the hop.
+The hop is a fixed sequence of *stages*. Each stage is a method that reads and writes only
+persistent, pointer-stable buffers owned by this object, so every stage is independently
+capturable as a CUDA graph (``engine/graphs.py``): ``stage_impl[name]`` holds either the
+eager method or a graph replay, and ``process_hop`` does not care which.
+
+Design constraints: static shapes, every persistent buffer allocated once in ``realloc`` and
+never replaced, scalars that may change between hops held in 0-dim device tensors, no
+``.item()``, ``.cpu()`` or boolean-mask indexing anywhere in the hop, and no random draw
+inside a stage (the decoder noise is pre-filled per hop, outside any graph). The op
+sequence of a stage depends only on the static configuration (index loaded, F0 extractor
+present, ``f0_unvoiced``), never on a hot parameter value: ``index_rate = 0`` is a blend
+with weight zero, ``protect >= 0.5`` a protect weight of one, ``volume_envelope = 1`` an
+RMS exponent of zero. All three are exact no-ops numerically.
 """
 
 from __future__ import annotations
+
+import math
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -21,7 +33,13 @@ from vox.config.schemas import RuntimeParams
 from vox.engine.chunker import ChunkPlan
 from vox.engine.postchain import PostChain
 from vox.features.base import Embedder
-from vox.pitch.base import PitchExtractor, postprocess_f0, semitones_to_ratio
+from vox.pitch.base import (
+    COARSE_F0_MAX,
+    COARSE_F0_MIN,
+    PitchExtractor,
+    postprocess_f0,
+    semitones_to_ratio,
+)
 from vox.pitch.pitch_cache import PitchCache
 from vox.profiling.timers import StageTimers
 from vox.retrieval import gpu_knn
@@ -29,8 +47,10 @@ from vox.retrieval.gpu_knn import GpuIndex
 from vox.synthesis.rvc_model import RvcModel
 
 # Stage names shared by the pipeline and whoever drives it (worker or stream simulator).
-STAGES = ("upload", "resample_in", "f0", "embed", "index", "synth", "post", "sola",
+STAGES = ("upload", "gate", "resample_in", "f0", "embed", "index", "synth", "post", "sola",
           "download")
+# The GPU stages of the hop, in execution order. Each is a capture unit for graphs.py.
+GPU_STAGES = ("resample_in", "f0", "embed", "index", "synth", "post")
 
 
 def upsample_features(feats: Tensor, out: Tensor) -> None:
@@ -67,19 +87,25 @@ class HopPipeline:
                  index: GpuIndex | None = None) -> None:
         if model.has_f0 and extractor is None:
             raise ValueError("a pitch-guided model needs a pitch extractor")
-        if plan.model_sr != model.tgt_sr:
-            raise ValueError(f"plan is for {plan.model_sr} Hz, model is {model.tgt_sr} Hz")
-        self.plan = plan
         self.model = model
         self.embedder = embedder
         self.extractor = extractor if model.has_f0 else None
         self.device = torch.device(device)
         self.timers = timers or StageTimers(STAGES, self.device, enabled=False)
         self.index = index
-        self.realloc()
+        self.params = params
+        self._interp = params.f0_unvoiced == "interp"
+        self.set_plan(plan)
         self.set_params(params)
 
     # ------------------------------------------------------------------ control path
+
+    def set_plan(self, plan: ChunkPlan) -> None:
+        """Adopt a chunk plan: reallocate every buffer. Never called while running."""
+        if plan.model_sr != self.model.tgt_sr:
+            raise ValueError(f"plan is for {plan.model_sr} Hz, model is {self.model.tgt_sr} Hz")
+        self.plan = plan
+        self.realloc()
 
     def realloc(self) -> None:
         """Allocate every persistent buffer from the plan. Never called while running."""
@@ -87,6 +113,7 @@ class HopPipeline:
         pin = dev.type == "cuda"
         self._host_in = torch.zeros(p.block, pin_memory=pin)
         self._host_in_np = self._host_in.numpy()
+        self._upload_done = torch.cuda.Event() if pin else None
         self.in_block = torch.zeros(p.block, device=dev)
         self.resampler_in = IncrementalResampler16k(p.device_sr, p.block, dev)
         self.resampler_out = OutputResampler(p.model_sr, p.device_sr, dev)
@@ -96,33 +123,64 @@ class HopPipeline:
         self.window_16k = self.ring_16k[-p.convert_16k:].unsqueeze(0)
         self.f0_tail = self.ring_16k[-p.f0_tail_16k:] if self.extractor else None
         self.pitch_cache = PitchCache(p.convert_frames, p.shift_frames, p.p_len, dev)
+        self.feats50 = torch.zeros(1, p.hubert_frames, self.model.emb_dim, device=dev)
         self.feats = torch.zeros(1, p.p_len, self.model.emb_dim, device=dev)
         self.feats0 = torch.zeros_like(self.feats)
         self.p_len_t = torch.tensor([p.p_len], dtype=torch.long, device=dev)
         self.sid_t = torch.zeros(1, dtype=torch.long, device=dev)
         self.ratio_t = torch.ones((), device=dev)
         self.index_rate_t = torch.zeros((), device=dev)
-        self.protect_t = torch.zeros((), device=dev)
+        self.protect_t = torch.ones((), device=dev)
+        self.f0_min_t = torch.zeros((), device=dev)
+        self.f0_max_t = torch.full((), math.inf, device=dev)
+        latent, source = self.model.noise_shapes(p.p_len, p.skip_head, p.return_length,
+                                                 p.dec_context)
+        self.noise_z = torch.zeros(latent, device=dev)
+        self.noise_src = torch.zeros(source, device=dev) if source is not None else None
+        self.audio_model = torch.zeros(p.decoder_out, device=dev)
         self.out = torch.zeros(p.out_device, device=dev)
         # Device-rate copy of the input under the decoded tail: the RMS-mix reference.
         self.in_tail = torch.zeros(p.out_device, device=dev)
         self._in_tail_tmp = torch.zeros(p.out_device - p.block, device=dev)
         self.post = PostChain(p, dev)
+        self.stage_fns: dict[str, Callable[[], None]] = {
+            "resample_in": self._stage_resample_in,
+            "f0": self._stage_f0,
+            "embed": self._stage_embed,
+            "index": self._stage_index,
+            "synth": self._stage_synth,
+            "post": self._stage_post,
+        }
+        if self.extractor is None:
+            self.stage_fns["f0"] = self._stage_noop
+        # graphs.py swaps entries here for graph replays; process_hop only reads it.
+        self.stage_impl: dict[str, Callable[[], None]] = dict(self.stage_fns)
+        if hasattr(self, "params"):
+            self.set_params(self.params)
 
-    def set_params(self, params: RuntimeParams) -> None:
-        """Apply hot parameters between hops. Scalars go into existing device tensors."""
+    def set_params(self, params: RuntimeParams) -> bool:
+        """Apply hot parameters between hops. Scalars go into existing device tensors.
+
+        Returns True when the change alters a stage's op sequence (``f0_unvoiced``), which
+        means any captured graph of that stage is stale and must be recaptured.
+        """
         self.params = params
         self.ratio_t.fill_(semitones_to_ratio(params.f0_up_key))
-        self.index_rate_t.fill_(params.index_rate)
-        self.protect_t.fill_(params.protect)
+        self.index_rate_t.fill_(params.index_rate if self.index is not None else 0.0)
+        # Upstream disables the protect blend at >= 0.5; a weight of 1 is the same thing.
+        self.protect_t.fill_(params.protect if params.protect < 0.5 else 1.0)
+        # Voicing bounds only act when tighter than the coarse-pitch contract (D9 / doc 08).
+        self.f0_min_t.fill_(params.f0_min_hz if params.f0_min_hz > COARSE_F0_MIN else 0.0)
+        self.f0_max_t.fill_(params.f0_max_hz if params.f0_max_hz < COARSE_F0_MAX else math.inf)
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
-        self._interp = params.f0_unvoiced == "interp"
-        self._use_index = self.index is not None and params.index_rate > 0
-        self._use_protect = self._use_index and self.extractor is not None \
-            and params.protect < 0.5
+        interp = params.f0_unvoiced == "interp"
+        changed = interp != self._interp
+        self._interp = interp
+        return changed
 
     def set_index(self, index: GpuIndex | None) -> None:
+        """Load/unload the retrieval index: changes the index stage's op sequence."""
         self.index = index
         self.set_params(self.params)
 
@@ -133,64 +191,148 @@ class HopPipeline:
         self.in_tail.zero_()
         self.pitch_cache.zero()
         self.out.zero_()
+        self.audio_model.zero_()
 
     def buffers(self) -> dict[str, Tensor]:
-        """Persistent buffers, for pointer-stability checks and future graph cache keys."""
+        """Persistent buffers, for pointer-stability checks and graph cache keys."""
         return {
-            "in_block": self.in_block, "ring_16k": self.ring_16k, "feats": self.feats,
-            "feats0": self.feats0, "pitch": self.pitch_cache.pitch,
-            "pitchf": self.pitch_cache.pitchf, "out": self.out, "in_tail": self.in_tail,
+            "in_block": self.in_block, "ring_16k": self.ring_16k, "feats50": self.feats50,
+            "feats": self.feats, "feats0": self.feats0, "pitch": self.pitch_cache.pitch,
+            "pitchf": self.pitch_cache.pitchf, "noise_z": self.noise_z,
+            "audio_model": self.audio_model, "out": self.out, "in_tail": self.in_tail,
         }
+
+    def state_tensors(self) -> list[Tensor]:
+        """Every tensor a stage mutates: snapshot/restore around graph warmup and capture."""
+        tensors = [self.in_block, self.ring_16k, self.in_tail, self.pitch_cache.pitch,
+                   self.pitch_cache.pitchf, self.feats50, self.feats, self.feats0,
+                   self.audio_model, self.out, self.resampler_in._window]
+        if self.noise_src is not None:
+            tensors.append(self.noise_src)
+        tensors.append(self.noise_z)
+        return tensors
+
+    def static_key(self) -> tuple:
+        """Everything that fixes a stage's op sequence and its memory addresses."""
+        return (
+            tuple(sorted((k, v.data_ptr()) for k, v in self.buffers().items())),
+            self.plan, id(self.model), id(self.embedder), id(self.extractor),
+            id(self.index), self._interp, self.model.decoder_fp16,
+            getattr(self.embedder, "fp16", None), self.post.rms_mix.graph_safe,
+            torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
+            torch.backends.cudnn.benchmark,
+        )
+
+    def stage_graph_safe(self, name: str) -> bool:
+        if name == "f0":
+            return self.extractor is None or getattr(self.extractor, "graph_safe", False)
+        return True
 
     # ---------------------------------------------------------------------- hot path
 
     def upload(self, block: np.ndarray) -> None:
-        """The one host -> device copy of the hop."""
+        """The one host -> device copy of the hop.
+
+        The pinned staging buffer may only be rewritten once the previous asynchronous copy
+        out of it has landed; the event wait makes that explicit instead of relying on the
+        hop's own download sync (under graph replay a hop is launched in ~1 ms of host
+        time, so without the wait the next block would overwrite the staging buffer while
+        the DMA of the previous one is still queued behind the running graphs).
+        """
+        if self._upload_done is not None:
+            self._upload_done.synchronize()
         self._host_in_np[:] = block
         self.in_block.copy_(self._host_in, non_blocking=True)
+        if self._upload_done is not None:
+            self._upload_done.record()
+
+    def fill_noise(self) -> None:
+        """Draw this hop's decoder noise. Outside every graph: RNG never lives in a capture."""
+        self.noise_z.normal_()
+        if self.noise_src is not None:
+            self.noise_src.normal_()
+
+    def _stage_noop(self) -> None:
+        return None
+
+    def _stage_resample_in(self) -> None:
+        p = self.plan
+        fresh = self.resampler_in.push(self.in_block)
+        self._ring_tmp.copy_(self.ring_16k[p.block_16k:])
+        self.ring_16k[:-p.block_16k].copy_(self._ring_tmp)
+        self.ring_16k[-self._fresh_len:].copy_(fresh)
+        self._in_tail_tmp.copy_(self.in_tail[p.block:])
+        self.in_tail[:-p.block].copy_(self._in_tail_tmp)
+        self.in_tail[-p.block:].copy_(self.in_block)
+
+    def _stage_f0(self) -> None:
+        f0 = self.extractor.extract(self.f0_tail)
+        coarse, cont = postprocess_f0(f0, self.ratio_t, self.f0_min_t, self.f0_max_t,
+                                      self._interp)
+        self.pitch_cache.roll_and_write(coarse, cont)
+
+    def _stage_embed(self) -> None:
+        self.feats50.copy_(self.embedder.embed(self.window_16k))
+
+    def _stage_index(self) -> None:
+        protect = self.index is not None and self.extractor is not None
+        if protect:
+            upsample_features(self.feats50, self.feats0)
+        if self.index is not None:
+            gpu_knn.blend(self.feats50, self.index, self.index_rate_t, self.plan.skip_head // 2)
+        upsample_features(self.feats50, self.feats)
+        if protect:
+            protect_blend(self.feats, self.feats0, self.pitch_cache.pitchf_view[0],
+                          self.protect_t, out=self.feats)
+
+    def _stage_synth(self) -> None:
+        p = self.plan
+        pitch = pitchf = None
+        if self.extractor is not None:
+            pitch, pitchf = self.pitch_cache.pitch_view, self.pitch_cache.pitchf_view
+        audio = self.model.infer(self.feats, self.p_len_t, pitch, pitchf, self.sid_t,
+                                 p.skip_head, p.return_length, p.dec_context,
+                                 self.noise_z, self.noise_src)
+        self.audio_model.copy_(audio)
+
+    def _stage_post(self) -> None:
+        self.out.copy_(self.resampler_out.run(self.audio_model))
+        self.post.run(self.out, self.in_tail)
 
     @torch.inference_mode()
     def process_hop(self) -> Tensor:
         """Convert the block in ``in_block``. Returns ``out``: ``block+overlap+search``."""
-        p, timers = self.plan, self.timers
-
+        timers, impl = self.timers, self.stage_impl
         with timers.stage("resample_in"):
-            fresh = self.resampler_in.push(self.in_block)
-            self._ring_tmp.copy_(self.ring_16k[p.block_16k:])
-            self.ring_16k[:-p.block_16k].copy_(self._ring_tmp)
-            self.ring_16k[-self._fresh_len:].copy_(fresh)
-            if self.post.needs_reference:
-                self._in_tail_tmp.copy_(self.in_tail[p.block:])
-                self.in_tail[:-p.block].copy_(self._in_tail_tmp)
-                self.in_tail[-p.block:].copy_(self.in_block)
-
-        pitch = pitchf = None
-        if self.extractor is not None:
-            with timers.stage("f0"):
-                f0 = self.extractor.extract(self.f0_tail)
-                coarse, cont = postprocess_f0(f0, self.ratio_t, self.params.f0_min_hz,
-                                              self.params.f0_max_hz, self._interp)
-                self.pitch_cache.roll_and_write(coarse, cont)
-                pitch, pitchf = self.pitch_cache.pitch_view, self.pitch_cache.pitchf_view
-
+            impl["resample_in"]()
+        with timers.stage("f0"):
+            impl["f0"]()
         with timers.stage("embed"):
-            feats50 = self.embedder.embed(self.window_16k)
-
+            impl["embed"]()
         with timers.stage("index"):
-            if self._use_protect:
-                upsample_features(feats50, self.feats0)
-            if self._use_index:
-                gpu_knn.blend(feats50, self.index, self.index_rate_t, p.skip_head // 2)
-            upsample_features(feats50, self.feats)
-            if self._use_protect:
-                protect_blend(self.feats, self.feats0, pitchf[0], self.protect_t,
-                              out=self.feats)
-
+            impl["index"]()
         with timers.stage("synth"):
-            audio = self.model.infer(self.feats, self.p_len_t, pitch, pitchf, self.sid_t,
-                                     p.skip_head, p.return_length, p.dec_context)
-
+            self.fill_noise()
+            impl["synth"]()
         with timers.stage("post"):
-            self.out.copy_(self.resampler_out.run(audio))
-            self.post.run(self.out, self.in_tail)
+            impl["post"]()
         return self.out
+
+    @torch.inference_mode()
+    def advance_context(self) -> None:
+        """Gate closed: keep the 16 kHz ring and the RMS reference current, nothing else.
+
+        The ring is then the true recent history when the gate reopens, with no stale
+        speech to replay and no refill stall (docs/research/03 §5, Applio protocol).
+        """
+        with self.timers.stage("resample_in"):
+            self.stage_impl["resample_in"]()
+
+    def forget_speech(self) -> None:
+        """Gate closed: drop everything derived from the audio that just ended."""
+        self.pitch_cache.zero()
+        self.feats.zero_()
+        self.feats0.zero_()
+        self.feats50.zero_()
+        self.audio_model.zero_()
+        self.out.zero_()

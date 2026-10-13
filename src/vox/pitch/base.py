@@ -45,7 +45,7 @@ def f0_to_coarse(f0: Tensor) -> Tensor:
     return torch.round(mel.clamp(1.0, 255.0)).long()
 
 
-def clamp_voicing(f0: Tensor, f0_min: float, f0_max: float) -> Tensor:
+def clamp_voicing(f0: Tensor, f0_min: Tensor | float, f0_max: Tensor | float) -> Tensor:
     """Treat estimates outside the calibrated source range as unvoiced.
 
     A frame far outside the speaker's own range is almost always an octave error; calling
@@ -74,15 +74,18 @@ def interp_unvoiced(f0: Tensor) -> Tensor:
     return left + (right - left) * weight.clamp(0.0, 1.0)
 
 
-def postprocess_f0(f0: Tensor, ratio: Tensor | float, f0_min: float = COARSE_F0_MIN,
-                   f0_max: float = COARSE_F0_MAX, interp: bool = False
+def postprocess_f0(f0: Tensor, ratio: Tensor | float, f0_min: Tensor | float = COARSE_F0_MIN,
+                   f0_max: Tensor | float = COARSE_F0_MAX, interp: bool = False
                    ) -> tuple[Tensor, Tensor]:
     """Raw extractor output -> ``(coarse int64, continuous Hz)`` after transposition.
 
     ``ratio`` is ``2 ** (f0_up_key / 12)``; pass a 0-dim device tensor on the hot path so
-    changing the key never changes the op sequence.
+    changing the key never changes the op sequence. The same goes for the voicing bounds:
+    as tensors they are always applied (use 0 / inf to disable), as floats only when
+    tighter than the coarse-pitch contract.
     """
-    if f0_min > COARSE_F0_MIN or f0_max < COARSE_F0_MAX:
+    tensors = isinstance(f0_min, Tensor) or isinstance(f0_max, Tensor)
+    if tensors or f0_min > COARSE_F0_MIN or f0_max < COARSE_F0_MAX:
         f0 = clamp_voicing(f0, f0_min, f0_max)
     if interp:
         f0 = interp_unvoiced(f0)

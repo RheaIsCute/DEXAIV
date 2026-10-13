@@ -1,0 +1,8 @@
+# Step 1 acceptance grid (CUDA graphs vs eager): small hops, the two EXTRA candidates
+# (500 ms = Phase 2 default, 1000 ms = the R4 recommendation), RMVPE. Each point runs once
+# per graphs mode; "on" fails loudly if capture fails, "off" is the eager baseline.
+# (Quoted: bare on/off are YAML booleans.)
+block_ms: [20, 30]
+extra_ms: [500, 1000]
+f0_method: [rmvpe]
+graphs: ["off", "on"]

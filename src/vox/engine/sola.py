@@ -9,7 +9,14 @@ then crossfades the first ``overlap`` samples against that tail with sin^2 / cos
 emits ``block`` samples and saves the next ``overlap`` as the new tail.
 
 The offset never leaves the device: it is applied with ``index_select`` on a tensor index,
-so the hop has no ``.item()`` sync and the stage is CUDA-graph capturable.
+so the hop has no ``.item()`` sync and the stage is CUDA-graph capturable. ``stitch`` runs
+``_impl``, which graphs.py may replace with a graph replay of ``_stitch_eager``.
+
+Gate protocol hooks (docs/research/03 §5, Applio): ``begin_drain`` / ``drain_step`` fade
+the saved tail out over exactly one overlap when the gate closes; ``zero`` forgets it. A
+zero tail makes the next hop fade in from silence through the ordinary crossfade, which is
+the onset fade (the crossfade windows carry the ramp across hop boundaries even when the
+overlap is longer than the hop).
 """
 
 from __future__ import annotations
@@ -47,10 +54,13 @@ class Sola:
         self.out = self._aligned[:self.block]  # stable view: the hop's emitted samples
         self.offset_hist = torch.zeros(self.search + 1, dtype=torch.long, device=device)
         self._one = torch.ones(1, dtype=torch.long, device=device)
+        self._drain_out = torch.zeros(self.block, device=device)
+        self._drain_pos = n  # == overlap: nothing left to drain
         if mode == "pv":
             self._pv_window = torch.sqrt(self.fade_out * self.fade_in)
             self._pv_bins = 2 * math.pi * torch.arange(n // 2 + 1, device=device)
             self._pv_time = torch.arange(n, device=device).unsqueeze(-1) / n
+        self._impl = self._stitch_eager
 
     def find_offset(self, infer: Tensor) -> Tensor:
         """0-dim device tensor: the best alignment offset in ``[0, search]``."""
@@ -62,6 +72,9 @@ class Sola:
     @torch.inference_mode()
     def stitch(self, infer: Tensor) -> Tensor:
         """``[block + overlap + search]`` -> ``[block]`` (a view valid until the next call)."""
+        return self._impl(infer)
+
+    def _stitch_eager(self, infer: Tensor) -> Tensor:
         offset = self.find_offset(infer)
         torch.add(self._base, offset, out=self._index)
         torch.index_select(infer, 0, self._index, out=self._aligned)
@@ -94,6 +107,45 @@ class Sola:
         resynth = (magnitude * glide).sum(-1) * self._pv_window / n
         return prev * self.fade_out**2 + new * self.fade_in**2 + resynth
 
+    # ------------------------------------------------------------------ gate protocol
+
+    def begin_drain(self) -> None:
+        """Gate just closed: the saved tail will be faded out over the coming hops."""
+        self._drain_pos = 0
+
+    @property
+    def draining(self) -> bool:
+        return self._drain_pos < self.overlap
+
+    @torch.inference_mode()
+    def drain_step(self) -> Tensor:
+        """One hop of the fade-out of the saved tail; silence once it is spent.
+
+        The saved tail is the natural continuation of the last emitted sample, so fading it
+        to zero over one overlap is a click-free ending. Eager (a handful of kernels, only
+        on the hops right after a gate close).
+        """
+        out = self._drain_out
+        out.zero_()
+        pos = self._drain_pos
+        n = min(self.block, self.overlap - pos)
+        if n > 0:
+            torch.mul(self.buffer[pos:pos + n], self.fade_out[pos:pos + n], out=out[:n])
+            self._drain_pos = pos + n
+            if self._drain_pos >= self.overlap:
+                self.buffer.zero_()
+        return out
+
+    def zero(self) -> None:
+        """Forget the saved tail: the next hop fades in from silence."""
+        self.buffer.zero_()
+        self._drain_pos = self.overlap
+
+    # ----------------------------------------------------------------- control path
+
+    def state_tensors(self) -> list[Tensor]:
+        return [self.buffer, self._aligned, self._index, self.offset_hist]
+
     def offsets_ms(self, device_sr: int):
         """Histogram of chosen offsets, expanded to per-hop values in ms. Control path."""
         import numpy as np
@@ -104,3 +156,4 @@ class Sola:
     def reset(self) -> None:
         self.buffer.zero_()
         self.offset_hist.zero_()
+        self._drain_pos = self.overlap

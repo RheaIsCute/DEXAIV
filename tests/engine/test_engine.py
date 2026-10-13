@@ -187,6 +187,54 @@ def test_40k_model_resamples_to_the_device_rate(device, cache, clip_48k):
     assert boundary_click_ratio(result.audio, plan.block) < 1.3
 
 
+@pytest.mark.gpu
+def test_graph_replay_matches_eager_and_removes_pool_allocations(engine, clip_48k):
+    """Graphs are the default fast path: the engine must be replaying, the replayed stream
+    must match an eager stream of the same seed, and the hop must allocate nothing."""
+    from vox.engine.pipeline import GPU_STAGES
+
+    assert engine.mode == "graphs", engine.graphs.report
+    assert set(engine.graphs.report.stages) >= set(GPU_STAGES) | {"sola"}
+    assert engine.graphs.report.verify["passed"]
+    sim = StreamSimulator(engine)
+    graphed = sim.run(clip_48k[: 4 * SR], seed=3)
+    assert graphed.alloc["pool_allocs_per_hop"] == 0
+    engine.graphs.release()
+    try:
+        assert engine.mode == "eager"
+        eager = sim.run(clip_48k[: 4 * SR], seed=3)
+    finally:
+        engine.graphs.capture()
+    assert engine.mode == "graphs"
+    distance = compare(eager.audio, graphed.audio, SR, start_s=1.5)
+    # same seed, same noise draws, same state: only kernel-level rounding differs
+    assert distance["l1"] < 0.05, distance
+
+
+def test_gate_streams_speech_silence_speech_without_clicks(engine, clip_48k):
+    """speech -> 1.5 s silence -> speech through the real engine with the gate on: the gate
+    must close and reopen, transitions must be click-free, and closed hops must be cheap."""
+    from vox.offline.metrics import transition_click_ratio
+
+    plan = engine.plan
+    speech = clip_48k[: 3 * SR]
+    audio = np.concatenate([speech, np.zeros(int(1.5 * SR), np.float32), speech])
+    result = StreamSimulator(engine).run(audio, gate=True)
+    assert result.gate_transitions >= 2, result.gate_transitions
+    closed = ~result.gate_open
+    assert closed.sum() >= 40  # most of the 1.5 s of silence (75 hops) minus the hangover
+    toggles = np.flatnonzero(np.diff(result.gate_open.astype(np.int8)) != 0) + 1
+    ratio = transition_click_ratio(result.audio, toggles * plan.block, plan.block)
+    assert ratio < 1.25, f"click ratio at gate transitions {ratio:.2f}"
+    assert boundary_click_ratio(result.audio, plan.block) < 1.25
+    # silence really is silence once the drain is over
+    silent_hops = np.flatnonzero(closed)[3:-1]
+    for h in silent_hops[:10]:
+        assert np.abs(result.audio[h * plan.block:(h + 1) * plan.block]).max() == 0.0
+    # a closed hop only advances the 16 kHz ring: far below the cost of a converted hop
+    assert np.median(result.closed_hop_ms) < 2.0, np.median(result.closed_hop_ms)
+
+
 def test_hot_params_apply_between_hops_without_reallocating(engine, clip_48k):
     pipeline, plan = engine.pipeline, engine.plan
     pointers = {k: v.data_ptr() for k, v in pipeline.buffers().items()}
