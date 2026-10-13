@@ -1,0 +1,6 @@
+# Text to speech for `vox say` (optional; install on top of runtime.txt).
+# kokoro-onnx, not the torch `kokoro` package: that one needs misaki, which has no
+# Python 3.13 release (docs/TTS_NOTES.md).
+kokoro-onnx==0.6.1
+onnxruntime==1.31.0
+edge-tts==7.3.1
