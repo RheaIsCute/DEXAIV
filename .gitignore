@@ -1,0 +1,31 @@
+# environments / caches
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# research-phase leftovers (canonical copy lives in docs/research/)
+/docs_research/
+/docs_research.zip
+/00_RESEARCH_INDEX.md
+/12_PROJECT_STRUCTURE.md
+
+# read-only reference clones (consultation only, never imported by src/vox)
+/_refs/
+
+# model weights and other large binaries
+*.pth
+*.pt
+*.bin
+*.index
+*.onnx
+*.safetensors
+models/*/
+!models/README.md
+
+# audio + benchmark artefacts
+benchmarks/corpus/*.wav
+benchmarks/corpus/*.flac
+benchmarks/results/
+out/

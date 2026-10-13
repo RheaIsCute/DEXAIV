@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rvc-vox"
+version = "0.1.0"
+description = "Low-latency real-time RVC voice changer (headless engine)"
+requires-python = ">=3.12"
+# Runtime pins live in requirements/ (torch needs the cu128 index, see scripts/setup_env.ps1).
+dependencies = []
+
+[project.scripts]
+vox = "vox.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "assets: needs downloaded model assets (scripts/fetch_assets.py)",
+    "gpu: needs a CUDA device",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "benchmarks", "scripts"]
+
+# Dependency rule of docs/research/12 §2. tests/unit/test_import_rules.py enforces the same
+# contracts without needing import-linter installed.
+[tool.importlinter]
+root_package = "vox"
+
+[[tool.importlinter.contracts]]
+name = "stage packages never import the engine or the control path"
+type = "forbidden"
+source_modules = ["vox.pitch", "vox.features", "vox.retrieval", "vox.synthesis", "vox.audio"]
+forbidden_modules = ["vox.engine", "vox.offline", "vox.api", "vox.calibration", "vox.cli"]
+
+[[tool.importlinter.contracts]]
+name = "hot path never imports the control path"
+type = "forbidden"
+source_modules = ["vox.engine"]
+forbidden_modules = ["vox.offline", "vox.api", "vox.calibration", "vox.cli", "vox.models"]

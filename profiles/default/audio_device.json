@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "input": {
+    "name": "",
+    "api": "WASAPI",
+    "exclusive": false,
+    "sr": 48000,
+    "channels": 1,
+    "enabled": true
+  },
+  "output": {
+    "name": "",
+    "api": "WASAPI",
+    "exclusive": false,
+    "sr": 48000,
+    "channels": 1,
+    "enabled": true
+  },
+  "monitor": {
+    "name": "",
+    "api": "WASAPI",
+    "exclusive": false,
+    "sr": 48000,
+    "channels": 1,
+    "enabled": false
+  }
+}

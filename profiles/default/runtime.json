@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "gpu": "NVIDIA GeForce RTX 5060 Ti",
+  "block_ms": 20.0,
+  "crossfade_ms": 30.0,
+  "context_extra_ms": 500.0,
+  "sola_search_ms": 10.0,
+  "decoder_context_ms": 0.0,
+  "tf32": true,
+  "hubert_fp16": false,
+  "decoder_fp16": false,
+  "use_cuda_graphs": false,
+  "benchmark_ref": "benchmarks/results/perf.jsonl"
+}

@@ -1,0 +1,5 @@
+# Offline tuning / benchmark only (Phase 5+). Not installed by setup_env.ps1; pin at lock time.
+faster-whisper
+resemblyzer
+praat-parselmouth
+matplotlib

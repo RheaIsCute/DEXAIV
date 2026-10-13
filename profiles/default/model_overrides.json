@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "default_model": "base_f0_48k_v2",
+  "models": {
+    "base_f0_48k_v2": {
+      "f0_up_key": 0.0,
+      "index_rate": 0.0
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "created": "",
+  "source_voice": {
+    "f0_median_hz": 0.0,
+    "f0_p10_hz": 0.0,
+    "f0_p90_hz": 0.0,
+    "f0_p01_hz": 0.0,
+    "f0_p99_hz": 0.0,
+    "voiced_ratio": 0.0,
+    "spectral_tilt_db_per_oct": 0.0
+  },
+  "f0_extractor": {
+    "method": "rmvpe",
+    "f0_min_hz": 50.0,
+    "f0_max_hz": 1100.0,
+    "median_filter_frames": 0,
+    "octave_flip_rate": {}
+  }
+}
