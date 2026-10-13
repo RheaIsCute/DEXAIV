@@ -150,6 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS)
     p.set_defaults(func=cmd_models)
 
+    from vox.tts.cli import add_say_parser
+
+    add_say_parser(sub, DEFAULT_MODELS, DEFAULT_PROFILE)
+
     p = sub.add_parser("bench", help="run the benchmark harness (benchmarks/bench.py)")
     p.add_argument("rest", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_bench)

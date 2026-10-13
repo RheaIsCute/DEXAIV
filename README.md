@@ -62,3 +62,19 @@ Later-phase modules (`audio/streams.py`, `engine/worker.py`, `engine/gate.py`,
 (MIT). The synthesizer and RMVPE networks under `src/vox/synthesis/nets/` and
 `src/vox/pitch/_rmvpe_net.py` are inference-only reimplementations that keep upstream
 parameter names so published checkpoints load unchanged.
+
+## Text to speech (`vox say`)
+
+Speak typed text in a model's voice: a TTS engine renders the text, then the full-file
+converter turns it into the model's voice. Needs `pip install -r requirements/tts.txt`.
+
+```powershell
+vox say "Hello there." --model MyVoice --out out\hello.wav     # kokoro (local) by default
+vox say "Hello there." --model MyVoice --play --device Speakers
+vox say --file script.txt --model MyVoice --backend edge --voice en-US-AriaNeural
+vox say --list-voices --backend kokoro
+```
+
+Without `--pitch` the transposition is measured from the rendered speech and printed.
+Picking a TTS voice already close to the target (a female TTS voice for a female model,
+pitch near 0) usually sounds best. Details are in [docs/TTS_NOTES.md](docs/TTS_NOTES.md).
