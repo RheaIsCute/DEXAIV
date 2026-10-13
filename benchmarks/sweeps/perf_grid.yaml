@@ -1,0 +1,6 @@
+# Phase 2 perf sweep (docs/research/13 Phase 2, open question Q1): eager, throughput mode.
+# Block sizes snap to 10 ms units (engine/chunker.py), so Q1's 16 ms and 32 ms points are
+# covered by 20 and 30.
+block_ms: [10, 20, 30, 50, 100]
+extra_ms: [100, 300, 500]
+f0_method: [rmvpe, fcpe]
