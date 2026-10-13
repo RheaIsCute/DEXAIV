@@ -1,0 +1,202 @@
+"""WAV in -> converted WAV out (docs/research/12 §3.11).
+
+Two modes share the same loaded models:
+
+* ``full`` - the canonical whole-file RVC inference (rvc-webui ``Pipeline.pipeline``):
+  high-pass, reflect padding, segmentation at quiet points, full-context F0. This is the
+  quality reference the streaming engine is measured against.
+* ``stream`` - the realtime engine driven hop by hop by the stream simulator.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+
+from vox.audio.resample import load_audio, resample_array, save_audio
+from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
+from vox.engine.pipeline import protect_blend
+from vox.features.base import Embedder
+from vox.offline.simulate import Engine, StreamSimulator, load_engine
+from vox.pitch.base import PitchExtractor, postprocess_f0, semitones_to_ratio
+from vox.retrieval import gpu_knn
+from vox.retrieval.gpu_knn import GpuIndex
+from vox.synthesis.rvc_model import RvcModel
+
+SR = 16000
+WINDOW = 160
+
+
+@dataclass(frozen=True)
+class SegmentPlan:
+    """Padding / segmentation of the canonical offline pipeline, in seconds."""
+
+    x_pad: float = 1.0  # reflect padding each side of a segment
+    x_query: float = 6.0  # search radius for a quiet cut point
+    x_center: float = 38.0  # nominal segment length
+    x_max: float = 41.0  # files shorter than this are converted in one piece
+
+
+class FullFileConverter:
+    def __init__(self, model: RvcModel, embedder: Embedder,
+                 extractor: PitchExtractor | None, device: torch.device,
+                 index: GpuIndex | None = None, segments: SegmentPlan = SegmentPlan()) -> None:
+        self.model = model
+        self.embedder = embedder
+        self.extractor = extractor if model.has_f0 else None
+        self.device = device
+        self.index = index
+        self.seg = segments
+
+    @classmethod
+    def from_engine(cls, engine: Engine, **kwargs) -> FullFileConverter:
+        """Reuse the models an engine already loaded."""
+        p = engine.pipeline
+        return cls(p.model, p.embedder, p.extractor, engine.device, p.index, **kwargs)
+
+    @torch.inference_mode()
+    def convert(self, audio_16k: np.ndarray, params: RuntimeParams) -> np.ndarray:
+        """Mono 16 kHz in -> mono float32 at the model sample rate."""
+        from scipy import signal
+
+        seg = self.seg
+        t_pad = int(SR * seg.x_pad)
+        t_pad_tgt = int(self.model.tgt_sr * seg.x_pad)
+        peak = float(np.abs(audio_16k).max()) / 0.95
+        audio = (audio_16k / peak if peak > 1 else audio_16k).astype(np.float64)
+        bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=SR)
+        audio = signal.filtfilt(bh, ah, audio).astype(np.float32)
+
+        cuts = self._cut_points(audio)
+        padded = np.pad(audio, (t_pad, t_pad), mode="reflect")
+        wave = torch.from_numpy(padded).to(self.device)
+        pitch = pitchf = None
+        if self.extractor is not None:
+            p_len = len(padded) // WINDOW
+            coarse, cont = postprocess_f0(
+                self.extractor.extract(wave), semitones_to_ratio(params.f0_up_key),
+                params.f0_min_hz, params.f0_max_hz, params.f0_unvoiced == "interp")
+            pitch, pitchf = coarse[:p_len].unsqueeze(0), cont[:p_len].unsqueeze(0)
+
+        pieces: list[torch.Tensor] = []
+        start = 0
+        for cut in cuts:
+            cut = cut // WINDOW * WINDOW
+            end = cut + 2 * t_pad
+            pieces.append(self._segment(wave[start:end + WINDOW], pitch, pitchf,
+                                        start // WINDOW, end // WINDOW, params))
+            start = cut
+        pieces.append(self._segment(wave[start:], pitch, pitchf, start // WINDOW, None, params))
+        out = torch.cat([piece[t_pad_tgt:-t_pad_tgt] for piece in pieces]).cpu().numpy()
+
+        if params.volume_envelope != 1:
+            out = _change_rms(audio, SR, out, self.model.tgt_sr, params.volume_envelope)
+        peak = float(np.abs(out).max()) / 0.99
+        return (out / peak if peak > 1 else out).astype(np.float32)
+
+    def _cut_points(self, audio: np.ndarray) -> list[int]:
+        """Cut long audio at the quietest sample near every ``x_center`` seconds."""
+        seg = self.seg
+        if len(audio) + WINDOW <= int(SR * seg.x_max):
+            return []
+        t_center, t_query = int(SR * seg.x_center), int(SR * seg.x_query)
+        padded = np.abs(np.pad(audio, (WINDOW // 2, WINDOW // 2), mode="reflect"))
+        csum = np.concatenate(([0.0], np.cumsum(padded, dtype=np.float64)))
+        energy = csum[WINDOW:WINDOW + len(audio)] - csum[:len(audio)]
+        cuts = []
+        for t in range(t_center, len(audio), t_center):
+            lo = t - t_query
+            cuts.append(lo + int(np.argmin(energy[lo:t + t_query])))
+        return cuts
+
+    def _segment(self, wave: torch.Tensor, pitch, pitchf, f_start: int, f_end: int | None,
+                 params: RuntimeParams) -> torch.Tensor:
+        feats = self.embedder.embed(wave.unsqueeze(0))
+        if pitch is not None:
+            pitch, pitchf = pitch[:, f_start:f_end], pitchf[:, f_start:f_end]
+        use_index = self.index is not None and params.index_rate > 0
+        use_protect = use_index and pitch is not None and params.protect < 0.5
+        feats0 = feats.clone() if use_protect else None
+        if use_index:
+            gpu_knn.blend(feats, self.index, params.index_rate)
+
+        def to_100hz(x: torch.Tensor) -> torch.Tensor:
+            return F.interpolate(x.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+
+        feats = to_100hz(feats)
+        p_len = min(wave.shape[0] // WINDOW, feats.shape[1])
+        feats = feats[:, :p_len]
+        if pitch is not None:
+            pitch, pitchf = pitch[:, :p_len], pitchf[:, :p_len]
+        if use_protect:
+            feats = protect_blend(feats, to_100hz(feats0)[:, :p_len], pitchf, params.protect)
+        lengths = torch.tensor([p_len], dtype=torch.long, device=self.device)
+        sid = torch.tensor([params.sid], dtype=torch.long, device=self.device)
+        return self.model.infer(feats, lengths, pitch, pitchf, sid)
+
+
+def _rms_frames(audio: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    padded = np.pad(audio.astype(np.float64), (frame // 2, frame // 2))
+    csum = np.concatenate(([0.0], np.cumsum(padded * padded)))
+    starts = np.arange(0, len(padded) - frame + 1, hop)
+    return np.sqrt((csum[starts + frame] - csum[starts]) / frame)
+
+
+def _change_rms(source: np.ndarray, sr_in: int, out: np.ndarray, sr_out: int,
+                rate: float) -> np.ndarray:
+    """Offline loudness-envelope mix: half-second RMS frames, ``rate`` = share of the output."""
+    def envelope(x: np.ndarray, sr: int) -> np.ndarray:
+        rms = _rms_frames(x, sr // 2 * 2, sr // 2)
+        return np.interp(np.linspace(0, len(rms) - 1, len(out)), np.arange(len(rms)), rms)
+
+    rms_in = envelope(source, sr_in)
+    rms_out = np.maximum(envelope(out, sr_out), 1e-6)
+    return out * np.power(rms_in, 1 - rate) * np.power(rms_out, rate - 1)
+
+
+def render_full(engine: Engine, audio: np.ndarray, seed: int | None = 0,
+                params: RuntimeParams | None = None) -> np.ndarray:
+    """Full-file reference render of device-rate ``audio``, returned at the device rate.
+
+    The quality yardstick for the streaming engine: same models, same parameters, whole-file
+    context. Output is trimmed/padded to the input length so the two share a timeline.
+    """
+    plan = engine.plan
+    if seed is not None:
+        torch.manual_seed(seed)
+    out = FullFileConverter.from_engine(engine).convert(
+        resample_array(audio, plan.device_sr, SR), params or engine.params)
+    out = resample_array(out, engine.loaded.model.tgt_sr, plan.device_sr)
+    fitted = np.zeros(len(audio), dtype=np.float32)
+    fitted[:min(len(out), len(audio))] = out[:len(audio)]
+    return fitted
+
+
+def convert_file(src: Path, dst: Path, models_dir: Path, model_name: str, mode: str = "stream",
+                 shape: ShapeParams | None = None, params: RuntimeParams | None = None,
+                 precision: PrecisionParams | None = None, device: str | None = None,
+                 out_sr: int | None = None) -> dict:
+    """Convert one file. Returns a small summary dict (and the engine, for reporting)."""
+    engine = load_engine(models_dir, model_name, shape, params, precision, device,
+                         warmup_hops=5 if mode == "stream" else 0)
+    summary: dict = {"mode": mode, "model": model_name, "engine": engine}
+    if mode == "full":
+        audio, _ = load_audio(src, SR)
+        out = FullFileConverter.from_engine(engine).convert(audio, engine.params)
+        sr = engine.loaded.model.tgt_sr
+    elif mode == "stream":
+        audio, _ = load_audio(src, engine.plan.device_sr)
+        result = StreamSimulator(engine).run(audio)
+        out, sr = result.aligned[:len(audio)], engine.plan.device_sr
+        summary["result"] = result
+    else:
+        raise ValueError(f"mode must be 'full' or 'stream', not {mode!r}")
+    if out_sr and out_sr != sr:
+        out, sr = resample_array(out, sr, out_sr), out_sr
+    save_audio(dst, out, sr)
+    summary.update(seconds=len(out) / sr, sr=sr, path=Path(dst))
+    return summary
