@@ -48,6 +48,27 @@ def test_nothing_imports_ui():
         assert not any(name == "ui" or name.startswith("ui.") for name in imports_of(path)), path
 
 
+def test_ui_reaches_the_engine_only_through_the_api():
+    """``ui/`` is a thin client: of ``vox`` it may import ``vox.api`` and nothing else."""
+    ui = SRC.parents[1] / "ui"
+    sources = sorted(ui.rglob("*.py"))
+    assert sources, "ui/ has no Python sources to check"
+    violations = []
+    for path in sources:
+        for name in imports_of(path):
+            inside_vox = name == "vox" or name.startswith("vox.")
+            if inside_vox and not (name == "vox.api" or name.startswith("vox.api.")):
+                violations.append(f"{path.relative_to(ui.parent)} imports {name}")
+    assert not violations, "\n".join(violations)
+
+
+def test_the_engine_never_imports_the_transport():
+    """The hot path stays free of the HTTP server and the controller (and of ``vox.tts``)."""
+    for path in sorted((SRC / "engine").rglob("*.py")):
+        bad = {n for n in imports_of(path) if n.startswith(("vox.api", "vox.tts", "http"))}
+        assert not bad, f"{path.name} imports {sorted(bad)}"
+
+
 def test_chunker_is_pure_and_audio_stays_light():
     assert not {n for n in imports_of(SRC / "engine" / "chunker.py")
                 if n.split(".")[0] in ("torch", "numpy", "sounddevice")}

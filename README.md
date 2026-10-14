@@ -86,3 +86,23 @@ vox say --list-voices --backend kokoro
 Without `--pitch` the transposition is measured from the rendered speech and printed.
 Picking a TTS voice already close to the target (a female TTS voice for a female model,
 pitch near 0) usually sounds best. Details are in [docs/TTS_NOTES.md](docs/TTS_NOTES.md).
+
+## The window (`vox gui`)
+
+Four screens over the same engine `vox run` drives: Live (start/stop, latency, levels,
+pitch, type-to-speak), Models (import by drag and drop, index per model), Performance
+(per-stage timings, 60 s hop-time chart) and Settings. Needs
+`pip install -r requirements/gui.txt` for its own window; without it the pages open in the
+browser.
+
+```powershell
+vox gui                                  # opens the window; press START to go live
+vox gui --output "Line 1" --start        # pick the output device and go live at once
+vox gui --no-window                      # only the local control API; prints its URL
+```
+
+Typing in the bar on the Live screen speaks the text in the model's voice over the same
+output as the live voice; the microphone is muted while the clip is rendered and played.
+Suppression, headphone monitoring, hop auto-tuning and calibration are shown but not built
+yet. Design, deviations and measured acceptance: [docs/gui/GUI_SPEC.md](docs/gui/GUI_SPEC.md)
+and section 5 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md).

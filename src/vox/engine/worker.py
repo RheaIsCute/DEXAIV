@@ -32,10 +32,13 @@ from vox.config.schemas import RuntimeParams, ShapeParams
 from vox.engine import chunker, warmup
 from vox.engine.gate import GateConfig, GateDecision, SilenceGate
 from vox.engine.graphs import StageGraphs
+from vox.engine.override import ClipOverride
 from vox.engine.pipeline import HopPipeline
 from vox.engine.sola import Sola
 from vox.pitch.base import PitchExtractor
 from vox.profiling.timers import StageTimers
+
+HOLD_CUSHION_S = 0.5  # silence queued while a hold shares the GPU with a clip render
 
 
 @dataclass
@@ -102,6 +105,10 @@ class InferenceWorker(threading.Thread):
         self._seen_underruns = 0
         self.ready = threading.Event()
         self.first_hop = threading.Event()  # set once the first hop is in the output ring
+        self.override = ClipOverride(self.plan.block)  # typed clips over the live voice
+        self.hold = False  # control path: treat every hop as gated (see ``_hop``)
+        self._cushion = 0  # extra silence queued for the duration of a hold, in samples
+        self._fill_before_hold = 0  # output ring fill when the cushion went in
         self._alloc()
 
     # ------------------------------------------------------------------ control path
@@ -118,6 +125,7 @@ class InferenceWorker(threading.Thread):
         self._host_out_np = self._host_out.numpy()
         self._zeros = torch.zeros(block, device=self.pipeline.device)
         self._zeros_np = np.zeros(block, dtype=np.float32)
+        self.override.resize(block)
 
     def apply_params(self, params: RuntimeParams) -> None:
         """Hot parameters: applied before the next hop (single-slot mailbox)."""
@@ -129,6 +137,11 @@ class InferenceWorker(threading.Thread):
     def apply_shape(self, request: ShapeRequest) -> None:
         """Restart-class change: the worker rebuilds between hops (brief gated pause)."""
         self._pending_shape = request
+
+    def play_clip(self, clip: np.ndarray) -> None:
+        """Device-rate mono clip that takes over the output from the next hop; the live
+        voice is faded out for its duration and back in after (engine/override.py)."""
+        self.override.submit(clip)
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -199,6 +212,13 @@ class InferenceWorker(threading.Thread):
             pipeline.upload(self._host_block)
         with timers.stage("gate"):
             decision: GateDecision = gate.decide(self._host_block)
+        if self.hold or self.override.active:
+            # A typed clip is being rendered or is playing: the live voice is silent
+            # anyway, so close it the way the gate would (SOLA tail faded out once, the
+            # context ring kept current) and leave the GPU to the clip. When the hold
+            # ends, speech resumes exactly like a gate onset.
+            decision = GateDecision(False, drain=s.gate_open, rms_dbfs=decision.rms_dbfs,
+                                    vad_prob=decision.vad_prob)
         if decision.speech:
             infer = pipeline.process_hop()
             with timers.stage("sola"):
@@ -232,8 +252,25 @@ class InferenceWorker(threading.Thread):
             self._prefill(self.fill_target - fill_before)
             s.underrun_refills += 1
             fill_before = self.fill_target
+        if self.hold:
+            if not self._cushion and not decision.drain and not sola.draining:
+                # The GPU is about to be shared with a clip render and hops may run late.
+                # Only silence is queued now, so queue more of it: a late hop then delays
+                # silence instead of running the device dry.
+                self._cushion = int(HOLD_CUSHION_S * plan.device_sr)
+                self._fill_before_hold = fill_before
+                self._prefill(self._cushion)
+        elif self._cushion:
+            # Hold over: what is queued is still all silence, so trim back to the fill the
+            # ring had before (never thinner than one hop under the target, where a clip
+            # would start on the edge of an underrun) and the old latency is restored.
+            keep = min(self.fill_target, max(self._fill_before_hold, self.fill_target - block))
+            self.out_ring.drop(max(0, self.out_ring.fill() - keep))
+            self._cushion = 0
+        overriding = self.override.mix(self._host_out_np)
         self.out_ring.write(self._host_out_np)
-        if not decision.speech and fill_before > self.fill_target + block:
+        if (not decision.speech and not overriding and not self.hold
+                and fill_before > self.fill_target + block):
             # Silence is playing: trim clock-drift growth without anyone hearing it.
             self.out_ring.drop(fill_before - self.fill_target)
             s.drift_trims += 1
@@ -242,7 +279,8 @@ class InferenceWorker(threading.Thread):
         if s.hops == 1:
             self.first_hop.set()
         s._sum_in += 1000.0 * backlog / plan.device_sr
-        s._sum_out += 1000.0 * fill_before / plan.device_sr
+        # The hold cushion is silence that is taken back out: it is not latency.
+        s._sum_out += 1000.0 * max(0, fill_before - self._cushion) / plan.device_sr
         s._n += 1
         timers.counters.output_underruns = self.out_ring.underruns
         timers.counters.input_overflows = self.in_ring.overruns

@@ -164,29 +164,41 @@ def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
     rendered = render_tts(backend, pieces)
 
     engine = load_engine(models_dir, model_name, None, params, precision, device, warmup_hops=0)
-    converter = FullFileConverter.from_engine(engine)
+    result = convert_rendered(FullFileConverter.from_engine(engine), engine.device,
+                              engine.loaded.model.tgt_sr, rendered, engine.params, pitch,
+                              target_f0, seed)
+    if out is not None:
+        save_audio(out, result.audio, result.sr)
+        result.path = Path(out)
+    return result
+
+
+def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int,
+                     rendered: list[np.ndarray], params: RuntimeParams,
+                     pitch: float | None = None, target_f0: float = DEFAULT_TARGET_F0_HZ,
+                     seed: int | None = 0) -> SayResult:
+    """Convert rendered 16 kHz TTS pieces with an already loaded converter.
+
+    The half of ``speak`` that needs the models; the control API calls it with the live
+    engine's converter so a typed clip uses the voice that is already loaded.
+    """
     measured = 0.0
     auto = pitch is None
     if auto:
         if converter.extractor is None:  # a model without F0 conditioning cannot transpose
             pitch = 0
         else:
-            measured = median_voiced_f0(converter.extractor, rendered, engine.device)
+            measured = median_voiced_f0(converter.extractor, rendered, device)
             pitch = auto_pitch(measured, target_f0)
-    params = dataclasses.replace(engine.params, f0_up_key=float(pitch))
+    params = dataclasses.replace(params, f0_up_key=float(pitch))
 
     converted = []
     for audio in rendered:
         if seed is not None:
             torch.manual_seed(seed)
         converted.append(converter.convert(audio, params))
-    sr = engine.loaded.model.tgt_sr
-    result = SayResult(crossfade_concat(converted, sr), sr, float(pitch), auto, measured,
-                       target_f0, len(pieces), sum(len(a) for a in rendered) / SR)
-    if out is not None:
-        save_audio(out, result.audio, sr)
-        result.path = Path(out)
-    return result
+    return SayResult(crossfade_concat(converted, sr), sr, float(pitch), auto, measured,
+                     target_f0, len(rendered), sum(len(a) for a in rendered) / SR)
 
 
 def play(audio: np.ndarray, sr: int, device: str | None = None) -> None:

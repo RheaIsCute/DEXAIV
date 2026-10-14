@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DEXAIV — Settings</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:'Space Grotesk',system-ui,sans-serif;background:#121217}
+a{color:#A9A9B8}a:hover{color:#ECECF1}
+</style>
+</helmet>
+<div style="width:1200px;height:780px;box-sizing:border-box;display:flex;background:#121217;color:#ECECF1;border-radius:12px;overflow:hidden">
+
+  <nav style="width:200px;box-sizing:border-box;padding:20px 12px;display:flex;flex-direction:column;gap:4px;background:#0D0D11;border-right:1px solid #24242D">
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 10px 22px 10px">
+      <div style="width:28px;height:28px;border-radius:8px;background:{{accent}};display:flex;align-items:center;justify-content:center;color:#121217;font-weight:700;font-size:15px">D</div>
+      <div style="font-weight:700;font-size:16px;letter-spacing:0.04em">DEXAIV</div>
+    </div>
+    <a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Live</a>
+    <a href="Models.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Models</a>
+    <a href="Performance.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Performance</a>
+    <a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;background:#24242D;color:#ECECF1;text-decoration:none;font-size:14px;font-weight:500">Settings</a>
+  </nav>
+
+  <main style="flex-grow:1;box-sizing:border-box;padding:28px 32px;display:flex;flex-direction:column;gap:16px;min-width:0">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <h1 style="margin:0;font-size:24px;font-weight:700">Settings</h1>
+        <div style="font-size:13px;color:#8B8B98;margin-top:4px">Profile <span style="color:#ECECF1;font-weight:500">asarii</span> — calibrated Oct 13. Most of this is set for you.</div>
+      </div>
+      <button style="height:42px;padding:0 18px;border-radius:12px;border:1px solid {{accent}};background:transparent;color:{{accent}};font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:14px;cursor:pointer">Recalibrate my voice</button>
+    </div>
+
+    <div style="display:flex;gap:16px;flex-grow:1;min-height:0">
+      <section style="flex:1;background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px;min-width:0">
+        <div style="font-size:13px;color:#8B8B98;font-weight:500;letter-spacing:0.06em;text-transform:uppercase">Audio</div>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:12px;color:#8B8B98">Microphone</span>
+          <select style="background:#121217;border:1px solid #24242D;border-radius:10px;padding:11px 12px;color:#ECECF1;font-family:'Space Grotesk',sans-serif;font-size:14px">
+            <option>Shure MV7 (WASAPI)</option>
+            <option>Realtek Mic Array (WASAPI)</option>
+          </select>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:12px;color:#8B8B98">Output</span>
+          <select style="background:#121217;border:1px solid #24242D;border-radius:10px;padding:11px 12px;color:#ECECF1;font-family:'Space Grotesk',sans-serif;font-size:14px">
+            <option>VB-Cable Input</option>
+            <option>Headphones (Arctis 7)</option>
+          </select>
+        </label>
+        <label style="display:flex;align-items:center;justify-content:space-between;font-size:14px">
+          <span>Monitor in headphones</span>
+          <input type="checkbox" checked style="accent-color:{{accent}};width:18px;height:18px">
+        </label>
+        <label style="display:flex;align-items:center;justify-content:space-between;font-size:14px">
+          <span>Exclusive WASAPI <span style="color:#8B8B98;font-size:12px">(lower latency)</span></span>
+          <input type="checkbox" style="accent-color:{{accent}};width:18px;height:18px">
+        </label>
+        <label style="display:flex;align-items:center;justify-content:space-between;font-size:14px">
+          <span>Silence gate</span>
+          <input type="checkbox" checked style="accent-color:{{accent}};width:18px;height:18px">
+        </label>
+      </section>
+
+      <section style="flex:1;background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px;min-width:0">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:13px;color:#8B8B98;font-weight:500;letter-spacing:0.06em;text-transform:uppercase">Conversion</div>
+          <span style="font-size:11px;color:#58D6A3;background:rgba(88,214,163,0.12);padding:3px 8px;border-radius:999px;font-weight:500">from calibration</span>
+        </div>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="display:flex;justify-content:space-between;font-size:12px;color:#8B8B98">Index rate <span style="font-family:'JetBrains Mono',monospace;color:#ECECF1">0.50</span></span>
+          <input type="range" min="0" max="100" value="50" style="width:100%;accent-color:{{accent}}">
+        </label>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="display:flex;justify-content:space-between;font-size:12px;color:#8B8B98">Protect consonants <span style="font-family:'JetBrains Mono',monospace;color:#ECECF1">0.33</span></span>
+          <input type="range" min="0" max="50" value="33" style="width:100%;accent-color:{{accent}}">
+        </label>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:12px;color:#8B8B98">Pitch tracker</span>
+          <select style="background:#121217;border:1px solid #24242D;border-radius:10px;padding:11px 12px;color:#ECECF1;font-family:'Space Grotesk',sans-serif;font-size:14px">
+            <option>RMVPE (best quality)</option>
+            <option>FCPE (lighter)</option>
+          </select>
+        </label>
+        <div style="font-size:12px;color:#5C5C68;line-height:1.5">Your range is clamped to 71–392 Hz from calibration, so octave errors on low notes are filtered out.</div>
+      </section>
+
+      <section style="flex:1;background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px;min-width:0">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:13px;color:#8B8B98;font-weight:500;letter-spacing:0.06em;text-transform:uppercase">Engine</div>
+          <span style="font-size:11px;color:#8B8B98;background:#24242D;padding:3px 8px;border-radius:999px">advanced</span>
+        </div>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="display:flex;justify-content:space-between;font-size:12px;color:#8B8B98">Hop size <span style="font-family:'JetBrains Mono',monospace;color:#ECECF1">20 ms</span></span>
+          <input type="range" min="10" max="100" value="20" step="10" style="width:100%;accent-color:{{accent}}">
+        </label>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="display:flex;justify-content:space-between;font-size:12px;color:#8B8B98">Context history <span style="font-family:'JetBrains Mono',monospace;color:#ECECF1">1000 ms</span></span>
+          <input type="range" min="500" max="2500" value="1000" step="100" style="width:100%;accent-color:{{accent}}">
+        </label>
+        <label style="display:flex;align-items:center;justify-content:space-between;font-size:14px">
+          <span>CUDA graphs</span>
+          <input type="checkbox" checked style="accent-color:{{accent}};width:18px;height:18px">
+        </label>
+        <label style="display:flex;align-items:center;justify-content:space-between;font-size:14px">
+          <span>Auto-tune hop for headroom</span>
+          <input type="checkbox" checked style="accent-color:{{accent}};width:18px;height:18px">
+        </label>
+        <div style="flex-grow:1"></div>
+        <div style="background:#121217;border:1px solid #24242D;border-radius:10px;padding:12px;font-size:12px;color:#8B8B98;line-height:1.5">Changing hop, context or pitch tracker re-captures the engine: a short mute, no restart.</div>
+      </section>
+    </div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#E38BD0","options":["#E38BD0","#8BD0E3","#C9E86B","#F0A86B"]},"$preview":{"width":1200,"height":780}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#E38BD0' };
+  }
+}
+</script>
+</body>
+</html>

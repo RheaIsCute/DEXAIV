@@ -292,6 +292,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_say_parser(sub, DEFAULT_MODELS, DEFAULT_PROFILE)
 
+    from vox.api.launch import add_gui_parser
+
+    add_gui_parser(sub, REPO_ROOT, DEFAULT_MODELS, DEFAULT_PROFILE)
+
     p = sub.add_parser("bench", help="run the benchmark harness (benchmarks/bench.py)")
     p.add_argument("rest", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_bench)

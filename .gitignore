@@ -29,3 +29,7 @@ benchmarks/corpus/*.wav
 benchmarks/corpus/*.flac
 benchmarks/results/
 out/
+
+# GUI session state (what the user changed in the window) and exported reports
+profiles/*/gui_state.json
+profiles/*/reports/

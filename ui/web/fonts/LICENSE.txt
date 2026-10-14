@@ -1,0 +1,4 @@
+Space Grotesk (Florian Karsten) and JetBrains Mono (JetBrains) are licensed under the
+SIL Open Font License 1.1: https://openfontlicense.org
+Latin subsets, woff2, from the Fontsource packages @fontsource/space-grotesk 5.2.10 and
+@fontsource/jetbrains-mono 5.2.8.

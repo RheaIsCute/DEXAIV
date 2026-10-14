@@ -262,3 +262,61 @@ gate closed on a silent microphone (the output-ring term reads the full fill tar
 gated). For the microphone the shared-mode 22 ms stands until the
 driver's exclusive format is understood (PortAudio may be opening a different native rate
 and not converting); a USB microphone or ASIO would be the way around it.
+
+## 5. Phase 8 (2026-10-13): the control API and the DEXAIV window
+
+Built from `docs/gui/GUI_SPEC.md` and the four mockups in `docs/gui/mockups/`, on top of
+the Phase 3 live engine and the `vox say` TTS path. Measured on the reference machine with
+a looping speech file as the microphone (`--input-file`) and the Virtual Audio Cable as
+the output, unless a row says otherwise.
+
+### 5.1 Deviations
+
+| # | Spec said | What was built | Why |
+|---|---|---|---|
+| G1 | JSON-lines stdio and/or a localhost websocket (doc 12 §3.12, doc 13 Phase 8) | Local **HTTP + server-sent events**, standard library only (`api/server.py`): `POST /api/command`, `GET /api/events`, `POST /api/upload`, bound to 127.0.0.1 on an ephemeral port behind a random token | The UI is HTML, so a browser-native transport needs no client library and no websocket dependency. Commands are request/response and events are one-way, which is exactly SSE. The token keeps other local pages from driving the engine. |
+| G2 | "pywebview or PySide6: decide and justify" | **pywebview** shell (`ui/app.py`) over static pages (`ui/web/`), started by `vox gui` as a **separate process** that is given only the URL | The mockups are plain HTML/CSS, so the screens are the mockups' own markup with the inline styles lifted into theme variables; Qt would have meant re-drawing them. The window process imports nothing from `vox` (WebView2 renders out of process as well), so the GUI cannot take the engine's GIL. Without pywebview, or with `--browser`, the same pages open in the default browser. |
+| G3 | `EngineController` in `api/control.py` | `api/controller.py` holds `EngineController`; `api/control.py` keeps `LiveSession`, which the controller wraps and `vox run` still uses directly | One object per file; the CLI path is untouched. Slow commands (start, model switch, clip render, import) run in order on one control thread and report through the state document; sliders apply at once. |
+| G4 | "Pitch card: value from the profile" | What the user changes is stored in `profiles/<name>/gui_state.json` (gitignored) and layered over the profile; the calibrated files are never rewritten from the GUI | The "auto · calibrated" badge needs the calibrated value to survive an edit. Until Phase 5 writes a calibration the badge reads "profile default". |
+| G5 | (nothing) | **Every PortAudio call is made on the control thread** (device listing, stream open/close, clip playback), and the state document serves a cached device list | Found the hard way: PortAudio's WASAPI backend sets COM up on the thread that first touches it. With the device list first read on an HTTP thread, opening the output stream from the control thread failed with `PaErrorCode -9999 Unanticipated host error` (the WDM-KS text in the message is stale). It reproduced whenever the state was requested before the first start and never otherwise. |
+| G6 | "Converted mic is muted for the clip's duration" | Muted from the moment the clip's **GPU render starts**: `worker.hold` closes the live voice the way the gate does (SOLA tail faded once, context ring kept current), then `engine/override.py` plays the clip into the same output ring and fades live back in | At hop 20 ms the engine uses ~16.5 of every 20 ms of GPU (R5), so rendering a clip beside an open gate made hops late: **10 underruns over 9 clips** before the hold. The extra mute is the render time, 160-480 ms measured, plus 4 hops for the fade-out to reach the ring. |
+| G7 | (nothing) | While held, the worker queues 0.5 s of extra silence in the output ring and takes it back out when the hold ends; it is excluded from the latency estimate | A held hop still waits on the GPU once (the upload event, D21), so it can run late behind the render's kernels. Only silence is queued then, so a cushion of silence costs nothing audible. With it: **0 underruns over 18 clips** (0.9-7.6 s each), latency back to 120-150 ms afterwards. |
+| G8 | Index loaded lazily, only when `index_rate > 0` (P6) | When the selected model has an index the GUI starts the engine with it loaded even at rate 0 | Otherwise the Index-rate slider would need an engine restart to leave zero. Cost: the k-NN stage runs every hop, 0.4 ms p50 / 0.9 ms p99 for 44k vectors. |
+| G9 | Toggles for Suppression (RNNoise), Monitor in headphones, Auto-tune hop; "Recalibrate my voice" | Shown **disabled** with a "not built into the engine yet" tooltip; the commands answer with that message; Recalibrate says calibration is Phase 5 | None of the four existed in the engine this branch was cut from (`81c4927`). A switch that does nothing would be worse than one that says so. |
+| G10 | "A dropped .pth imports via `vox models import`" | Dropped files are streamed to `POST /api/upload`, then `import_model` calls the same `discovery.import_model`; a `.pth` dropped with exactly one `.index` is staged alone in a folder so the pair is matched | A web page never sees a dropped file's path. Same code as the CLI import from there on. "Browse…" in the Index menu uploads an `.index` into the model's folder the same way. |
+| G11 | Profiler stats as in `LiveSession.snapshot` | Fixed a window bug there (stages the gate skips were measured against the total hop count and dropped out of the snapshot once any hop had been gated) and added per-stage CUDA-event times | Under graphs the host time of a stage is the ~0.05 ms launch of its replay; the Performance bars show device time. |
+| G12 | Mockup copy | "In use" (disabled) instead of a second "Use" on the active card; tags come from real data (in use, test voice, vector count, speakers); all four screens show the nav icons the Live mockup has; headroom is `1 - p99 / hop`; dips in the hop-time chart are windows of gated hops | The mockups show placeholder data. Where a label had no source in the engine it was derived from what the engine does report. |
+
+The mockups reference a `support.js` that was not in the package, so they do not render on
+their own. For the side-by-side comparison they were rendered with a 50-line stand-in
+(template substitution only, values from each mockup's own script).
+
+### 5.2 Acceptance
+
+| # | Check | Result |
+|---|---|---|
+| 1 | `vox gui` opens; Live shows real meters, latency, model | Pass. Meters at 14-15 events/s, profiler at 2/s; latency estimate 121 ms shared mode (hop 20 + ring 27 + compute 16 + SOLA 40 + device 22), 111 ms with the output exclusive. |
+| 2 | Start/stop; pitch, gate threshold, gate toggle, index rate, protect live without dropouts | Pass: 12 changes 0.4 s apart with the gate open, underruns 0 -> 0, no rebuild. Suppression is not built (G9). |
+| 3 | Typed clip over the cable while live | Pass: 18 clips, 0 underruns, no step at either seam above what the speech itself contains in the cable recording; live resumes. The mic is muted 0.25-0.55 s longer than the clip (G6). |
+| 4 | `.pth` + `.index` dropped together | Pass through the upload API with a real pair (54 MB + 132 MB): one card, index paired with 43,857 vectors. The drag gesture itself in the window was not exercised by a human. |
+| 5 | Pitch tracker or hop change re-captures in place | Pass: hop 20 -> 30 -> 20 and RMVPE -> FCPE -> RMVPE, 1.8-2.4 s each, session never restarted. CUDA graphs off/on and exclusive on/off reopen the session (3-5 s). |
+| 6 | CLI unaffected | Pass: after closing the backend, `vox run` on the same model: 451 hops, 0 underruns, p99 16.7 ms. |
+| 7 | Screens match the mockups | Side-by-side captures at 1200x780 under `out/shots/` (`mock-*.png`, `final-*.png`). Layout, spacing, colours and type match; content differs where the mockup shows placeholders (G12). |
+
+GIL check (doc 13): hop p50 / p99 medians over 30 half-second windows were 16.3 / 17.7 ms
+with no UI attached and 16.5 / 18.7 ms with a page attached and rendering (one run each,
+so within the 20% session-to-session swing already noted).
+
+Another session was running GPU jobs on this machine during part of these runs, so the
+timing figures above were not all taken on an otherwise idle GPU.
+
+Tests: `tests/api/` (controller against a fake session, HTTP transport),
+`tests/unit/test_override.py`, and two new import rules (`ui/` reaches `vox` only through
+`vox.api`; the engine never imports the transport or `vox.tts`).
+
+### 5.3 Not verified
+
+- A real microphone through the GUI: every live run used the file-backed input.
+- Listening: clicks and gaps were judged from the cable recording, not by ear.
+- The window itself under long use; headless Chrome rendered the captures.
+- Kokoro's first use after a fresh install (weights download) from inside the GUI.

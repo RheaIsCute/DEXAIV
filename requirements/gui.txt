@@ -1,0 +1,2 @@
+# The DEXAIV window (`vox gui`). Optional: without it the UI opens in the browser.
+pywebview==6.2.1

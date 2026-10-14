@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DEXAIV — Performance</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:'Space Grotesk',system-ui,sans-serif;background:#121217}
+a{color:#A9A9B8}a:hover{color:#ECECF1}
+</style>
+</helmet>
+<div style="width:1200px;height:780px;box-sizing:border-box;display:flex;background:#121217;color:#ECECF1;border-radius:12px;overflow:hidden">
+
+  <nav style="width:200px;box-sizing:border-box;padding:20px 12px;display:flex;flex-direction:column;gap:4px;background:#0D0D11;border-right:1px solid #24242D">
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 10px 22px 10px">
+      <div style="width:28px;height:28px;border-radius:8px;background:{{accent}};display:flex;align-items:center;justify-content:center;color:#121217;font-weight:700;font-size:15px">D</div>
+      <div style="font-weight:700;font-size:16px;letter-spacing:0.04em">DEXAIV</div>
+    </div>
+    <a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Live</a>
+    <a href="Models.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Models</a>
+    <a href="Performance.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;background:#24242D;color:#ECECF1;text-decoration:none;font-size:14px;font-weight:500">Performance</a>
+    <a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Settings</a>
+  </nav>
+
+  <main style="flex-grow:1;box-sizing:border-box;padding:28px 32px;display:flex;flex-direction:column;gap:18px;min-width:0">
+    <div style="display:flex;align-items:flex-end;justify-content:space-between">
+      <div>
+        <h1 style="margin:0;font-size:24px;font-weight:700">Performance</h1>
+        <div style="font-size:13px;color:#8B8B98;margin-top:4px">Live, last 60 s · CUDA graphs on · hop 20 ms</div>
+      </div>
+      <div style="display:flex;gap:24px;font-family:'JetBrains Mono',monospace;text-align:right">
+        <div><div style="font-size:26px;font-weight:600">84<span style="font-size:13px;color:#8B8B98"> ms</span></div><div style="font-size:11px;color:#8B8B98">end-to-end est.</div></div>
+        <div><div style="font-size:26px;font-weight:600;color:#58D6A3">0</div><div style="font-size:11px;color:#8B8B98">underruns</div></div>
+        <div><div style="font-size:26px;font-weight:600">38<span style="font-size:13px;color:#8B8B98"> %</span></div><div style="font-size:11px;color:#8B8B98">headroom</div></div>
+      </div>
+    </div>
+
+    <section style="background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <div style="font-size:13px;color:#8B8B98;font-weight:500;letter-spacing:0.06em;text-transform:uppercase">Per-stage compute, p50</div>
+        <div style="font-size:12px;color:#8B8B98;font-family:'JetBrains Mono',monospace">budget: hop 20.0 ms</div>
+      </div>
+      <sc-for list="{{stages}}" as="s" hint-placeholder-count="5">
+        <div style="display:flex;align-items:center;gap:12px;font-family:'JetBrains Mono',monospace;font-size:12px">
+          <div style="width:88px;color:#A9A9B8">{{s.name}}</div>
+          <div style="flex-grow:1;height:14px;border-radius:7px;background:#24242D;overflow:hidden">
+            <div style="width:{{s.pct}};height:100%;border-radius:7px;background:{{s.color}}"></div>
+          </div>
+          <div style="width:140px;text-align:right;color:#8B8B98">{{s.vals}}</div>
+        </div>
+      </sc-for>
+      <div style="display:flex;align-items:center;gap:12px;font-family:'JetBrains Mono',monospace;font-size:12px;border-top:1px solid #24242D;padding-top:10px;margin-top:2px">
+        <div style="width:88px;font-weight:600;color:#ECECF1">TOTAL</div>
+        <div style="flex-grow:1"></div>
+        <div style="width:140px;text-align:right;font-weight:600">14.9 / 17.2 ms</div>
+      </div>
+    </section>
+
+    <div style="display:flex;gap:16px;flex-grow:1;min-height:0">
+      <section style="flex:3;background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:10px;min-width:0">
+        <div style="font-size:13px;color:#8B8B98;font-weight:500;letter-spacing:0.06em;text-transform:uppercase">Hop time, last 60 s (p50 / p99)</div>
+        <svg role="img" aria-label="Hop compute time over the last sixty seconds, steady around fifteen milliseconds with p99 under eighteen" viewBox="0 0 620 150" style="width:100%;height:150px">
+          <line x1="0" y1="30" x2="620" y2="30" stroke="#E25D5D" stroke-width="1" stroke-dasharray="4 4"/>
+          <text x="6" y="24" fill="#E25D5D" font-size="10" font-family="JetBrains Mono">hop budget 20 ms</text>
+          <polyline fill="none" stroke="#3A3A46" stroke-width="1.5" points="0,52 40,50 80,55 120,49 160,58 200,51 240,53 280,61 320,50 360,52 400,56 440,49 480,54 520,52 560,58 620,51"/>
+          <polyline fill="none" stroke="{{accent}}" stroke-width="2" points="0,72 40,71 80,73 120,70 160,72 200,71 240,72 280,74 320,70 360,71 400,72 440,70 480,71 520,71 560,72 620,70"/>
+          <text x="560" y="66" fill="{{accent}}" font-size="10" font-family="JetBrains Mono">p50</text>
+          <text x="560" y="46" fill="#8B8B98" font-size="10" font-family="JetBrains Mono">p99</text>
+        </svg>
+      </section>
+      <section style="flex:2;background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:12px;min-width:0">
+        <div style="font-size:13px;color:#8B8B98;font-weight:500;letter-spacing:0.06em;text-transform:uppercase">System</div>
+        <div style="display:flex;flex-direction:column;gap:10px;font-size:13px">
+          <div style="display:flex;justify-content:space-between"><span style="color:#8B8B98">GPU</span><span style="font-family:'JetBrains Mono',monospace">31 % · 1.9 GB VRAM</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:#8B8B98">CPU</span><span style="font-family:'JetBrains Mono',monospace">9 %</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:#8B8B98">Output ring</span><span style="font-family:'JetBrains Mono',monospace">42 ms fill</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:#8B8B98">Gate</span><span style="font-family:'JetBrains Mono',monospace;color:#58D6A3">open</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:#8B8B98">Session</span><span style="font-family:'JetBrains Mono',monospace">01:12:46</span></div>
+        </div>
+        <div style="flex-grow:1"></div>
+        <button style="height:38px;border-radius:10px;border:1px solid #2E2E39;background:transparent;color:#ECECF1;font-family:'Space Grotesk',sans-serif;font-weight:500;font-size:13px;cursor:pointer">Export report</button>
+      </section>
+    </div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#E38BD0","options":["#E38BD0","#8BD0E3","#C9E86B","#F0A86B"]},"$preview":{"width":1200,"height":780}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const a = this.props.accent ?? '#E38BD0';
+    return {
+      accent: a,
+      stages: [
+        { name: 'F0 RMVPE', pct: '37%', color: a, vals: '7.3 / 8.1 ms' },
+        { name: 'ContentVec', pct: '13%', color: a, vals: '2.6 / 3.1 ms' },
+        { name: 'Index kNN', pct: '2%', color: a, vals: '0.3 / 0.5 ms' },
+        { name: 'Synth', pct: '23%', color: a, vals: '4.5 / 5.1 ms' },
+        { name: 'SOLA', pct: '1%', color: a, vals: '0.2 / 0.4 ms' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

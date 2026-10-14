@@ -15,8 +15,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from vox.audio import devices as audio_devices
 from vox.audio.rings import SPSCRing
 from vox.audio.streams import DuplexAudio, FileInput, StreamConfig
@@ -51,6 +49,8 @@ class LiveConfig:
     loop_file: bool = False
     device: str | None = None
     preload_extractors: bool = True  # so a live F0-method switch never loads a model
+    registry: Any = None  # a ModelRegistry to reuse (keeps the model loaded across sessions)
+    cache: dict | None = None  # loaded embedder / extractors / VAD to reuse likewise
 
 
 class LiveSession:
@@ -84,9 +84,10 @@ class LiveSession:
                     self.warnings.append(warning)
                     self.log(f"warning: {warning}")
 
-        cache: dict = {}
+        cache: dict = cfg.cache if cfg.cache is not None else {}
         engine = load_engine(cfg.models_dir, cfg.model, cfg.shape, cfg.params, cfg.precision,
-                             cfg.device, cache=cache, gate=cfg.gate, log=self.log)
+                             cfg.device, registry=cfg.registry, cache=cache, gate=cfg.gate,
+                             log=self.log)
         self.engine = engine
         extractors = {}
         if cfg.preload_extractors and engine.pipeline.extractor is not None:
@@ -186,12 +187,17 @@ class LiveSession:
         timers = e.timers
         plan = w.plan
         w.stats.window()
-        skip = max(0, timers.host.total(timers.index(TOTAL)) - STATS_WINDOW_HOPS)
         stages = {}
         for i, name in enumerate(timers.stages):
-            s = timers.host.summary(i, skip)
+            # Each stage keeps its own count: hops the gate skipped never ran the model
+            # stages, so a window measured in total hops would come up empty for them.
+            s = timers.host.summary(i, max(0, timers.host.total(i) - STATS_WINDOW_HOPS))
             if s.count:
                 stages[name] = {"p50": s.p50, "p95": s.p95, "p99": s.p99}
+                # Device time from CUDA events: under graphs the host only launches a replay.
+                g = timers.gpu.summary(i, max(0, timers.gpu.total(i) - STATS_WINDOW_HOPS))
+                if g.count:
+                    stages[name].update(gpu_p50=g.p50, gpu_p99=g.p99)
         total = stages.get(TOTAL, {"p50": float("nan"), "p95": float("nan"),
                                    "p99": float("nan")})
         health = a.health

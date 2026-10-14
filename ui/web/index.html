@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DEXAIV</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <nav class="rail">
+    <div class="brand">
+      <div class="brand-mark">D</div>
+      <div class="brand-name">DEXAIV</div>
+    </div>
+    <a class="nav-item" data-screen="live" href="#live">
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h3l3-8 4 16 3-8h7"/></svg>
+      Live
+    </a>
+    <a class="nav-item" data-screen="models" href="#models">
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+      Models
+    </a>
+    <a class="nav-item" data-screen="performance" href="#performance">
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 13l3-3 4 4 5-6"/></svg>
+      Performance
+    </a>
+    <a class="nav-item" data-screen="settings" href="#settings">
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6A7 7 0 0 0 5 12a7 7 0 0 0 .1 1.2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 2 1.2L10 21h4l.5-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6A7 7 0 0 0 19 12z"/></svg>
+      Settings
+    </a>
+    <div class="grow"></div>
+    <div class="rail-foot num" id="app-foot"></div>
+  </nav>
+
+  <!-- ================================================================ Live -->
+  <main class="screen" id="screen-live" style="--gap:20px">
+    <div class="row between center">
+      <div class="row center" style="gap:14px">
+        <button class="power" id="power" aria-label="Start or stop live conversion">
+          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path id="power-icon" d=""/></svg>
+          <span id="power-label">START</span>
+        </button>
+        <div class="col" style="gap:2px">
+          <div class="status-line"><span class="dot" id="status-dot"></span><span id="status-title">Stopped</span></div>
+          <div class="sub" id="status-sub"></div>
+        </div>
+      </div>
+      <div class="right">
+        <div class="latency num"><span id="latency">–</span><span class="unit"> ms</span></div>
+        <div class="sub" style="margin-top:4px">end-to-end · <span id="dropouts">0 dropouts</span></div>
+      </div>
+    </div>
+
+    <div class="row" style="gap:16px">
+      <section class="panel flex1 col" style="gap:12px">
+        <div class="row between center">
+          <div class="label">Voice model</div>
+          <a class="link" href="#models">Change</a>
+        </div>
+        <div class="row center" style="gap:12px">
+          <div class="chip chip-lg" id="model-chip">–</div>
+          <div class="minw0">
+            <div class="model-name" id="model-name">No model</div>
+            <div class="sub num" id="model-spec">Import a .pth on the Models screen</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel flex1 col" style="gap:10px">
+        <div class="row between center">
+          <div class="label">Pitch</div>
+          <button class="badge good" id="pitch-badge" title="Back to this value">auto · calibrated</button>
+        </div>
+        <div class="row baseline" style="gap:8px">
+          <div class="big num" id="pitch-value">+0</div>
+          <div class="sub" style="font-size:13px">semitones</div>
+        </div>
+        <label class="field">
+          <span class="sub">Pitch offset</span>
+          <input type="range" id="pitch" min="-12" max="24" step="1" value="0" style="margin-top:6px">
+        </label>
+      </section>
+    </div>
+
+    <section class="panel row" style="gap:24px">
+      <div class="col minw0" style="flex:3;gap:14px">
+        <div class="label">Levels</div>
+        <div class="col num" style="gap:12px;font-size:12px">
+          <div class="row center" style="gap:12px">
+            <div class="meter-name">IN</div>
+            <div class="meter">
+              <div class="meter-fill in" id="meter-in"></div>
+              <div class="meter-tick" id="gate-tick" title="Gate threshold"></div>
+            </div>
+            <div class="meter-value" id="meter-in-db">–</div>
+          </div>
+          <div class="row center" style="gap:12px">
+            <div class="meter-name">OUT</div>
+            <div class="meter"><div class="meter-fill out" id="meter-out"></div></div>
+            <div class="meter-value" id="meter-out-db">–</div>
+          </div>
+        </div>
+        <label class="col" style="gap:5px">
+          <span class="row between sub">Gate threshold <span class="num strong" id="gate-value">-48 dB</span></span>
+          <input type="range" id="gate-threshold" min="-80" max="-20" step="1" value="-48">
+        </label>
+      </div>
+      <div class="col side" style="gap:12px">
+        <label class="toggle"><span>Noise gate</span><input type="checkbox" id="gate-on"></label>
+        <label class="toggle" id="suppression-row"><span>Suppression</span><input type="checkbox" id="suppression"></label>
+        <div class="hint" id="noise-floor"></div>
+      </div>
+    </section>
+
+    <div class="grow"></div>
+
+    <div class="speak">
+      <div class="row center" style="gap:10px">
+        <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8B8B98" stroke-width="2"><path d="M4 7V5h16v2"/><path d="M12 5v14"/><path d="M9 19h6"/></svg>
+        <input type="text" id="speak-text" placeholder="Type instead of talking — Enter sends it as your voice" aria-label="Type to speak" autocomplete="off">
+        <button class="btn-accent" id="speak-go">Speak</button>
+      </div>
+      <div class="speak-caption num">
+        <button class="plain" id="tts-voice" title="Change the TTS voice">voice –</button>
+        <span id="tts-pitch">pitch auto</span>
+        <span class="good-text" id="tts-note">mic muted while it speaks</span>
+        <button class="link plain" id="history-open" style="margin-left:auto">History</button>
+      </div>
+      <div class="popover" id="history" hidden></div>
+      <div class="popover" id="voices" hidden></div>
+    </div>
+
+    <footer class="row center" style="gap:12px;font-size:13px">
+      <a class="device" href="#settings">
+        <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8B8B98" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></svg>
+        <span class="muted">Mic</span><span class="device-name" id="mic-name">–</span>
+      </a>
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#5C5C68" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      <a class="device" href="#settings">
+        <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8B8B98" stroke-width="2"><path d="M3 10v4h4l5 5V5L7 10H3z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>
+        <span class="muted">Out</span><span class="device-name" id="out-name">–</span>
+      </a>
+    </footer>
+  </main>
+
+  <!-- ============================================================== Models -->
+  <main class="screen" id="screen-models" style="--gap:18px" hidden>
+    <div class="row between center">
+      <div>
+        <h1>Models</h1>
+        <div class="lead">Drop a .pth anywhere — version, sample rate and index are detected automatically.</div>
+      </div>
+      <button class="btn-outline" id="import-open">Import…</button>
+      <input type="file" id="import-files" accept=".pth,.index" multiple hidden>
+      <input type="file" id="index-file" accept=".index" hidden>
+    </div>
+
+    <div class="dropzone" id="dropzone">
+      <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
+      <span id="dropzone-text">Drop a <b>.pth</b> — or <b>.pth + .index together</b> and they import as one voice</span>
+    </div>
+
+    <div class="model-grid" id="model-grid"></div>
+
+    <div class="grow"></div>
+    <div class="foot-note" id="models-foot"></div>
+  </main>
+
+  <!-- ========================================================= Performance -->
+  <main class="screen" id="screen-performance" style="--gap:18px" hidden>
+    <div class="row between end">
+      <div>
+        <h1>Performance</h1>
+        <div class="lead" id="perf-lead">Stopped — start the engine to see live numbers</div>
+      </div>
+      <div class="row num right" style="gap:24px">
+        <div><div class="stat"><span id="perf-latency">–</span><span class="unit"> ms</span></div><div class="stat-name">end-to-end est.</div></div>
+        <div><div class="stat" id="perf-underruns">0</div><div class="stat-name">underruns</div></div>
+        <div><div class="stat"><span id="perf-headroom">–</span><span class="unit"> %</span></div><div class="stat-name">headroom</div></div>
+      </div>
+    </div>
+
+    <section class="panel col" style="gap:10px">
+      <div class="row between baseline">
+        <div class="label">Per-stage compute, p50</div>
+        <div class="sub num" id="perf-budget">budget: hop – ms</div>
+      </div>
+      <div class="col" id="stages" style="gap:10px"></div>
+      <div class="stage total num">
+        <div class="stage-name strong">TOTAL</div>
+        <div class="grow"></div>
+        <div class="stage-vals strong" id="perf-total">– / – ms</div>
+      </div>
+    </section>
+
+    <div class="row grow" style="gap:16px;min-height:0">
+      <section class="panel col minw0" style="flex:3;gap:10px">
+        <div class="label">Hop time, last 60 s (p50 / p99)</div>
+        <div class="chart-wrap">
+          <svg id="chart" role="img" aria-label="Hop compute time over the last sixty seconds" viewBox="0 0 620 150" preserveAspectRatio="none">
+            <line x1="0" y1="30" x2="620" y2="30" stroke="#E25D5D" stroke-width="1" stroke-dasharray="4 4" vector-effect="non-scaling-stroke"/>
+            <polyline id="chart-p99" fill="none" stroke="#3A3A46" stroke-width="1.5" vector-effect="non-scaling-stroke" points=""/>
+            <polyline id="chart-p50" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke" points=""/>
+          </svg>
+          <span class="chart-tag num warn-text" id="chart-budget" style="left:6px;top:20%">hop budget – ms</span>
+          <span class="chart-tag num accent-text" id="chart-p50-tag" hidden>p50</span>
+          <span class="chart-tag num muted" id="chart-p99-tag" hidden>p99</span>
+        </div>
+      </section>
+      <section class="panel col minw0" style="flex:2;gap:12px">
+        <div class="label">System</div>
+        <div class="col" style="gap:10px;font-size:13px">
+          <div class="row between"><span class="muted">GPU</span><span class="num" id="sys-gpu">–</span></div>
+          <div class="row between"><span class="muted">CPU</span><span class="num" id="sys-cpu">–</span></div>
+          <div class="row between"><span class="muted">Output ring</span><span class="num" id="sys-ring">–</span></div>
+          <div class="row between"><span class="muted">Gate</span><span class="num" id="sys-gate">–</span></div>
+          <div class="row between"><span class="muted">Session</span><span class="num" id="sys-session">–</span></div>
+        </div>
+        <div class="grow"></div>
+        <button class="btn-outline small" id="export">Export report</button>
+      </section>
+    </div>
+  </main>
+
+  <!-- ============================================================ Settings -->
+  <main class="screen" id="screen-settings" style="--gap:16px" hidden>
+    <div class="row between center">
+      <div>
+        <h1>Settings</h1>
+        <div class="lead" id="profile-lead"></div>
+      </div>
+      <button class="btn-accent-outline" id="calibrate">Recalibrate my voice</button>
+    </div>
+
+    <div class="row grow" style="gap:16px;min-height:0">
+      <section class="panel flex1 col" style="gap:14px">
+        <div class="label">Audio</div>
+        <label class="col" style="gap:6px">
+          <span class="sub">Microphone</span>
+          <select id="mic"></select>
+        </label>
+        <label class="col" style="gap:6px">
+          <span class="sub">Output</span>
+          <select id="out"></select>
+        </label>
+        <label class="toggle" id="monitor-row"><span>Monitor in headphones</span><input type="checkbox" id="monitor"></label>
+        <label class="toggle"><span>Exclusive WASAPI <span class="muted small">(lower latency)</span></span><input type="checkbox" id="exclusive"></label>
+        <label class="toggle"><span>Silence gate</span><input type="checkbox" id="gate-on-2"></label>
+      </section>
+
+      <section class="panel flex1 col" style="gap:14px">
+        <div class="row between center">
+          <div class="label">Conversion</div>
+          <span class="badge good" id="conversion-badge">from calibration</span>
+        </div>
+        <label class="col" style="gap:6px">
+          <span class="row between sub">Index rate <span class="num strong" id="index-rate-value">0.00</span></span>
+          <input type="range" id="index-rate" min="0" max="100" value="0">
+        </label>
+        <label class="col" style="gap:6px">
+          <span class="row between sub">Protect consonants <span class="num strong" id="protect-value">0.33</span></span>
+          <input type="range" id="protect" min="0" max="50" value="33">
+        </label>
+        <label class="col" style="gap:6px">
+          <span class="sub">Pitch tracker</span>
+          <select id="tracker">
+            <option value="rmvpe">RMVPE (best quality)</option>
+            <option value="fcpe">FCPE (lighter)</option>
+          </select>
+        </label>
+        <div class="hint wide" id="clamp-note"></div>
+      </section>
+
+      <section class="panel flex1 col" style="gap:14px">
+        <div class="row between center">
+          <div class="label">Engine</div>
+          <span class="badge">advanced</span>
+        </div>
+        <label class="col" style="gap:6px">
+          <span class="row between sub">Hop size <span class="num strong" id="hop-value">20 ms</span></span>
+          <input type="range" id="hop" min="10" max="100" value="20" step="10">
+        </label>
+        <label class="col" style="gap:6px">
+          <span class="row between sub">Context history <span class="num strong" id="context-value">1000 ms</span></span>
+          <input type="range" id="context" min="500" max="2500" value="1000" step="100">
+        </label>
+        <label class="toggle"><span>CUDA graphs</span><input type="checkbox" id="graphs"></label>
+        <label class="toggle" id="autotune-row"><span>Auto-tune hop for headroom</span><input type="checkbox" id="autotune"></label>
+        <div class="grow"></div>
+        <div class="info">Changing hop, context or pitch tracker re-captures the engine: a short mute, no restart.</div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div class="drop-veil" id="drop-veil" hidden><div>Drop to import</div></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

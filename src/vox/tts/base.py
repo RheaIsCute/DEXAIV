@@ -32,6 +32,10 @@ class TtsBackend(ABC):
         Must stay cheap and offline: it only checks what is installed.
         """
 
+    def load(self) -> None:
+        """Do whatever makes the first ``synthesize`` as fast as the rest. Never downloads;
+        a backend with nothing to preload does nothing."""
+
     @abstractmethod
     def voices(self) -> list[str]:
         """Names accepted as ``voice``."""

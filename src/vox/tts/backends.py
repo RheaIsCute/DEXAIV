@@ -85,19 +85,34 @@ class KokoroBackend(TtsBackend):
         with np.load(self._file("voices-v1.0.bin")) as styles:  # only the small file
             return sorted(styles.files)
 
-    def synthesize(self, text: str, out_wav_path: Path) -> int:
-        from vox.audio.resample import save_audio
-
-        self._require()
+    def _model(self):
         if self._kokoro is None:
             from kokoro_onnx import Kokoro
 
             self._kokoro = Kokoro(str(self._file("kokoro-v1.0.onnx")),
                                   str(self._file("voices-v1.0.bin")))
-        if self.voice not in self._kokoro.get_voices():
+        return self._kokoro
+
+    def load(self) -> None:
+        """Build the ONNX session and run one short sentence (espeak and the graph both
+        initialise lazily). Skipped while the weights are not downloaded yet."""
+        directory = (self.cache_dir or Path()) / "kokoro"
+        if self.unavailable_reason() or not all((directory / f).is_file() for f in KOKORO_FILES):
+            return
+        kokoro = self._model()
+        if self.voice in kokoro.get_voices():
+            kokoro.create("Hi.", voice=self.voice, speed=1.0,
+                          lang=KOKORO_LANGS.get(self.voice[0], "en-us"))
+
+    def synthesize(self, text: str, out_wav_path: Path) -> int:
+        from vox.audio.resample import save_audio
+
+        self._require()
+        kokoro = self._model()
+        if self.voice not in kokoro.get_voices():
             raise TtsError(f"kokoro has no voice {self.voice!r} (see 'vox say --list-voices')")
         lang = KOKORO_LANGS.get(self.voice[0], "en-us")
-        samples, sr = self._kokoro.create(text, voice=self.voice, speed=1.0, lang=lang)
+        samples, sr = kokoro.create(text, voice=self.voice, speed=1.0, lang=lang)
         save_audio(out_wav_path, samples, sr)
         return sr
 

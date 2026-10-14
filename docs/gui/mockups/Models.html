@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DEXAIV — Models</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:'Space Grotesk',system-ui,sans-serif;background:#121217}
+a{color:#A9A9B8}a:hover{color:#ECECF1}
+</style>
+</helmet>
+<div style="width:1200px;height:780px;box-sizing:border-box;display:flex;background:#121217;color:#ECECF1;border-radius:12px;overflow:hidden">
+
+  <nav style="width:200px;box-sizing:border-box;padding:20px 12px;display:flex;flex-direction:column;gap:4px;background:#0D0D11;border-right:1px solid #24242D">
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 10px 22px 10px">
+      <div style="width:28px;height:28px;border-radius:8px;background:{{accent}};display:flex;align-items:center;justify-content:center;color:#121217;font-weight:700;font-size:15px">D</div>
+      <div style="font-weight:700;font-size:16px;letter-spacing:0.04em">DEXAIV</div>
+    </div>
+    <a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Live</a>
+    <a href="Models.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;background:#24242D;color:#ECECF1;text-decoration:none;font-size:14px;font-weight:500">Models</a>
+    <a href="Performance.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Performance</a>
+    <a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:9px;color:#8B8B98;text-decoration:none;font-size:14px">Settings</a>
+  </nav>
+
+  <main style="flex-grow:1;box-sizing:border-box;padding:28px 32px;display:flex;flex-direction:column;gap:18px;min-width:0">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <h1 style="margin:0;font-size:24px;font-weight:700">Models</h1>
+        <div style="font-size:13px;color:#8B8B98;margin-top:4px">Drop a .pth anywhere — version, sample rate and index are detected automatically.</div>
+      </div>
+      <button style="height:42px;padding:0 18px;border-radius:12px;border:1px solid #2E2E39;background:transparent;color:#ECECF1;font-family:'Space Grotesk',sans-serif;font-weight:500;font-size:14px;cursor:pointer">Import…</button>
+    </div>
+
+    <div style="border:2px dashed #2E2E39;border-radius:14px;padding:22px;display:flex;align-items:center;justify-content:center;gap:12px;color:#8B8B98;font-size:14px">
+      <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
+      <span>Drop a <span style="color:#ECECF1;font-weight:500">.pth</span> — or <span style="color:#ECECF1;font-weight:500">.pth + .index together</span> and they import as one voice</span>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:16px">
+      <sc-for list="{{models}}" as="m" hint-placeholder-count="3">
+        <article style="background:#1A1A21;border:1px solid #24242D;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="width:42px;height:42px;border-radius:12px;background:{{m.chip}};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;color:#121217;flex-shrink:0">{{m.initial}}</div>
+            <div style="min-width:0">
+              <div style="font-weight:700;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{m.name}}</div>
+              <div style="font-size:11px;color:#8B8B98;font-family:'JetBrains Mono',monospace">{{m.spec}}</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <sc-for list="{{m.tags}}" as="t" hint-placeholder-count="2">
+              <span style="font-size:11px;color:#A9A9B8;background:#24242D;padding:3px 9px;border-radius:999px">{{t.label}}</span>
+            </sc-for>
+          </div>
+          <label style="display:flex;flex-direction:column;gap:5px">
+            <span style="font-size:11px;color:#8B8B98;letter-spacing:0.04em;text-transform:uppercase">Index</span>
+            <select style="background:#121217;border:1px solid #24242D;border-radius:9px;padding:8px 10px;color:#ECECF1;font-family:'JetBrains Mono',monospace;font-size:12px;width:100%;box-sizing:border-box">
+              <option>{{m.index0}}</option>
+              <option>{{m.index1}}</option>
+              <option>{{m.index2}}</option>
+            </select>
+          </label>
+          <div style="display:flex;gap:8px;margin-top:2px">
+            <button style="flex:1;height:36px;border-radius:10px;border:none;background:{{accent}};color:#121217;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:13px;cursor:pointer">Use</button>
+            <button aria-label="Preview this voice" style="width:36px;height:36px;border-radius:10px;border:1px solid #2E2E39;background:transparent;color:#ECECF1;display:flex;align-items:center;justify-content:center;cursor:pointer">
+              <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            </button>
+          </div>
+        </article>
+      </sc-for>
+    </div>
+
+    <div style="flex-grow:1"></div>
+    <div style="font-size:12px;color:#5C5C68">3 models · 412 MB on disk · models\</div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#E38BD0","options":["#E38BD0","#8BD0E3","#C9E86B","#F0A86B"]},"$preview":{"width":1200,"height":780}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const a = this.props.accent ?? '#E38BD0';
+    return {
+      accent: a,
+      models: [
+        { name: 'Rhea v2', initial: 'R', chip: 'linear-gradient(135deg,' + a + ',#6C5CE7)', spec: 'RVC v2 · 48 kHz · f0', tags: [{label:'calibrated'},{label:'in use'}], index0: 'added_rhea_v2.index (auto)', index1: 'added_rhea_v2_e300.index', index2: 'No index (off)' },
+        { name: 'base_f0_48k_v2', initial: 'B', chip: '#2E2E39', spec: 'RVC v2 · 48 kHz · f0', tags: [{label:'test voice'}], index0: 'added_base_48k.index (auto)', index1: 'No index (off)', index2: 'Browse…' },
+        { name: 'base_f0_40k_v2', initial: 'B', chip: '#2E2E39', spec: 'RVC v2 · 40 kHz · f0', tags: [{label:'test voice'}], index0: 'No index (off)', index1: 'Browse…', index2: 'added_base_48k.index (mismatch)' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
