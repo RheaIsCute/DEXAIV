@@ -45,22 +45,31 @@ class RvcModel:
         net.eval().requires_grad_(False).to(device)
         return cls(net, meta, device)
 
+    def noise_shapes(self, p_len: int, skip_head: int = 0, return_length: int | None = None,
+                     dec_context: int = 0):
+        """Shapes of the ``(noise, source_noise)`` buffers ``infer`` accepts (control path)."""
+        return self.net.noise_shapes(p_len, skip_head, return_length, dec_context)
+
     @torch.inference_mode()
     def infer(self, feats: Tensor, p_len: Tensor, pitch: Tensor | None,
               pitchf: Tensor | None, sid: Tensor, skip_head: int = 0,
-              return_length: int | None = None, dec_context: int = 0) -> Tensor:
+              return_length: int | None = None, dec_context: int = 0,
+              noise: Tensor | None = None, source_noise: Tensor | None = None) -> Tensor:
         """``feats [1, T, C]`` at 100 Hz -> audio ``[frames * upp]`` at ``tgt_sr``.
 
         ``skip_head`` / ``return_length`` are host ints from the static chunk plan, so the
-        tail slice never needs a GPU ``.item()``.
+        tail slice never needs a GPU ``.item()``. ``noise`` / ``source_noise`` are optional
+        pre-drawn standard-normal buffers (see ``nets.synthesizer``).
         """
         if not self.decoder_fp16:
             return self.net.infer(feats, p_len, pitch, pitchf, sid, skip_head,
-                                  return_length, dec_context)[0, 0]
+                                  return_length, dec_context, noise, source_noise)[0, 0]
+        dec_context = min(dec_context, skip_head) if return_length is not None else 0
         z, g = self.net.infer_latent(feats, p_len, pitch, sid, skip_head, return_length,
-                                     dec_context)
+                                     dec_context, noise)
         if self.has_f0 and return_length is not None:
             pitchf = pitchf[:, skip_head - dec_context:skip_head + return_length]
         with torch.autocast(self.device.type, dtype=torch.float16):
-            audio = self.net.dec(z, pitchf, g=g) if self.has_f0 else self.net.dec(z, g=g)
+            audio = (self.net.dec(z, pitchf, g=g, source_noise=source_noise) if self.has_f0
+                     else self.net.dec(z, g=g))
         return audio[0, 0, dec_context * self.upp:].float()

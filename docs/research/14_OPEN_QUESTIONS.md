@@ -370,3 +370,68 @@ so the A/B (re-confirmed live at P3) still decides.
 - **PROPOSED TEST:** Blind A/B at 0 / 80 ms on sustained vowels once per-hop cost is known
   under graphs.
 - **DECISION REQUIRED BY:** P6.
+
+---
+
+# Phase 3 results (2026-10-13): graphs, gate, live audio
+
+Same machine. Raw records: `benchmarks/baselines/phase3_2026-10-13/*.jsonl`. Details and
+the deviations they caused: `docs/DEVIATIONS.md` §4.
+
+## Q1 - updated: under per-stage CUDA graphs every small hop is compute-feasible
+
+`vox bench perf --sweep benchmarks/sweeps/perf_graphs.yaml` (DEVIATIONS R5): hop compute
+p50 15.3-16.9 ms, p99 19-21 ms at hops of 20 and 30 ms, extra 500 and 1000 ms, RMVPE. The
+eager tail is gone (p99 - p50 = 2-5 ms). Headroom (hop / p99) is ~1.0x at 20 ms and ~1.45x
+at 30 ms. The hop is now GPU-bound (~16 ms of kernel time: RMVPE 7.9, ContentVec 3.0, synth
+4.8), so the next step down is per-stage GPU work, not launch count. **Decision:** live
+default hop 20 ms with a two-hop output fill target; 30 ms is the conservative fallback.
+Final at P6 as planned (FP16 ContentVec, RMVPE batch-norm folding, FCPE graph-safety).
+
+## Q3 - updated: extra = 1000 ms is the default
+
+Re-measured with graphs and with the gate on and off (DEVIATIONS R6). Compute no longer
+depends on extra (flat 16-17 ms from 100 to 2500 ms), the speech-frame distance is flat
+beyond 500 ms, and the pause level bias at 1000 ms is +0.13 nepers gate off (R4) and
+negative with the gate on. 2500 ms buys -0.12 vs +0.13 in pause bias for 1.5 s more
+context memory and no compute; revisit at P6 with the target voice.
+
+## Q14 - unchanged
+
+The streamed-vs-full-file gap (1.82-1.89x the seed noise floor in speech frames) is the same
+under graphs, with the gate and at extra 1000 ms. Still needs ears: `out/accept_full.wav`
+vs `out/accept_stream.wav`, and now `out/gate_on.wav` vs `out/gate_full.wav`.
+
+## Q16 - results: per-stage graphs ship; the whole-hop hang is a ContentVec + synth fusion
+
+- **Compute floor reached this phase:** ~16 ms per hop (R5), 2.5x below eager, with
+  p99 within 4 ms of p50.
+- **The hang is reproducible and bisected** (`scripts/probe_whole_hop_graph.py --stages`,
+  each attempt in a child process with a 75 s timeout, 3 side-stream warmups, no RNG in
+  the capture, replay on the capture stream):
+
+  | fused into one graph | replay |
+  |---|---|
+  | resample_in+f0, f0+embed, embed+index, index+synth, synth+post | ok, 15-16 ms |
+  | resample_in+f0+embed, resample_in+f0+embed+index | ok |
+  | f0+embed+index+synth | **hangs** |
+  | embed+index+synth(+post) | **hangs** |
+  | all six stages | **hangs** (as in Phase 2) |
+
+  Every graph that contains **both ContentVec and the synthesizer** hangs on its first
+  replay; every graph that contains only one of them replays fine, including with their
+  neighbours. Noise hoisting and warmup did not change it, so RNG and cuDNN selection are
+  cleared as causes. The remaining suspects are shared cuBLAS/cuDNN workspace or handle
+  state between the two large networks inside one capture (both are transformer-and-conv
+  stacks; HuBERT's attention and the synthesizer's flow/decoder each pull cuBLAS
+  workspaces), or a WDDM submission limit on a very long single graph (~1,700 nodes).
+  Checking it means a CUDA-level trace (Nsight Systems / compute-sanitizer) on the hung
+  replay; per-stage graphs make that unnecessary for the latency target, so it is parked.
+- **Power state** (the P3 / 1860 MHz theory): **ruled out.** `nvidia-smi -lgc 2000,3090`
+  (the shell had the rights) and `vox bench perf` at hop 20 / extra 1000: graphs 16.3 ms
+  p50 / 19.1 p99 locked (SM clock read 2370-2812 MHz, P1 under load) vs 16.1 / 20.5
+  unlocked; eager 41.2 / 90.5 vs 40.9 / 90.4. Clocks reset afterwards (`-rgc`). The GPU
+  already clocks up under the graphed load; the 16 ms is kernel time at full clock.
+- **Decision:** per-stage graphs are the production path (`graphs: auto`, seven graphs:
+  six stages plus SOLA). The whole-hop fusion would save at most six graph launches
+  (~0.1-0.2 ms); not worth a driver investigation.

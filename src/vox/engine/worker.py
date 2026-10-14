@@ -1,8 +1,309 @@
-"""Inference worker thread decoupling <=10 ms callbacks from the 20-32 ms hop.
+"""Inference worker thread decoupling <=10 ms callbacks from the 20-30 ms hop.
 
-Contract: docs/research/12 §3.6, 03 §10.
+Contract: docs/research/12 §3.6, 03 §10. The loop per hop:
 
-Not implemented yet: scheduled for Phase 3 (docs/research/13).
+    wait hop_event -> read one hop from the input ring -> upload -> gate.decide
+      -> process_hop (graph replay) + sola.stitch | drain / zeros
+      -> one device -> host copy -> write exactly one hop into the output ring
+
+Everything the worker owns on the GPU was built by the control path before ``start``;
+nothing here loads a model or allocates in steady state. Hot parameter changes arrive in a
+single-slot mailbox and are applied between hops. Shape changes (hop, extra, F0 method)
+go through ``_rebuild``: the gate is closed and drained, the plan replaced, graphs
+recaptured and verified, then the input backlog is dropped so latency does not pile up.
+
+The output ring is kept near ``fill_target``: zeros are inserted on an underrun, and when
+the gate is closed (output is silence anyway) the fill is trimmed back if clock drift between
+the two devices let it grow. Those corrections are counted separately from underruns.
 """
 
 from __future__ import annotations
+
+import dataclasses
+import threading
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+
+from vox.audio.rings import SPSCRing
+from vox.config.schemas import RuntimeParams, ShapeParams
+from vox.engine import chunker, warmup
+from vox.engine.gate import GateConfig, GateDecision, SilenceGate
+from vox.engine.graphs import StageGraphs
+from vox.engine.pipeline import HopPipeline
+from vox.engine.sola import Sola
+from vox.pitch.base import PitchExtractor
+from vox.profiling.timers import StageTimers
+
+
+@dataclass
+class ShapeRequest:
+    shape: ShapeParams
+    f0_method: str | None = None
+    sola_mode: str | None = None
+
+
+@dataclass
+class WorkerStats:
+    hops: int = 0
+    gated_hops: int = 0
+    gate_transitions: int = 0
+    gate_open: bool = False
+    dropped_input_samples: int = 0
+    underrun_refills: int = 0
+    drift_trims: int = 0
+    rebuilds: int = 0
+    last_rebuild_ms: float = 0.0
+    # latency terms, running means over the last stats window (ms)
+    in_backlog_ms: float = 0.0
+    out_fill_ms: float = 0.0
+    _sum_in: float = 0.0
+    _sum_out: float = 0.0
+    _n: int = 0
+    gate_rms_dbfs: float = -120.0
+    gate_vad: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+    def window(self) -> None:
+        """Fold the running sums into the public means and start a new window."""
+        if self._n:
+            self.in_backlog_ms = self._sum_in / self._n
+            self.out_fill_ms = self._sum_out / self._n
+        self._sum_in = self._sum_out = 0.0
+        self._n = 0
+
+
+class InferenceWorker(threading.Thread):
+    def __init__(self, pipeline: HopPipeline, sola: Sola, gate: SilenceGate,
+                 graphs: StageGraphs, timers: StageTimers, in_ring: SPSCRing,
+                 out_ring: SPSCRing, hop_event: threading.Event, fill_target: int,
+                 extractors: dict[str, PitchExtractor] | None = None,
+                 log=print) -> None:
+        super().__init__(name="vox-inference", daemon=True)
+        self.pipeline = pipeline
+        self.sola = sola
+        self.gate = gate
+        self.graphs = graphs
+        self.timers = timers
+        self.in_ring = in_ring
+        self.out_ring = out_ring
+        self.hop_event = hop_event
+        self.fill_target = fill_target
+        self.extractors = extractors or {}
+        self.log = log
+        self.stats = WorkerStats()
+        self._stop = threading.Event()
+        self._pending_params: RuntimeParams | None = None
+        self._pending_gate: GateConfig | None = None
+        self._pending_shape: ShapeRequest | None = None
+        self.params = pipeline.params
+        self._seen_underruns = 0
+        self.ready = threading.Event()
+        self.first_hop = threading.Event()  # set once the first hop is in the output ring
+        self._alloc()
+
+    # ------------------------------------------------------------------ control path
+
+    @property
+    def plan(self) -> chunker.ChunkPlan:
+        return self.pipeline.plan
+
+    def _alloc(self) -> None:
+        block = self.plan.block
+        cuda = self.pipeline.device.type == "cuda"
+        self._host_block = np.zeros(block, dtype=np.float32)
+        self._host_out = torch.zeros(block, pin_memory=cuda)
+        self._host_out_np = self._host_out.numpy()
+        self._zeros = torch.zeros(block, device=self.pipeline.device)
+        self._zeros_np = np.zeros(block, dtype=np.float32)
+
+    def apply_params(self, params: RuntimeParams) -> None:
+        """Hot parameters: applied before the next hop (single-slot mailbox)."""
+        self._pending_params = params
+
+    def apply_gate(self, config: GateConfig) -> None:
+        self._pending_gate = config
+
+    def apply_shape(self, request: ShapeRequest) -> None:
+        """Restart-class change: the worker rebuilds between hops (brief gated pause)."""
+        self._pending_shape = request
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        self.hop_event.set()
+        self.join(timeout=timeout)
+
+    def latency_estimate_ms(self, device_ms: float, compute_p50_ms: float) -> dict[str, float]:
+        """End-to-end estimate: hop accumulation + input backlog + compute + output ring wait
+        + SOLA delay + device buffers (docs/research/04 §2)."""
+        plan = self.plan
+        s = self.stats
+        parts = {
+            "hop": plan.block_ms, "input_backlog": s.in_backlog_ms, "compute": compute_p50_ms,
+            "output_ring": s.out_fill_ms, "sola": plan.overlap_ms + plan.search_ms,
+            "devices": device_ms,
+        }
+        parts["total"] = sum(parts.values())
+        return parts
+
+    # ---------------------------------------------------------------------- hot loop
+
+    def run(self) -> None:
+        try:
+            self.ready.set()
+            while not self._stop.is_set():
+                if not self.hop_event.wait(timeout=0.05):
+                    continue
+                self.hop_event.clear()
+                self._apply_pending()
+                while not self._stop.is_set() and self.in_ring.available() >= self.plan.block:
+                    self._hop()
+        except Exception as err:  # noqa: BLE001 - surface, never die silently
+            self.stats.errors.append(f"{type(err).__name__}: {err}")
+            self.log(f"worker: fatal {type(err).__name__}: {err}")
+            raise
+
+    def _prefill(self, n: int) -> None:
+        """Zeros into the output ring so the callback has audio while the first hop runs."""
+        if n > 0:
+            self.out_ring.write(np.zeros(n, dtype=np.float32))
+
+    def _apply_pending(self) -> None:
+        shape = self._pending_shape
+        if shape is not None:
+            self._pending_shape = None
+            self._rebuild(shape)
+        params = self._pending_params
+        if params is not None:
+            self._pending_params = None
+            self.params = params
+            if self.pipeline.set_params(params):
+                self._recapture("f0_unvoiced changed")
+        gate = self._pending_gate
+        if gate is not None:
+            self._pending_gate = None
+            self.gate.set_config(gate)
+
+    def _hop(self) -> None:
+        plan, pipeline, sola, gate, timers = (self.plan, self.pipeline, self.sola, self.gate,
+                                              self.timers)
+        block = plan.block
+        s = self.stats
+        # Backlog beyond one hop means we are late; it is latency, so measure it.
+        backlog = self.in_ring.available() - block
+        timers.begin_hop()
+        with timers.stage("upload"):
+            self.in_ring.read(self._host_block)
+            pipeline.upload(self._host_block)
+        with timers.stage("gate"):
+            decision: GateDecision = gate.decide(self._host_block)
+        if decision.speech:
+            infer = pipeline.process_hop()
+            with timers.stage("sola"):
+                stitched = sola.stitch(infer)
+        else:
+            if decision.drain:
+                sola.begin_drain()
+                pipeline.forget_speech()
+            pipeline.advance_context()
+            with timers.stage("sola"):
+                stitched = sola.drain_step() if sola.draining else self._zeros
+            s.gated_hops += 1
+        if decision.onset or decision.drain:
+            s.gate_transitions += 1
+            timers.counters.vad_transitions += 1
+        s.gate_open = decision.speech
+        s.gate_rms_dbfs = decision.rms_dbfs
+        s.gate_vad = decision.vad_prob
+        with timers.stage("download"):
+            self._host_out.copy_(stitched)  # syncs the hop
+        fill_before = self.out_ring.fill()
+        if s.hops == 0:
+            # The output stream starts once this hop is in the ring (LiveSession waits for
+            # ``first_hop``), so the prefill goes in now, right under the first real hop.
+            self._prefill(self.fill_target)
+            fill_before = self.fill_target
+        if self.out_ring.underruns > self._seen_underruns:
+            # The callback ran dry: top the ring back up to the target so one late hop
+            # does not become a run of underruns. Counted as a refill, audible as a gap.
+            self._seen_underruns = self.out_ring.underruns
+            self._prefill(self.fill_target - fill_before)
+            s.underrun_refills += 1
+            fill_before = self.fill_target
+        self.out_ring.write(self._host_out_np)
+        if not decision.speech and fill_before > self.fill_target + block:
+            # Silence is playing: trim clock-drift growth without anyone hearing it.
+            self.out_ring.drop(fill_before - self.fill_target)
+            s.drift_trims += 1
+        timers.end_hop()
+        s.hops += 1
+        if s.hops == 1:
+            self.first_hop.set()
+        s._sum_in += 1000.0 * backlog / plan.device_sr
+        s._sum_out += 1000.0 * fill_before / plan.device_sr
+        s._n += 1
+        timers.counters.output_underruns = self.out_ring.underruns
+        timers.counters.input_overflows = self.in_ring.overruns
+
+    # ------------------------------------------------------- rebuild (between hops)
+
+    def _recapture(self, why: str) -> None:
+        if not self.graphs.supported():
+            return
+        start = time.perf_counter()
+        try:
+            self.graphs.capture()
+        except Exception as err:  # noqa: BLE001
+            self.log(f"worker: recapture after {why} failed ({err}); running eager")
+        self.log(f"worker: recaptured graphs ({why}) in "
+                 f"{(time.perf_counter() - start) * 1000:.0f} ms")
+
+    def _rebuild(self, request: ShapeRequest) -> None:
+        """Apply a restart-class change in place: drain, replan, recapture, resume."""
+        start = time.perf_counter()
+        pipeline, old_plan = self.pipeline, self.plan
+        # 1. close the gate audibly cleanly: fade the SOLA tail out into the output ring
+        if self.gate.open:
+            self.sola.begin_drain()
+            while self.sola.draining:
+                self._host_out.copy_(self.sola.drain_step())
+                self.out_ring.write(self._host_out_np)
+            self.gate.reset()
+        # 2. swap the extractor if asked (pre-loaded objects only: no loading here)
+        if request.f0_method and request.f0_method in self.extractors:
+            pipeline.extractor = self.extractors[request.f0_method]
+            self.params = dataclasses.replace(self.params, f0_method=request.f0_method)
+        shape = request.shape
+        model = pipeline.model
+        f0_tail = 0
+        if pipeline.extractor is not None:
+            block_16k = chunker.plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms,
+                                     shape.sola_search_ms, shape.device_sr, model.tgt_sr).block_16k
+            f0_tail = pipeline.extractor.tail_samples(block_16k)
+        plan = chunker.plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms,
+                            shape.sola_search_ms, shape.device_sr, model.tgt_sr, f0_tail,
+                            shape.decoder_context_ms)
+        # 3. replan everything that depends on the plan
+        pipeline.set_plan(plan)
+        pipeline.set_params(self.params)
+        mode = request.sola_mode or self.sola.mode
+        self.sola = Sola(plan, pipeline.device, mode)
+        self.graphs.sola = self.sola
+        self.gate = SilenceGate(plan, self.gate.config, self.gate.vad)
+        self._alloc()
+        if plan.block != old_plan.block:
+            self.fill_target = int(round(self.fill_target * plan.block / old_plan.block))
+        # 4. warm up and capture at the new shapes (resets pipeline + SOLA state)
+        warmup.run(pipeline, self.sola, 3, self.graphs, log=self.log)
+        # 5. the input piled up meanwhile: keep one hop, refill the output to target
+        dropped = self.in_ring.keep_latest(plan.block)
+        self.stats.dropped_input_samples += dropped
+        self.out_ring.drop(self.out_ring.available())
+        self._prefill(self.fill_target)
+        self.stats.rebuilds += 1
+        self.stats.last_rebuild_ms = (time.perf_counter() - start) * 1000.0
+        self.log(f"worker: rebuilt for hop {plan.block_ms:.0f} ms / extra {plan.extra_ms:.0f} ms"
+                 f" / f0 {self.params.f0_method} in {self.stats.last_rebuild_ms:.0f} ms "
+                 f"({self.graphs.report.mode}: {'graphs' if self.graphs.active else 'eager'})")

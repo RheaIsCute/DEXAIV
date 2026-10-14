@@ -107,5 +107,40 @@ def boundary_click_ratio(audio: np.ndarray, block: int, half_width: int = 8) -> 
     return float(np.median(edge[active]) / np.median(middle[active]))
 
 
+def transition_click_ratio(audio: np.ndarray, positions: np.ndarray, block: int,
+                           half_width: int = 8) -> float:
+    """``boundary_click_ratio`` restricted to given sample positions (gate transitions).
+
+    Roughness (|second difference|) in a +-``half_width`` window around each position,
+    relative to the roughness mid-hop in the active hops around it. ~1.0 = seamless.
+    """
+    accel = np.abs(np.diff(audio.astype(np.float64), n=2))
+    positions = np.asarray(positions, dtype=np.int64)
+    positions = positions[(positions > block) & (positions < len(accel) - block)]
+    if positions.size == 0:
+        return float("nan")
+
+    def local(center: np.ndarray) -> np.ndarray:
+        idx = center[:, None] + np.arange(-half_width, half_width)[None, :]
+        return accel[np.clip(idx, 0, len(accel) - 1)].mean(axis=1)
+
+    edge = local(positions)
+    # reference: mid-hop roughness of the neighbouring hops (one before, one after)
+    middle = np.maximum(local(positions - block // 2), local(positions + block // 2))
+    middle = np.maximum(middle, 1e-7)
+    return float(np.median(edge / middle))
+
+
+def frame_rms_dbfs(audio: np.ndarray, sr: int, hop_ms: float = 10.0,
+                   win_ms: float = 40.0) -> np.ndarray:
+    """Per-frame RMS level in dBFS (centred windows), for pause / speech region masks."""
+    hop, win = int(sr * hop_ms / 1000), int(sr * win_ms / 1000)
+    padded = np.pad(audio.astype(np.float64), (win // 2, win // 2))
+    csum = np.concatenate(([0.0], np.cumsum(padded * padded)))
+    starts = np.arange(0, len(audio), hop)
+    energy = (csum[np.minimum(starts + win, len(padded))] - csum[starts]) / win
+    return 10.0 * np.log10(energy + 1e-12)
+
+
 def rms_dbfs(audio: np.ndarray) -> float:
     return float(20 * np.log10(np.sqrt(np.mean(np.square(audio, dtype=np.float64))) + 1e-12))

@@ -76,8 +76,15 @@ class SineGen(nn.Module):
         self.register_buffer("_harmonics", torch.arange(1, self.dim + 1, dtype=torch.float32)
                              .reshape(1, 1, -1), persistent=False)
 
+    def noise_shape(self, frames: int) -> tuple[int, int, int]:
+        """Shape of the ``noise`` tensor ``forward`` consumes for ``frames`` F0 frames."""
+        return (1, frames * self.upp, self.dim)
+
     @torch.no_grad()
-    def forward(self, f0: Tensor) -> Tensor:
+    def forward(self, f0: Tensor, noise: Tensor | None = None) -> Tensor:
+        """``noise``: pre-drawn standard-normal samples of ``noise_shape(t)``. Passing them
+        in keeps every random draw outside a captured CUDA graph (the hot path pre-fills
+        the buffer each hop); ``None`` draws fresh, the upstream behaviour."""
         f0 = f0.float().unsqueeze(-1)  # [b, t, 1]
         # Phase advance within each frame, then carry the wrapped end-of-frame phase forward.
         rad = f0 / self.sampling_rate * self._ramp  # [b, t, upp]
@@ -85,14 +92,19 @@ class SineGen(nn.Module):
         carried = frame_end.cumsum(dim=1).fmod(1.0)
         rad = rad + F.pad(carried, (0, 0, 1, -1))
         rad = rad.reshape(f0.shape[0], -1, 1) * self._harmonics
-        initial_phase = torch.rand(1, 1, self.dim, device=f0.device)
-        initial_phase[..., 0] = 0
-        sine = torch.sin(2 * math.pi * (rad + initial_phase)) * self.sine_amp
+        if self.dim > 1:
+            # Upstream draws a random start phase per harmonic; the fundamental stays at 0.
+            initial_phase = torch.rand(1, 1, self.dim, device=f0.device)
+            initial_phase[..., 0] = 0
+            rad = rad + initial_phase
+        sine = torch.sin(2 * math.pi * rad) * self.sine_amp
 
         uv = (f0 > 0).to(sine.dtype)
         uv = uv.expand(-1, -1, self.upp).reshape(f0.shape[0], -1, 1)
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        return sine * uv + noise_amp * torch.randn_like(sine)
+        if noise is None:
+            noise = torch.randn_like(sine)
+        return sine * uv + noise_amp * noise
 
 
 class SourceModuleHnNSF(nn.Module):
@@ -101,9 +113,9 @@ class SourceModuleHnNSF(nn.Module):
         self.l_sin_gen = SineGen(sampling_rate, upp, harmonic_num)
         self.l_linear = nn.Linear(harmonic_num + 1, 1)
 
-    def forward(self, f0: Tensor) -> Tensor:
+    def forward(self, f0: Tensor, noise: Tensor | None = None) -> Tensor:
         with torch.autocast(f0.device.type, enabled=False):
-            sine = self.l_sin_gen(f0)
+            sine = self.l_sin_gen(f0, noise)
             merged = torch.tanh(self.l_linear(sine.to(self.l_linear.weight.dtype)))
         return merged.transpose(1, 2)  # [b, 1, t * upp]
 
@@ -176,14 +188,14 @@ class GeneratorNSF(_GeneratorBase):
             else:
                 self.noise_convs.append(nn.Conv1d(1, channels, kernel_size=1))
 
-    def source(self, f0: Tensor) -> Tensor:
+    def source(self, f0: Tensor, noise: Tensor | None = None) -> Tensor:
         """The excitation signal; kept separate so a decoder backend can reuse it (P5)."""
-        return self.m_source(f0)
+        return self.m_source(f0, noise)
 
     def forward(self, x: Tensor, f0: Tensor, g: Tensor | None = None,
-                source: Tensor | None = None) -> Tensor:
+                source: Tensor | None = None, source_noise: Tensor | None = None) -> Tensor:
         if source is None:
-            source = self.source(f0)
+            source = self.source(f0, source_noise)
         source = source.to(x.dtype)
         x = self.conv_pre(x)
         if g is not None:

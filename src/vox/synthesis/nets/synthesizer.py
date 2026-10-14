@@ -2,6 +2,11 @@
 
 One class covers the four upstream variants (256/768-d input, with/without F0). Reference:
 rvc-webui ``infer/module/models.py`` ``SynthesizerTrnMs{256,768}NSFsid[_nono].infer``, MIT.
+
+Randomness: the latent noise and the NSF excitation noise may be passed in pre-drawn
+(``noise`` / ``source_noise``). The streaming engine fills those buffers outside its CUDA
+graphs each hop, so no random draw happens inside a captured region. Left ``None``, both
+are drawn on the spot, exactly as upstream.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ class Synthesizer(nn.Module):
          gin_channels, sr) = config[:18]
         self.has_f0 = f0
         self.sr = int(sr)
+        self.inter_channels = int(inter_channels)
         self.enc_p = TextEncoder(emb_dim, inter_channels, hidden_channels, filter_channels,
                                  n_heads, n_layers, kernel_size, f0=f0)
         decoder_args = (inter_channels, resblock, resblock_kernel_sizes,
@@ -40,9 +46,28 @@ class Synthesizer(nn.Module):
         self.emb_g = nn.Embedding(spk_embed_dim, gin_channels)
         self.upp = self.dec.upp
 
+    @staticmethod
+    def _flow_head(skip_head: int, return_length: int | None, dec_context: int) -> int:
+        if return_length is None:
+            return 0
+        return max(skip_head - dec_context - FLOW_CONTEXT_FRAMES, 0)
+
+    def noise_shapes(self, p_len: int, skip_head: int = 0, return_length: int | None = None,
+                     dec_context: int = 0) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+        """Shapes of ``(noise, source_noise)`` for a window of ``p_len`` frames."""
+        if return_length is not None:
+            dec_context = min(dec_context, skip_head)
+        latent = (1, self.inter_channels,
+                  p_len - self._flow_head(skip_head, return_length, dec_context))
+        if not self.has_f0:
+            return latent, None
+        frames = p_len if return_length is None else return_length + dec_context
+        return latent, self.dec.m_source.l_sin_gen.noise_shape(frames)
+
     def infer_latent(self, phone: Tensor, lengths: Tensor, pitch: Tensor | None, sid: Tensor,
                      skip_head: int = 0, return_length: int | None = None,
-                     dec_context: int = 0) -> tuple[Tensor, Tensor]:
+                     dec_context: int = 0, noise: Tensor | None = None
+                     ) -> tuple[Tensor, Tensor]:
         """Everything up to the decoder input. Returns ``(z * mask, g)``.
 
         With ``return_length`` set, the encoder still attends over the whole window, the
@@ -52,9 +77,11 @@ class Synthesizer(nn.Module):
         """
         g = self.emb_g(sid).unsqueeze(-1)
         first = skip_head - dec_context
-        flow_head = max(first - FLOW_CONTEXT_FRAMES, 0) if return_length is not None else 0
+        flow_head = self._flow_head(skip_head, return_length, dec_context)
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, lengths, flow_head)
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * NOISE_SCALE) * x_mask
+        if noise is None:
+            noise = torch.randn_like(m_p)
+        z_p = (m_p + torch.exp(logs_p) * noise * NOISE_SCALE) * x_mask
         z = self.flow.reverse(z_p, x_mask, g=g)
         if return_length is not None:
             start, end = first - flow_head, skip_head - flow_head + return_length
@@ -64,7 +91,8 @@ class Synthesizer(nn.Module):
 
     def infer(self, phone: Tensor, lengths: Tensor, pitch: Tensor | None,
               pitchf: Tensor | None, sid: Tensor, skip_head: int = 0,
-              return_length: int | None = None, dec_context: int = 0) -> Tensor:
+              return_length: int | None = None, dec_context: int = 0,
+              noise: Tensor | None = None, source_noise: Tensor | None = None) -> Tensor:
         """Returns audio ``[b, 1, return_length * upp]`` at the model sample rate.
 
         ``dec_context`` frames ahead of the tail are decoded too and their samples dropped.
@@ -74,13 +102,13 @@ class Synthesizer(nn.Module):
         """
         dec_context = min(dec_context, skip_head) if return_length is not None else 0
         z, g = self.infer_latent(phone, lengths, pitch, sid, skip_head, return_length,
-                                 dec_context)
+                                 dec_context, noise)
         if not self.has_f0:
             audio = self.dec(z, g=g)
         else:
             if return_length is not None:
                 pitchf = pitchf[:, skip_head - dec_context:skip_head + return_length]
-            audio = self.dec(z, pitchf, g=g)
+            audio = self.dec(z, pitchf, g=g, source_noise=source_noise)
         return audio[:, :, dec_context * self.upp:]
 
 

@@ -22,6 +22,8 @@ from vox.config import defaults
 from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
 from vox.engine import chunker, warmup
 from vox.engine.chunker import ChunkPlan
+from vox.engine.gate import GateConfig, GateDecision, SilenceGate, SileroVad
+from vox.engine.graphs import StageGraphs
 from vox.engine.pipeline import STAGES, HopPipeline
 from vox.engine.sola import Sola
 from vox.features.contentvec import ContentVec
@@ -41,7 +43,14 @@ class Engine:
     loaded: LoadedModel
     params: RuntimeParams
     precision: PrecisionParams
+    graphs: StageGraphs
+    gate: SilenceGate | None = None
     warmup_ms: float = 0.0
+
+    @property
+    def mode(self) -> str:
+        """``graphs`` when replaying captured graphs, else ``eager``."""
+        return "graphs" if self.graphs.active else "eager"
 
 
 def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = None,
@@ -49,13 +58,21 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
                 precision: PrecisionParams | None = None,
                 device: torch.device | str | None = None, warmup_hops: int = 5,
                 registry: ModelRegistry | None = None,
-                cache: dict | None = None) -> Engine:
-    """Control-path construction: load models, plan, allocate, warm up.
+                cache: dict | None = None, graphs: str | None = None,
+                gate: GateConfig | None = None, log=print) -> Engine:
+    """Control-path construction: load models, plan, allocate, warm up, capture graphs.
 
     ``cache`` lets a sweep reuse the loaded embedder and extractors across engine builds.
+    ``graphs`` overrides ``precision.graphs`` ("on" | "off" | "auto"). ``gate`` configures
+    the silence gate (default: enabled, Silero VAD, engine defaults); the Silero model is
+    loaded on the CPU here, never in the hot loop.
     """
     shape = shape or defaults.DEFAULT_SHAPE
     precision = precision or defaults.DEFAULT_PRECISION
+    if graphs is not None:
+        import dataclasses
+
+        precision = dataclasses.replace(precision, graphs=graphs)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     warmup.apply_precision(precision)
 
@@ -93,9 +110,19 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
     timers = StageTimers(STAGES, device, capacity=defaults.PROFILER_RING)
     pipeline = HopPipeline(plan, model, embedder, extractor, device, params, timers, index)
     sola = Sola(plan, device, params.sola_mode)
-    engine = Engine(plan, pipeline, sola, timers, device, loaded, params, precision)
+    stage_graphs = StageGraphs(pipeline, sola, precision.graphs)
+    gate_config = gate or GateConfig()
+    vad = None
+    if gate_config.use_vad:
+        if "vad" not in cache:
+            cache["vad"] = SileroVad()
+            cache["vad"].load(Path(models_dir))
+        vad = cache["vad"]
+    silence_gate = SilenceGate(plan, gate_config, vad)
+    engine = Engine(plan, pipeline, sola, timers, device, loaded, params, precision,
+                    stage_graphs, silence_gate)
     if warmup_hops:
-        engine.warmup_ms = warmup.run(pipeline, sola, warmup_hops)
+        engine.warmup_ms = warmup.run(pipeline, sola, warmup_hops, stage_graphs, log=log)
     return engine
 
 
@@ -111,6 +138,9 @@ class SimResult:
     sola_offsets_ms: np.ndarray
     alloc: dict[str, float] | None
     pointers_stable: bool
+    gate_open: np.ndarray | None = None  # per hop: True when the hop ran through the model
+    gate_transitions: int = 0
+    closed_hop_ms: np.ndarray | None = None  # host ms of hops the gate skipped
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -125,16 +155,21 @@ class StreamSimulator:
         self.alloc = AllocProbe(engine.device)
 
     def run(self, audio: np.ndarray, realtime: bool = False, jitter_ms: float = 0.0,
-            sync_debug: bool = False, reset: bool = True, seed: int | None = 0) -> SimResult:
+            sync_debug: bool = False, reset: bool = True, seed: int | None = 0,
+            gate: bool = False) -> SimResult:
         """Feed ``audio`` (mono float32 at the device rate) through the engine.
 
         ``sync_debug`` makes any implicit host<->device synchronisation inside the hop raise
         (after a few settling hops), which is how the no-``.item()`` rule is enforced.
+        ``gate`` runs the engine's silence gate exactly as the live worker does.
         """
         engine = self.engine
         plan, pipeline, sola, timers = engine.plan, engine.pipeline, engine.sola, engine.timers
+        silence_gate = engine.gate if gate else None
+        always = GateDecision(True)
         cuda = engine.device.type == "cuda"
         block = plan.block
+        zeros_block = torch.zeros(block, device=engine.device)
         # Whole hops, plus enough trailing silence to flush the SOLA delay.
         flush = -(-plan.stream_delay // block)
         hops = -(-len(audio) // block) + flush
@@ -147,6 +182,8 @@ class StreamSimulator:
         if reset:
             pipeline.reset()
             sola.reset()
+            if silence_gate is not None:
+                silence_gate.reset()
         timers.reset()
         self.alloc = AllocProbe(engine.device, capacity=hops)
         if seed is not None:
@@ -155,6 +192,9 @@ class StreamSimulator:
         rng = np.random.default_rng(0)
         hop_s = block / plan.device_sr
         settle = 8
+        gate_open = np.ones(hops, dtype=bool)
+        closed_ms: list[float] = []
+        transitions = 0
 
         compute = 0.0
         start = time.perf_counter()
@@ -170,22 +210,41 @@ class StreamSimulator:
             hop_start = time.perf_counter()
             timers.begin_hop()
             self.alloc.begin_hop()
+            host_block = padded[n * block:(n + 1) * block]
             with timers.stage("upload"):
-                pipeline.upload(padded[n * block:(n + 1) * block])
+                pipeline.upload(host_block)
+            with timers.stage("gate"):
+                decision = silence_gate.decide(host_block) if silence_gate else always
             if strict:
                 torch.cuda.set_sync_debug_mode("error")
             try:
-                infer = pipeline.process_hop()
-                with timers.stage("sola"):
-                    stitched = sola.stitch(infer)
+                if decision.speech:
+                    infer = pipeline.process_hop()
+                    with timers.stage("sola"):
+                        stitched = sola.stitch(infer)
+                else:
+                    # Gate closed: the Applio protocol (engine/gate.py module docstring).
+                    if decision.drain:
+                        sola.begin_drain()
+                        pipeline.forget_speech()
+                    pipeline.advance_context()
+                    with timers.stage("sola"):
+                        stitched = sola.drain_step() if sola.draining else zeros_block
+                    gate_open[n] = False
             finally:
                 if strict:
                     torch.cuda.set_sync_debug_mode("default")
+            if decision.onset or decision.drain:
+                transitions += 1
+                timers.counters.vad_transitions += 1
             with timers.stage("download"):
                 host_out.copy_(stitched)  # the one device -> host copy; syncs the hop
             self.alloc.end_hop()
             timers.end_hop()
-            compute += time.perf_counter() - hop_start
+            hop_ms = time.perf_counter() - hop_start
+            compute += hop_ms
+            if not decision.speech:
+                closed_ms.append(hop_ms * 1000.0)
             out[n * block:(n + 1) * block] = host_out_np
             if realtime and time.perf_counter() > available + hop_s:
                 timers.counters.deadline_misses += 1
@@ -201,4 +260,7 @@ class StreamSimulator:
             sola_offsets_ms=sola.offsets_ms(plan.device_sr),
             alloc=self.alloc.summary(skip=min(defaults.PROFILER_WARMUP_HOPS, hops // 2)),
             pointers_stable=stable,
+            gate_open=gate_open if silence_gate is not None else None,
+            gate_transitions=transitions,
+            closed_hop_ms=np.asarray(closed_ms, dtype=np.float64),
         )

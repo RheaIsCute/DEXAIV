@@ -3,10 +3,13 @@
 Low-latency real-time RVC voice changer for one user, one mic, one GPU (Windows + NVIDIA).
 Headless engine first; the research and design live in [docs/research/](docs/research/).
 
-**Status: Phases 0-2 of the [roadmap](docs/research/13_IMPLEMENTATION_ROADMAP.md) are built.**
-The conversion engine runs offline, hop by hop, through the same objects live audio will
-use. Live audio (Phase 3) is not started. Measured results, deviations from the research
-docs and newly found open questions are in [docs/DEVIATIONS.md](docs/DEVIATIONS.md) and
+**Status: Phases 0-2 plus the reordered Phase 3 of the
+[roadmap](docs/research/13_IMPLEMENTATION_ROADMAP.md) are built.** The conversion engine
+runs offline and live through the same objects: per-stage CUDA graphs are the default fast
+path (`graphs: auto`), the silence gate (energy + Silero VAD) idles the GPU in pauses, and
+`vox run` streams microphone -> engine -> any output device with hot parameter changes and
+a 1 Hz profiler line. Measured results, deviations from the research docs and newly found
+open questions are in [docs/DEVIATIONS.md](docs/DEVIATIONS.md) and
 [docs/research/14_OPEN_QUESTIONS.md](docs/research/14_OPEN_QUESTIONS.md).
 
 ## Setup
@@ -30,11 +33,15 @@ vox models list
 vox convert in.wav out.wav --model MyVoice --pitch 7                 # the streaming engine
 vox convert in.wav out.wav --model MyVoice --pitch 7 --mode full     # canonical whole-file
 vox bench accept                             # Phase 2 acceptance + profiler report
-vox bench perf                               # block x extra x f0 sweep
+vox bench perf                               # block x extra x f0 sweep (--sweep perf_graphs.yaml: graphs vs eager)
+vox bench gate                               # silence-gate acceptance
+vox devices                                  # WASAPI devices with indices
+vox run --model MyVoice --pitch 7 --input 22 --output 20   # live; type 'help' for commands
+python scripts/measure_rtt.py --cable "Virtual Audio Cable"   # loopback round-trip latency
 vox env                                      # environment fingerprint
 ```
 
-`vox run`, `vox devices` and `vox calibrate` exist as placeholders for Phases 3 and 5.
+`vox calibrate` is a placeholder for Phase 5.
 
 ## Layout
 
@@ -43,17 +50,18 @@ The structure is the blueprint of
 
 | Path | Role |
 |---|---|
-| `src/vox/engine/` | `chunker.py` (the chunking law), `pipeline.py` (the per-hop function), `sola.py`, `postchain.py`, `warmup.py` |
+| `src/vox/engine/` | `chunker.py` (the chunking law), `pipeline.py` (the per-hop function as capturable stages), `graphs.py` (per-stage CUDA graphs), `gate.py` (silence gate), `worker.py` (inference thread), `sola.py`, `postchain.py`, `warmup.py` |
 | `src/vox/pitch/`, `features/`, `retrieval/`, `synthesis/` | stage packages: RMVPE / FCPE, ContentVec, GPU k-NN index, RVC synthesizer |
-| `src/vox/audio/resample.py` | incremental 48 k -> 16 k and model -> device resamplers |
+| `src/vox/audio/` | `resample.py` (incremental 48 k -> 16 k and model -> device), `rings.py` (SPSC rings), `streams.py` (WASAPI in/out streams, file-backed input), `devices.py` |
+| `src/vox/api/control.py` | `LiveSession`: engine + rings + worker + streams, hot and restart-class changes, stats snapshots |
 | `src/vox/profiling/` | stage timers (host + CUDA events read one hop late), statistics, reports |
 | `src/vox/models/`, `config/` | checkpoint detection, model registry, JSON profiles |
 | `src/vox/offline/` | `simulate.py` (stream simulator), `convert.py` (full-file + CLI), `metrics.py` |
 | `benchmarks/bench.py` | acceptance run and sweeps, all through the stream simulator |
 | `scripts/parity_rvc_webui.py` | A/B against a read-only rvc-webui clone |
+| `scripts/measure_rtt.py`, `scripts/probe_whole_hop_graph.py` | loopback latency measurement; the Q16 whole-hop graph probe |
 
-Later-phase modules (`audio/streams.py`, `engine/worker.py`, `engine/gate.py`,
-`engine/graphs.py`, `calibration/`, `api/`) are stubs that state their contract.
+Later-phase modules (`calibration/`, `api/events.py`) are stubs that state their contract.
 
 ## Reference code
 

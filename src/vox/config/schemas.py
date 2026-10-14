@@ -45,7 +45,7 @@ class ShapeParams:
     block_ms: float = 20.0
     crossfade_ms: float = 30.0
     sola_search_ms: float = 10.0
-    extra_ms: float = 500.0
+    extra_ms: float = 1000.0  # 500 -> 1000: pause loudness bias (docs/DEVIATIONS.md R4)
     device_sr: int = 48000
     decoder_context_ms: float = 0.0  # decoder left context (0 = upstream); see Q17
 
@@ -73,7 +73,7 @@ class PrecisionParams:
     tf32: bool = True
     hubert_fp16: bool = False
     decoder_fp16: bool = False
-    use_cuda_graphs: bool = False
+    graphs: str = "auto"  # CUDA graphs: "on" | "off" | "auto" (capture, verify, else eager)
 
 
 # ----------------------------------------------------------------------------- profile files
@@ -111,7 +111,7 @@ class VoiceProfile:
 class VadProfile:
     engine: str = "silero"
     threshold: float = 0.5
-    release_ms: int = 400
+    release_ms: int = 200  # hangover after the last speech (Applio uses 200 ms)
 
 
 @dataclass
@@ -154,13 +154,13 @@ class RuntimeProfile:
     gpu: str = ""
     block_ms: float = 20.0
     crossfade_ms: float = 30.0
-    context_extra_ms: float = 500.0
+    context_extra_ms: float = 1000.0
     sola_search_ms: float = 10.0
     decoder_context_ms: float = 0.0
     tf32: bool = True
     hubert_fp16: bool = False
     decoder_fp16: bool = False
-    use_cuda_graphs: bool = False
+    graphs: str = "auto"
     benchmark_ref: str = ""
 
     def shape(self, device_sr: int = 48000) -> ShapeParams:
@@ -178,7 +178,7 @@ class RuntimeProfile:
             tf32=self.tf32,
             hubert_fp16=self.hubert_fp16,
             decoder_fp16=self.decoder_fp16,
-            use_cuda_graphs=self.use_cuda_graphs,
+            graphs=self.graphs,
         )
 
 
