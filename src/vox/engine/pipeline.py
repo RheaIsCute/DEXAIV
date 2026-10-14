@@ -218,7 +218,7 @@ class HopPipeline:
             tuple(sorted((k, v.data_ptr()) for k, v in self.buffers().items())),
             self.plan, id(self.model), id(self.embedder), id(self.extractor),
             id(self.index), self._interp, self.model.decoder_fp16,
-            getattr(self.embedder, "fp16", None), self.post.rms_mix.graph_safe,
+            getattr(self.embedder, "autocast", None), self.post.rms_mix.graph_safe,
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
             torch.backends.cudnn.benchmark,
         )

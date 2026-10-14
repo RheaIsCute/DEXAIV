@@ -101,6 +101,29 @@ def load_model_config(path: Path) -> ModelConfig:
     return load_as(ModelConfig, path)
 
 
+# ------------------------------------------------------------ persisted warmup decisions
+
+
+def load_tuned(profile_dir: Path | None, key: str) -> dict[str, Any] | None:
+    """The warmup record stored under ``key`` in ``runtime.json``, or None."""
+    if profile_dir is None:
+        return None
+    path = Path(profile_dir) / "runtime.json"
+    if not path.is_file():
+        return None
+    return load_as(RuntimeProfile, path).tuned.get(key)
+
+
+def save_tuned(profile_dir: Path | None, key: str, record: dict[str, Any]) -> None:
+    """Store ``record`` under ``key`` in ``runtime.json`` (created from defaults if absent)."""
+    if profile_dir is None:
+        return
+    path = Path(profile_dir) / "runtime.json"
+    runtime = load_as(RuntimeProfile, path) if path.is_file() else RuntimeProfile()
+    runtime.tuned[key] = record
+    save_as(runtime, path)
+
+
 def resolve_runtime_params(
     profile: Profile | None = None,
     model_config: ModelConfig | None = None,

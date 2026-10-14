@@ -45,7 +45,9 @@ def add_say_parser(sub, default_models: Path, default_profile: Path) -> None:
     p.add_argument("--play", action="store_true", help="play the result")
     p.add_argument("--device", default=None,
                    help="output audio device for --play: index or name (default: system default)")
-    p.add_argument("--torch-device", default=None, help="cuda | cpu (default: cuda if available)")
+    p.add_argument("--torch-device", default=None,
+                   help="compute device (default: the RTX 5060 Ti, asserted; cpu only with "
+                        "VOX_ALLOW_CPU=1, see TARGET.md)")
     p.set_defaults(func=run)
 
 
@@ -91,6 +93,16 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"tts: {backend.name} voice {backend.voice}, {result.tts_seconds:.2f} s in "
           f"{result.pieces} piece(s)")
+    if result.expressive:
+        for n, piece in enumerate(result.hints):
+            hints = []
+            if piece.speed != 1.0:
+                hints.append(f"speed {piece.speed:.2f}")
+            if piece.gain_db:
+                hints.append(f"gain {piece.gain_db:+.1f} dB")
+            if piece.explicit and n < len(result.hints) - 1:
+                hints.append(f"pause {piece.pause_after_s * 1000:.0f} ms")
+            print(f"  piece {n + 1}: {piece.text!r}" + (f"  [{', '.join(hints)}]" if hints else ""))
     if result.auto_pitch:
         print(f"auto pitch: {result.pitch:+.0f} semitones (TTS median F0 "
               f"{result.tts_median_f0:.1f} Hz -> target {result.target_f0:.1f} Hz)")

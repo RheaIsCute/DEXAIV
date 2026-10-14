@@ -2,6 +2,8 @@
 
 Low-latency real-time RVC voice changer for one user, one mic, one GPU (Windows + NVIDIA).
 Headless engine first; the research and design live in [docs/research/](docs/research/).
+It targets exactly one machine, described in [TARGET.md](TARGET.md) (RTX 5060 Ti, Virtual
+Audio Cable, NVIDIA Broadcast); the engine asserts that GPU at startup.
 
 **Status: Phases 0-2 plus the reordered Phase 3 of the
 [roadmap](docs/research/13_IMPLEMENTATION_ROADMAP.md) are built.** The conversion engine
@@ -87,6 +89,10 @@ Without `--pitch` the transposition is measured from the rendered speech and pri
 Picking a TTS voice already close to the target (a female TTS voice for a female model,
 pitch near 0) usually sounds best. Details are in [docs/TTS_NOTES.md](docs/TTS_NOTES.md).
 
+Informal text sounds informal (`src/vox/tts/expressive.py`): `...` and dashes become
+pauses that grow with the dot count, "heyyy" / "nooooo" render slower, a word in CAPS or
+`!!` / `??` gets emphasis (a little faster and louder). Plain text is untouched.
+
 ## The window (`vox gui`)
 
 Four screens over the same engine `vox run` drives: Live (start/stop, latency, levels,
@@ -105,4 +111,4 @@ Typing in the bar on the Live screen speaks the text in the model's voice over t
 output as the live voice; the microphone is muted while the clip is rendered and played.
 Suppression, headphone monitoring, hop auto-tuning and calibration are shown but not built
 yet. Design, deviations and measured acceptance: [docs/gui/GUI_SPEC.md](docs/gui/GUI_SPEC.md)
-and section 5 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md).
+and section 6 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md).

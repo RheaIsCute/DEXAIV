@@ -10,5 +10,96 @@
   "hubert_fp16": false,
   "decoder_fp16": false,
   "graphs": "auto",
-  "benchmark_ref": "benchmarks/results/perf.jsonl"
+  "hubert_autocast": "auto",
+  "benchmark_ref": "benchmarks/results/perf.jsonl",
+  "tuned": {
+    "base_f0_48k_v2|hop20|extra500|xf30|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.02799810841679573,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 15.143700002226979,
+          "p99": 16.23671700261184,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 14.522500001476146,
+          "p99": 15.534214997605886,
+          "hops": 50
+        }
+      }
+    },
+    "base_f0_48k_v2|hop30|extra500|xf30|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.04112254083156586,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 14.788150001550093,
+          "p99": 27.464353996037946,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 14.700400010042358,
+          "p99": 15.453797995724017,
+          "hops": 50
+        }
+      }
+    },
+    "base_f0_48k_v2|hop20|extra1000|xf30|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.04450049623847008,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 15.099399992323015,
+          "p99": 16.346125996060437,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 15.330349997384474,
+          "p99": 16.637434999865945,
+          "hops": 50
+        }
+      }
+    },
+    "base_f0_48k_v2|hop30|extra1000|xf30|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.036106597632169724,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 16.227450003498234,
+          "p99": 18.101717007375555,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 16.13445000111824,
+          "p99": 17.038646998553304,
+          "hops": 50
+        }
+      }
+    }
+  }
 }

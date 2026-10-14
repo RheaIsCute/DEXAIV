@@ -46,9 +46,10 @@ def _engine(args, registry, cache, shape_kw=None, **param_kw):
 
     shape = dataclasses.replace(defaults.DEFAULT_SHAPE, **(shape_kw or {}))
     params = RuntimeParams(f0_up_key=args.pitch, **param_kw)
-    precision = PrecisionParams(hubert_fp16=args.hubert_fp16, graphs=args.graphs)
+    precision = PrecisionParams(hubert_fp16=args.hubert_fp16, graphs=args.graphs,
+                                hubert_autocast=args.hubert_autocast)
     return load_engine(args.models_dir, args.model, shape, params, precision,
-                       registry=registry, cache=cache)
+                       registry=registry, cache=cache, profile_dir=args.profile)
 
 
 def _record(name: str, record: dict) -> None:
@@ -469,6 +470,10 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--pitch", type=float, default=0.0)
     parser.add_argument("--hubert-fp16", action="store_true")
+    parser.add_argument("--hubert-autocast", choices=("auto", "fp16", "bf16", "off"),
+                        default="auto", help="HuBERT autocast ladder (TARGET.md rule 2)")
+    parser.add_argument("--profile", type=Path, default=ROOT / "profiles" / "default",
+                        help="profile directory whose runtime.json stores warmup decisions")
     parser.add_argument("--graphs", choices=("on", "off", "auto"), default="auto",
                         help="CUDA graphs mode for the engine under test")
     parser.add_argument("--gate", choices=("on", "off"), default="off",

@@ -263,14 +263,87 @@ gated). For the microphone the shared-mode 22 ms stands until the
 driver's exclusive format is understood (PortAudio may be opening a different native rate
 and not converting); a USB microphone or ASIO would be the way around it.
 
-## 5. Phase 8 (2026-10-13): the control API and the DEXAIV window
+## 5. Single-target hardening (2026-10-13): RTX 5060 Ti only, and the expressive TTS layer
+
+`TARGET.md` (repo root) now defines the one supported machine; `CLAUDE.md` points every
+session at it. The rules it implies were implemented on `feature/expressive-tts` together
+with the expressive typed-speech layer (`docs/TTS_NOTES.md`, "Expressive typed speech").
+
+### 5.1 Deviations
+
+| # | Doc says | What was built | Why |
+|---|---|---|---|
+| D26 | Device = `cuda` if available else CPU (doc 12, Phase 0-3 code) | `config/target.py::select_device`: the engine resolves to the CUDA device whose name contains "5060 Ti" and asserts cc (12, 0), VRAM >= 15 GiB and the cu128 torch build; any other GPU, a `cuda:N` that is not it, or no CUDA is a `TargetError`. CPU only with `VOX_ALLOW_CPU=1` (set by `tests/conftest.py`). Every `load_engine` logs the check line | TARGET.md rule 1. The iGPU and the virtual display adapter are not CUDA devices, so CUDA enumeration could never pick them; the assertion guards against a second NVIDIA card, a wrong torch wheel, or running on another machine |
+| D27 | HuBERT FP16 autocast "default off until Phase 6 validates it" (D12) | `hubert_autocast: "auto"` (default): at warmup the ladder tries FP16 then BF16, renders 30 eager hops of the synthetic warmup signal with seeded decoder noise, and keeps the first candidate whose log-mel L1 against the FP32 eager render is <= 0.05 (the bar the graph replay has to clear). The choice is stored with the profile under the shape key and applied on later startups without measuring | TARGET.md rule 2. The gate is the eager-match check the doc 06 ladder asks for; the numbers are in R10 |
+| D28 | cuDNN `benchmark=False` always (doc 06 §5, D-less) | Still False everywhere a stage could run eagerly. During a graph capture's warmup runs `graphs._capture` may turn it on (`StageGraphs.autotune`), so cuDNN times its conv algorithms for the fixed shapes and the captured graph records the winners. Warmup captures once each way, times 60 replays of each, keeps autotune only if it is > 5% faster, and persists the decision under the shape key (`runtime.json: tuned`) | TARGET.md rule 4. PyTorch has no API to export cuDNN's algorithm cache, so the persisted thing is the decision plus the measurements; a later startup captures once (as before) and gets the same kernels because the shapes are the same. Live rebuilds (`worker._rebuild`) reuse the current decisions and never measure |
+| D29 | Index cap 200k vectors (doc 07, Phase 2) | `target.index_vector_cap(emb_dim)`: 2 GiB of the 12 GiB engine budget, ~700k vectors at 768-d; the startup log prints reserved/allocated memory against the budget | TARGET.md rule 3 |
+| D30 | Output device = host API default (doc 03 §8, Phase 3) | Default output = the first device whose name marks it as a virtual cable (VAC "Line 1"); default input unchanged (the host default microphone); `check_rate` keeps warning when the cable is not at 48 kHz | TARGET.md rule 6 |
+| D31 | No suppression setting at runtime (RNNoise is a calibration flag, Phase 5) | `LiveSession` resolves an effective `suppression` at start: explicit `--suppression on/off`, else the profile's `rnnoise_enabled`, except that an input named "NVIDIA Broadcast" defaults it off; the decision and its reason are logged and shown in the session line | TARGET.md: the Broadcast virtual mic is already denoised and double denoising hurts. The RNNoise stage itself is still Phase 5 work; this is the setting it will read |
+| D32 | `vox say` renders every piece at speed 1.0 and joins pieces with a constant 200 ms gap | Per-piece speed (kokoro `speed`, edge-tts `rate`), per-boundary pause and per-piece post-RVC gain from `tts/expressive.py`; the plain path is byte-identical (verified against the pre-change tree with a fixed TTS wav) | Feature prompt Part 1; see `docs/TTS_NOTES.md` |
+
+### 5.2 R10. What the hardening changed in the numbers (same machine, GPU otherwise idle)
+
+`vox bench perf --sweep benchmarks/sweeps/perf_graphs.yaml`, same clip, same model, same
+settings as the Phase 3 table in R5. New defaults: HuBERT autocast ladder (picked **FP16**
+at every point: eager-match log-mel L1 0.028-0.045 against the 0.05 bar, seeded noise,
+30 hops), cuDNN autotune measured and **rejected** at every point (persisted as
+`cudnn_autotune: false`), TF32 on as before. Logs: `out/perf_graphs_hardening.log`,
+`out/graph_probe_hardening_*.log`, `out/perf_locked_hardening.log`.
+
+| hop | extra | mode | Phase 3 p50 / p99 | hardened p50 / p99 | delta p50 / p99 |
+|---|---|---|---|---|---|
+| 20 ms | 500 | eager | 46.2 / 118.4 | 53.3 / 120.1 | +7.1 / +1.7 |
+| 30 ms | 500 | eager | 48.8 / 120.3 | 43.8 / 89.4 | -5.0 / -30.9 |
+| 20 ms | 1000 | eager | 41.7 / 114.0 | 40.3 / 113.3 | -1.4 / -0.7 |
+| 30 ms | 1000 | eager | 42.4 / 97.6 | 50.7 / 120.5 | +8.3 / +22.9 |
+| 20 ms | 500 | **graphs** | 16.9 / 19.1 | **15.8 / 18.4** | -1.1 / -0.7 |
+| 30 ms | 500 | **graphs** | 16.2 / 20.8 | **15.1 / 17.2** | -1.1 / -3.6 |
+| 20 ms | 1000 | **graphs** | 15.3 / 20.7 | **16.2 / 18.3** | +0.9 / -2.4 |
+| 30 ms | 1000 | **graphs** | 15.3 / 20.1 | **16.0 / 19.0** | +0.7 / -1.1 |
+
+- **Graphed p99 is 1-4 ms lower at every point; p50 is flat (within +-1 ms).** The eager
+  rows swing +-8 ms either way, which is the session-to-session host launch variance R5
+  already noted; eager is the fallback and is not tuned.
+- **HuBERT FP16 autocast buys nothing measurable per hop.** Graph probe, embed stage:
+  replay p50 3.25 ms (p99 3.85) with FP16 autocast against 2.6-3.0 ms FP32 in R2/R5; f0
+  7.36 ms and synth 4.77 ms are unchanged. At a 1.0-1.5 s window the HuBERT forward is
+  launch/memory-bound, so halving the matmul precision moves nothing and the autocast
+  casts add a few kernels. It passes the eager-match check (L1 0.02-0.045, against a
+  same-seed floor of ~0.001 for TF32 rounding and a new-seed floor of 0.30), so it stays
+  the default per TARGET.md rule 2; `--hubert-autocast off` is one flag away and the
+  decision is in `runtime.json`. **BF16** was never selected because FP16 passed first; in
+  the one engine build where FP16 failed before the noise was seeded (L1 0.076, a different
+  noise draw), BF16 scored 0.249: the lower mantissa shows, as doc 06 §5 predicted.
+- **cuDNN autotune vs heuristics: 14.5-16.2 ms either way, differences of -4% to +2%,
+  i.e. noise.** The 5% margin keeps the heuristics; a 2% margin flipped the decision from
+  run to run. The autotune path costs one extra capture (~1.2 s) and 2x60 timed replays
+  once per shape; subsequent startups read the record and capture once. The thing the
+  prompt asked to persist (the chosen algorithm configuration) cannot be exported from
+  PyTorch; the persisted decision gives the same kernels because the shapes are fixed.
+- **Q16 (power state), re-tested with the hardened engine:** `nvidia-smi -lgc 2000,3090`
+  (no admin prompt on this machine) and the hop 20 / extra 1000 graphed point: locked
+  15.7 / 18.7 ms against unlocked 16.2 / 18.3. Same result as R5: clocks are not the lever;
+  the GPU already sits at P1 / 2.8 GHz under the graphed load. "Prefer maximum performance"
+  in the NVIDIA control panel is a per-process driver profile that cannot be toggled from
+  the CLI; the clock lock is the stronger version of the same intervention and shows no
+  delta, so the control-panel setting is not worth a manual A/B. Q16 is closed.
+- **Startup log** now prints, in order: the hardware check line, `hubert autocast: ...`,
+  `cudnn autotune: ...` (or `(from profile)` for both), the graphs capture line, and a
+  memory line (`reserved 1.2-2.8 GiB of a 12 GiB engine budget`).
+- Nothing regressed in the engine tests (`tests/engine`, run after the sweep); the TTS
+  path is byte-identical for formal text (TTS_NOTES).
+- Caveat on measurement hygiene: a second checkout (`DEXAIV-tts`) was running GPU work
+  from another session during the first attempt (`vox run`, `pytest tests/engine`); those
+  numbers were discarded and the sweep re-run when `nvidia-smi` showed the GPU idle.
+
+## 6. Phase 8 (2026-10-13): the control API and the DEXAIV window
 
 Built from `docs/gui/GUI_SPEC.md` and the four mockups in `docs/gui/mockups/`, on top of
 the Phase 3 live engine and the `vox say` TTS path. Measured on the reference machine with
 a looping speech file as the microphone (`--input-file`) and the Virtual Audio Cable as
 the output, unless a row says otherwise.
 
-### 5.1 Deviations
+### 6.1 Deviations
 
 | # | Spec said | What was built | Why |
 |---|---|---|---|
@@ -282,7 +355,7 @@ the output, unless a row says otherwise.
 | G6 | "Converted mic is muted for the clip's duration" | Muted from the moment the clip's **GPU render starts**: `worker.hold` closes the live voice the way the gate does (SOLA tail faded once, context ring kept current), then `engine/override.py` plays the clip into the same output ring and fades live back in | At hop 20 ms the engine uses ~16.5 of every 20 ms of GPU (R5), so rendering a clip beside an open gate made hops late: **10 underruns over 9 clips** before the hold. The extra mute is the render time, 160-480 ms measured, plus 4 hops for the fade-out to reach the ring. |
 | G7 | (nothing) | While held, the worker queues 0.5 s of extra silence in the output ring and takes it back out when the hold ends; it is excluded from the latency estimate | A held hop still waits on the GPU once (the upload event, D21), so it can run late behind the render's kernels. Only silence is queued then, so a cushion of silence costs nothing audible. With it: **0 underruns over 18 clips** (0.9-7.6 s each), latency back to 120-150 ms afterwards. |
 | G8 | Index loaded lazily, only when `index_rate > 0` (P6) | When the selected model has an index the GUI starts the engine with it loaded even at rate 0 | Otherwise the Index-rate slider would need an engine restart to leave zero. Cost: the k-NN stage runs every hop, 0.4 ms p50 / 0.9 ms p99 for 44k vectors. |
-| G9 | Toggles for Suppression (RNNoise), Monitor in headphones, Auto-tune hop; "Recalibrate my voice" | Shown **disabled** with a "not built into the engine yet" tooltip; the commands answer with that message; Recalibrate says calibration is Phase 5 | None of the four existed in the engine this branch was cut from (`81c4927`). A switch that does nothing would be worse than one that says so. |
+| G9 | Toggles for Suppression (RNNoise), Monitor in headphones, Auto-tune hop; "Recalibrate my voice" | Shown **disabled** with a "not built into the engine yet" tooltip; the commands answer with that message; Recalibrate says calibration is Phase 5 | None of the four processes audio in the engine. Section 5 added the suppression *setting* (resolved at start, off by default on the NVIDIA Broadcast mic) but no RNNoise stage runs yet, so the switch stays disabled. A switch that does nothing would be worse than one that says so. |
 | G10 | "A dropped .pth imports via `vox models import`" | Dropped files are streamed to `POST /api/upload`, then `import_model` calls the same `discovery.import_model`; a `.pth` dropped with exactly one `.index` is staged alone in a folder so the pair is matched | A web page never sees a dropped file's path. Same code as the CLI import from there on. "Browse…" in the Index menu uploads an `.index` into the model's folder the same way. |
 | G11 | Profiler stats as in `LiveSession.snapshot` | Fixed a window bug there (stages the gate skips were measured against the total hop count and dropped out of the snapshot once any hop had been gated) and added per-stage CUDA-event times | Under graphs the host time of a stage is the ~0.05 ms launch of its replay; the Performance bars show device time. |
 | G12 | Mockup copy | "In use" (disabled) instead of a second "Use" on the active card; tags come from real data (in use, test voice, vector count, speakers); all four screens show the nav icons the Live mockup has; headroom is `1 - p99 / hop`; dips in the hop-time chart are windows of gated hops | The mockups show placeholder data. Where a label had no source in the engine it was derived from what the engine does report. |
@@ -291,7 +364,7 @@ The mockups reference a `support.js` that was not in the package, so they do not
 their own. For the side-by-side comparison they were rendered with a 50-line stand-in
 (template substitution only, values from each mockup's own script).
 
-### 5.2 Acceptance
+### 6.2 Acceptance
 
 | # | Check | Result |
 |---|---|---|
@@ -314,7 +387,13 @@ Tests: `tests/api/` (controller against a fake session, HTTP transport),
 `tests/unit/test_override.py`, and two new import rules (`ui/` reaches `vox` only through
 `vox.api`; the engine never imports the transport or `vox.tts`).
 
-### 5.3 Not verified
+After merging the section 5 branch (`feature/expressive-tts`) the engine tests (20), the
+other tests (314) and the whole live acceptance were run again on an idle GPU: all pass,
+9 more typed clips with 0 underruns, hop p50 / p99 15.6 / 16.4 ms. Typed clips in the
+window go through the expressive layer (speed, pauses and gain per piece) like `vox say`;
+the latency readout stays at ~130 ms while a clip renders (the cushion is not counted).
+
+### 6.3 Not verified
 
 - A real microphone through the GUI: every live run used the file-backed input.
 - Listening: clicks and gaps were judged from the cable recording, not by ear.

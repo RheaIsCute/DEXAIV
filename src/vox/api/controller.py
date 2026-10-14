@@ -483,7 +483,8 @@ class EngineController:
             input=self.store.get("input"), output=self.store.get("output"),
             exclusive=bool(self.store.get("exclusive")), input_file=self.input_file,
             loop_file=self.loop_file, device=self.device, registry=self.registry,
-            cache=self.cache)
+            cache=self.cache, profile_dir=self.profile_dir,
+            suppression_profile=self.profile.calibration.rnnoise_enabled)
         self.status, self.error = "starting", None
         self.perf, self._rebuilds_seen, self._recapturing = None, 0, False
         self.perf_history.clear()
@@ -821,7 +822,8 @@ class EngineController:
             engine = load_engine(self.models_dir, model, self._shape(), params,
                                  self._precision(), self.device, warmup_hops=0,
                                  registry=registry, cache=self.cache, graphs="off",
-                                 gate=GateConfig(enabled=False, use_vad=False), log=self._log)
+                                 gate=GateConfig(enabled=False, use_vad=False), log=self._log,
+                                 profile_dir=self.profile_dir)
             self._offline = (key, engine)
         return self._offline[1], False
 
@@ -863,7 +865,8 @@ class EngineController:
         under_start = ring.underruns if ring else 0
         started = time.perf_counter()
         try:
-            rendered = tts.render_tts(backend, tts.split_text(text))
+            pieces = tts.split_pieces(text)
+            rendered = tts.render_tts(backend, pieces)
         except TtsError as err:
             raise ApiError(str(err)) from err
         tts_s = time.perf_counter() - started
@@ -882,7 +885,8 @@ class EngineController:
             with self._beside_live(engine, session is not None):
                 result = tts.convert_rendered(
                     FullFileConverter.from_engine(engine), engine.device,
-                    engine.loaded.model.tgt_sr, rendered, params, None, target, seed=None)
+                    engine.loaded.model.tgt_sr, rendered, params, None, target, seed=None,
+                    pieces=pieces)
             convert_s = time.perf_counter() - converting
             device_sr = self._shape().device_sr
             clip = resample_array(result.audio, result.sr, device_sr)

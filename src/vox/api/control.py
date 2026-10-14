@@ -51,6 +51,25 @@ class LiveConfig:
     preload_extractors: bool = True  # so a live F0-method switch never loads a model
     registry: Any = None  # a ModelRegistry to reuse (keeps the model loaded across sessions)
     cache: dict | None = None  # loaded embedder / extractors / VAD to reuse likewise
+    profile_dir: Path | None = None  # where warmup's tuning decisions are persisted
+    # Noise suppression (the engine's RNNoise path): None = resolve at start from the
+    # profile's setting, except that the NVIDIA Broadcast virtual mic (already denoised)
+    # defaults it OFF (TARGET.md: double denoising hurts). True/False = explicit.
+    suppression: bool | None = None
+    suppression_profile: bool = False  # calibration.json's rnnoise_enabled
+
+
+BROADCAST_MARKER = "nvidia broadcast"
+
+
+def resolve_suppression(requested: bool | None, profile_default: bool,
+                        input_name: str | None) -> tuple[bool, str]:
+    """The effective suppression setting and a one-line reason."""
+    if requested is not None:
+        return requested, "explicit"
+    if input_name and BROADCAST_MARKER in input_name.lower():
+        return False, "input is the NVIDIA Broadcast virtual mic (already denoised)"
+    return profile_default, "profile"
 
 
 class LiveSession:
@@ -68,6 +87,7 @@ class LiveSession:
         self.warnings: list[str] = []
         self.in_device = None
         self.out_device = None
+        self.suppression = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -84,10 +104,15 @@ class LiveSession:
                     self.warnings.append(warning)
                     self.log(f"warning: {warning}")
 
+        input_name = self.in_device.name if self.in_device is not None else None
+        self.suppression, why = resolve_suppression(cfg.suppression, cfg.suppression_profile,
+                                                    input_name)
+        self.log(f"suppression: {'on' if self.suppression else 'off'} ({why})")
+
         cache: dict = cfg.cache if cfg.cache is not None else {}
         engine = load_engine(cfg.models_dir, cfg.model, cfg.shape, cfg.params, cfg.precision,
                              cfg.device, registry=cfg.registry, cache=cache, gate=cfg.gate,
-                             log=self.log)
+                             log=self.log, profile_dir=cfg.profile_dir)
         self.engine = engine
         extractors = {}
         if cfg.preload_extractors and engine.pipeline.extractor is not None:
@@ -151,6 +176,7 @@ class LiveSession:
                 f" | hop {plan.block_ms:.0f} ms, overlap {plan.overlap_ms:.0f}, search "
                 f"{plan.search_ms:.0f}, extra {plan.extra_ms:.0f} | f0 {e.params.f0_method} | "
                 f"mode {e.mode} | gate {'on' if cfg.gate.enabled else 'off'} | "
+                f"suppression {'on' if self.suppression else 'off'} | "
                 f"fill target {1000 * self.worker.fill_target / plan.device_sr:.0f} ms | "
                 f"device latency in {self.audio.health.input_latency_ms:.1f} / out "
                 f"{self.audio.health.output_latency_ms:.1f} ms")

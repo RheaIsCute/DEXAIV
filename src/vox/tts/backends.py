@@ -104,7 +104,7 @@ class KokoroBackend(TtsBackend):
             kokoro.create("Hi.", voice=self.voice, speed=1.0,
                           lang=KOKORO_LANGS.get(self.voice[0], "en-us"))
 
-    def synthesize(self, text: str, out_wav_path: Path) -> int:
+    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
         from vox.audio.resample import save_audio
 
         self._require()
@@ -112,9 +112,14 @@ class KokoroBackend(TtsBackend):
         if self.voice not in kokoro.get_voices():
             raise TtsError(f"kokoro has no voice {self.voice!r} (see 'vox say --list-voices')")
         lang = KOKORO_LANGS.get(self.voice[0], "en-us")
-        samples, sr = kokoro.create(text, voice=self.voice, speed=1.0, lang=lang)
+        samples, sr = kokoro.create(text, voice=self.voice, speed=float(speed), lang=lang)
         save_audio(out_wav_path, samples, sr)
         return sr
+
+
+def edge_rate(speed: float) -> str:
+    """edge-tts prosody rate for a relative speed: 0.92 -> "-8%", 1.05 -> "+5%"."""
+    return f"{round((speed - 1.0) * 100.0):+d}%"
 
 
 class EdgeBackend(TtsBackend):
@@ -148,14 +153,16 @@ class EdgeBackend(TtsBackend):
         edge_tts = self._edge()
         return sorted(v["ShortName"] for v in self._run(edge_tts.list_voices()))
 
-    def synthesize(self, text: str, out_wav_path: Path) -> int:
+    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
         from vox.audio.resample import load_audio, save_audio
 
         edge_tts = self._edge()
         out_wav_path = Path(out_wav_path)
         mp3 = out_wav_path.with_suffix(".mp3")  # the service streams MP3
+        # The rate is only sent when it differs from normal, so speed 1.0 is the old request.
+        prosody = {"rate": edge_rate(speed)} if speed != 1.0 else {}
         try:
-            self._run(edge_tts.Communicate(text, self.voice).save(str(mp3)))
+            self._run(edge_tts.Communicate(text, self.voice, **prosody).save(str(mp3)))
             audio, sr = load_audio(mp3)
         finally:
             mp3.unlink(missing_ok=True)

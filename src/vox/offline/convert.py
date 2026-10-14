@@ -179,10 +179,11 @@ def render_full(engine: Engine, audio: np.ndarray, seed: int | None = 0,
 def convert_file(src: Path, dst: Path, models_dir: Path, model_name: str, mode: str = "stream",
                  shape: ShapeParams | None = None, params: RuntimeParams | None = None,
                  precision: PrecisionParams | None = None, device: str | None = None,
-                 out_sr: int | None = None, gate=None) -> dict:
+                 out_sr: int | None = None, gate=None, profile_dir: Path | None = None) -> dict:
     """Convert one file. Returns a small summary dict (and the engine, for reporting)."""
     engine = load_engine(models_dir, model_name, shape, params, precision, device,
-                         warmup_hops=5 if mode == "stream" else 0, gate=gate)
+                         warmup_hops=5 if mode == "stream" else 0, gate=gate,
+                         profile_dir=profile_dir)
     summary: dict = {"mode": mode, "model": model_name, "engine": engine}
     if mode == "full":
         audio, _ = load_audio(src, SR)
