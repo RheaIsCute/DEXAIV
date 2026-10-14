@@ -28,4 +28,11 @@ models/*/
 benchmarks/corpus/*.wav
 benchmarks/corpus/*.flac
 benchmarks/results/
-out/
+# out/ is scratch, except the committed expressive acceptance wavs (docs/TTS_NOTES.md)
+out/*
+!out/expressive/
+out/expressive/*
+!out/expressive/*.wav
+!out/expressive/mae/
+out/expressive/mae/*
+!out/expressive/mae/*.wav

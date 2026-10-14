@@ -3,6 +3,10 @@
 Long text is split on sentence boundaries into pieces of at most ~30 s, each piece is
 rendered and converted on its own, and the results are joined with a 10 ms crossfade. One
 transposition is used for the whole utterance so the voice does not jump between pieces.
+
+Informal text gets its render hints from ``vox.tts.expressive``: per-piece TTS speed, a
+per-boundary pause (dots and dashes) and a per-piece gain applied to the *converted* audio
+so it survives the RVC stage. A text without any mark takes exactly the old path.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ import dataclasses
 import math
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -23,22 +27,20 @@ from vox.config.store import Profile
 from vox.offline.convert import SR, FullFileConverter
 from vox.offline.simulate import load_engine
 from vox.tts.base import TtsBackend, TtsError
+from vox.tts.expressive import SENTENCE_GAP_S, ExpressivePiece, analyze, split_sentences
 
 DEFAULT_TARGET_F0_HZ = 200.0
 TARGET_F0_KEY = "target_f0_median_hz"  # optional, in model_overrides.json or config.json
 MAX_PIECE_S = 30.0
 CHARS_PER_SECOND = 14.0  # conservative speaking rate used to size pieces before rendering
 CROSSFADE_MS = 10.0
-PIECE_GAP_S = 0.2  # backends trim silence, so restore a sentence pause between pieces
+PIECE_GAP_S = SENTENCE_GAP_S  # backends trim silence, so restore a sentence pause between pieces
+PEAK = 0.99  # ceiling after per-piece gain (the converter itself normalises to this)
 MAX_PITCH = 24
 
-_SENTENCE_END = re.compile(  # after the terminator, or after one closing quote / bracket
-    r"(?<=[.!?…。！？][\"'”’)\]])\s+|(?<=[.!?…。！？])\s+|\n+")
 _CLAUSE_END = re.compile(r"(?<=[,;:])\s+")
 
-
-def split_sentences(text: str) -> list[str]:
-    return [s.strip() for s in _SENTENCE_END.split(text) if s.strip()]
+__all__ = ["ExpressivePiece", "analyze", "split_pieces", "split_sentences", "split_text"]
 
 
 def _pack(parts: list[str], limit: int) -> list[str]:
@@ -52,21 +54,47 @@ def _pack(parts: list[str], limit: int) -> list[str]:
     return packed
 
 
-def split_text(text: str, max_seconds: float = MAX_PIECE_S,
-               chars_per_second: float = CHARS_PER_SECOND) -> list[str]:
-    """Pieces of whole sentences, each estimated to speak in at most ``max_seconds``.
+def _pack_pieces(parts: list[ExpressivePiece], limit: int) -> list[ExpressivePiece]:
+    """``_pack`` for pieces: only neighbours with the same hints join, never across an
+    explicit pause; the joined piece keeps the pause of its last member."""
+    packed: list[ExpressivePiece] = []
+    for part in parts:
+        last = packed[-1] if packed else None
+        if (last is not None and last.same_hints(part) and not last.explicit
+                and len(last.text) + 1 + len(part.text) <= limit):
+            packed[-1] = replace(part, text=last.text + " " + part.text)
+        else:
+            packed.append(part)
+    return packed
 
-    A single sentence longer than that is cut at clause punctuation, then between words.
+
+def split_pieces(text: str, max_seconds: float = MAX_PIECE_S,
+                 chars_per_second: float = CHARS_PER_SECOND) -> list[ExpressivePiece]:
+    """Pieces of whole sentences with render hints, each estimated to speak in at most
+    ``max_seconds``. A single piece longer than that is cut at clause punctuation, then
+    between words; the cuts inherit the hints and the explicit pause stays on the last cut.
     """
     limit = max(1, int(max_seconds * chars_per_second))
-    parts: list[str] = []
-    for sentence in split_sentences(text):
-        if len(sentence) <= limit:
-            parts.append(sentence)
+    parts: list[ExpressivePiece] = []
+    for piece in analyze(text):
+        if len(piece.text) <= limit:
+            parts.append(piece)
             continue
-        for clause in _pack(_CLAUSE_END.split(sentence), limit):
-            parts.extend(_pack(clause.split(), limit) if len(clause) > limit else [clause])
-    return _pack(parts, limit)
+        cuts: list[str] = []
+        for clause in _pack(_CLAUSE_END.split(piece.text), limit):
+            cuts.extend(_pack(clause.split(), limit) if len(clause) > limit else [clause])
+        for n, cut in enumerate(cuts):
+            last = n == len(cuts) - 1
+            parts.append(replace(piece, text=cut,
+                                 pause_after_s=piece.pause_after_s if last else PIECE_GAP_S,
+                                 explicit=piece.explicit and last))
+    return _pack_pieces(parts, limit)
+
+
+def split_text(text: str, max_seconds: float = MAX_PIECE_S,
+               chars_per_second: float = CHARS_PER_SECOND) -> list[str]:
+    """The texts of ``split_pieces``."""
+    return [p.text for p in split_pieces(text, max_seconds, chars_per_second)]
 
 
 def crossfade_concat(pieces: list[np.ndarray], sr: int, ms: float = CROSSFADE_MS) -> np.ndarray:
@@ -125,26 +153,50 @@ class SayResult:
     pieces: int
     tts_seconds: float
     path: Path | None = None
+    hints: list[ExpressivePiece] = dataclasses.field(default_factory=list)
 
     @property
     def seconds(self) -> float:
         return len(self.audio) / self.sr
 
+    @property
+    def expressive(self) -> bool:
+        """Did any piece carry a render hint (speed, gain or an explicit pause)?"""
+        return not all(p.plain for p in self.hints)
 
-def render_tts(backend: TtsBackend, pieces: list[str]) -> list[np.ndarray]:
-    """Render each text piece and load it as the mono 16 kHz the converter expects."""
+
+def render_tts(backend: TtsBackend, pieces: list[ExpressivePiece]) -> list[np.ndarray]:
+    """Render each piece at its speed and load it as the mono 16 kHz the converter expects.
+
+    Each piece but the last gets its boundary pause appended as silence (both backends trim
+    their own trailing silence).
+    """
     rendered = []
     with tempfile.TemporaryDirectory(prefix="vox_tts_") as tmp:
         for n, piece in enumerate(pieces):
             wav = Path(tmp) / f"piece_{n:03d}.wav"
-            backend.synthesize(piece, wav)
+            backend.synthesize(piece.text, wav, speed=piece.speed)
             audio, _ = load_audio(wav, SR)
             if not len(audio):
-                raise TtsError(f"{backend.name} produced no audio for {piece[:40]!r}")
+                raise TtsError(f"{backend.name} produced no audio for {piece.text[:40]!r}")
             if n < len(pieces) - 1:
-                audio = np.concatenate([audio, np.zeros(int(SR * PIECE_GAP_S), np.float32)])
+                gap = np.zeros(round(SR * piece.pause_after_s), np.float32)
+                audio = np.concatenate([audio, gap])
             rendered.append(audio)
     return rendered
+
+
+def apply_gain(audio: np.ndarray, gain_db: float) -> np.ndarray:
+    """Per-piece gain on converted audio; 0 dB returns the input object untouched."""
+    if gain_db == 0.0:
+        return audio
+    return (audio * 10.0 ** (gain_db / 20.0)).astype(np.float32)
+
+
+def limit_peak(audio: np.ndarray, peak: float = PEAK) -> np.ndarray:
+    """Scale the whole utterance down if a gained piece pushed it past ``peak``."""
+    top = float(np.abs(audio).max()) if len(audio) else 0.0
+    return (audio * (peak / top)).astype(np.float32) if top > peak else audio
 
 
 def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
@@ -158,7 +210,7 @@ def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
     ``target_f0``; ``params.f0_up_key`` is ignored either way (it is calibrated for the
     user's microphone voice, not for a TTS voice).
     """
-    pieces = split_text(text, max_piece_s)
+    pieces = split_pieces(text, max_piece_s)
     if not pieces:
         raise TtsError("nothing to say: the text is empty")
     rendered = render_tts(backend, pieces)
@@ -176,13 +228,17 @@ def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
     params = dataclasses.replace(engine.params, f0_up_key=float(pitch))
 
     converted = []
-    for audio in rendered:
+    for piece, audio in zip(pieces, rendered):
         if seed is not None:
             torch.manual_seed(seed)
-        converted.append(converter.convert(audio, params))
+        # Gain goes on the converted audio: applied before RVC it would be normalised away.
+        converted.append(apply_gain(converter.convert(audio, params), piece.gain_db))
     sr = engine.loaded.model.tgt_sr
-    result = SayResult(crossfade_concat(converted, sr), sr, float(pitch), auto, measured,
-                       target_f0, len(pieces), sum(len(a) for a in rendered) / SR)
+    joined = crossfade_concat(converted, sr)
+    if any(p.gain_db for p in pieces):
+        joined = limit_peak(joined)
+    result = SayResult(joined, sr, float(pitch), auto, measured, target_f0, len(pieces),
+                       sum(len(a) for a in rendered) / SR, hints=pieces)
     if out is not None:
         save_audio(out, result.audio, sr)
         result.path = Path(out)

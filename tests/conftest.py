@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+
+# The pure-CPU engine path exists only for unit tests (TARGET.md rule 1).
+os.environ.setdefault("VOX_ALLOW_CPU", "1")
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"

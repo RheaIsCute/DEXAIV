@@ -20,7 +20,7 @@ class FakeBackend(TtsBackend):
     def voices(self):
         return ["one", "two"]
 
-    def synthesize(self, text, out_wav_path):
+    def synthesize(self, text, out_wav_path, speed=1.0):
         return 24000
 
 
@@ -89,3 +89,9 @@ def test_default_is_kokoro_with_edge_as_the_fallback(monkeypatch, tmp_path, caps
     monkeypatch.setattr(backends, "_installed", lambda module: False)
     with pytest.raises(TtsError, match="no TTS backend available"):
         pick_backend(None, None, tmp_path)
+
+
+@pytest.mark.parametrize("speed, rate", [(1.0, "+0%"), (0.92, "-8%"), (1.05, "+5%"),
+                                         (0.78, "-22%"), (0.8733, "-13%")])
+def test_edge_rate_string(speed, rate):
+    assert backends.edge_rate(speed) == rate

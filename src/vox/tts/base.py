@@ -37,5 +37,10 @@ class TtsBackend(ABC):
         """Names accepted as ``voice``."""
 
     @abstractmethod
-    def synthesize(self, text: str, out_wav_path: Path) -> int:
-        """Render ``text`` in ``self.voice`` to a mono WAV. Returns its sample rate."""
+    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
+        """Render ``text`` in ``self.voice`` to a mono WAV. Returns its sample rate.
+
+        ``speed`` is the render rate relative to the voice's normal pace (1.0); the
+        expressive layer passes values in roughly 0.78 .. 1.05. A backend must render
+        ``speed=1.0`` exactly as it did before the parameter existed.
+        """

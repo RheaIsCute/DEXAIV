@@ -121,6 +121,7 @@ class ToneBackend(TtsBackend):
     def __init__(self):
         super().__init__()
         self.texts = []
+        self.speeds = []
 
     def unavailable_reason(self):
         return None
@@ -128,8 +129,9 @@ class ToneBackend(TtsBackend):
     def voices(self):
         return ["sine"]
 
-    def synthesize(self, text, out_wav_path):
+    def synthesize(self, text, out_wav_path, speed=1.0):
         self.texts.append(text)
+        self.speeds.append(speed)
         save_audio(out_wav_path, 0.1 * np.ones(24000, np.float32), 24000)  # 1 s at 24 kHz
         return 24000
 
@@ -212,3 +214,64 @@ def test_long_text_is_converted_piecewise_with_one_pitch(fake_engine, tmp_path):
 def test_empty_text_is_an_error(fake_engine, tmp_path):
     with pytest.raises(TtsError, match="empty"):
         speak.speak("  \n", ToneBackend(), tmp_path, "Voice")
+
+
+# ------------------------------------------------------------------------- expressive
+
+
+def test_split_pieces_keeps_formal_text_identical_to_split_text():
+    text = "A sentence of some words. " * 100 + "And a very long one, " + "word " * 300 + "end."
+    pieces = speak.split_pieces(text)
+    assert [p.text for p in pieces] == speak.split_text(text)
+    assert all(p.plain and p.pause_after_s == speak.PIECE_GAP_S for p in pieces)
+
+
+def test_pieces_never_pack_across_an_explicit_pause_or_different_hints():
+    pieces = speak.split_pieces("hey... hey!! are you fr right now. Fine. Ok.")
+    assert [p.text for p in pieces] == ["hey", "hey!", "are you fr right now. Fine. Ok."]
+    assert pieces[0].explicit and pieces[0].pause_after_s == pytest.approx(0.25)
+    assert pieces[1].gain_db == 1.5 and pieces[2].plain
+
+
+def test_overlong_marked_piece_keeps_hints_on_every_cut_and_the_pause_on_the_last():
+    text = "sooo " + "word " * 40 + "end..."
+    pieces = speak.split_pieces(text, max_seconds=5, chars_per_second=10)
+    assert len(pieces) > 1
+    assert all(p.speed == pytest.approx(0.92) for p in pieces)
+    assert [p.explicit for p in pieces] == [False] * (len(pieces) - 1) + [True]
+    assert pieces[-1].pause_after_s == pytest.approx(0.25)
+
+
+def test_render_uses_per_piece_speed_and_per_boundary_pause(fake_engine, tmp_path):
+    converter, _ = fake_engine
+    backend = ToneBackend()
+    result = speak.speak("hey... hey!! are you fr right now", backend, tmp_path, "Voice",
+                         pitch=0)
+    assert backend.texts == ["hey", "hey!", "are you fr right now"]
+    assert backend.speeds == [1.0, pytest.approx(1.05), 1.0]
+    lengths = [n for n, _ in converter.calls]
+    assert lengths == [16000 + 4000, 16000 + int(16000 * speak.PIECE_GAP_S), 16000]
+    assert result.expressive and result.pieces == 3
+
+
+def test_gain_is_applied_after_conversion_and_the_peak_is_limited(fake_engine, tmp_path):
+    # max_piece_s=0.3 (4 characters) keeps "hey!" and "hey" as two pieces in both runs
+    loud = speak.speak("hey!! hey", ToneBackend(), tmp_path, "Voice", pitch=0, max_piece_s=0.3)
+    plain = speak.speak("hey! hey", ToneBackend(), tmp_path, "Voice", pitch=0, max_piece_s=0.3)
+    assert loud.expressive and not plain.expressive
+    assert len(loud.audio) == len(plain.audio)
+    sr = plain.sr
+    first, last = slice(0, sr // 2), slice(-sr // 2, None)  # away from the 10 ms seam
+    assert np.allclose(loud.audio[first], plain.audio[first] * 10 ** (1.5 / 20), atol=1e-6)
+    assert np.allclose(loud.audio[last], plain.audio[last], atol=1e-6)
+    limited = speak.limit_peak(np.array([0.5, 1.5, -1.5], np.float32))
+    assert np.allclose(limited, [0.33, 0.99, -0.99], atol=1e-6)
+    assert speak.apply_gain(plain.audio, 0.0) is plain.audio
+
+
+def test_formal_text_takes_the_plain_path(fake_engine, tmp_path):
+    converter, _ = fake_engine
+    backend = ToneBackend()
+    result = speak.speak("Hello there. General greeting.", backend, tmp_path, "Voice", pitch=0)
+    assert backend.speeds == [1.0] and not result.expressive and result.hints[0].plain
+    assert result.audio is not None and len(converter.calls) == 1

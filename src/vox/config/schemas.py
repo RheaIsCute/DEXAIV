@@ -71,9 +71,19 @@ class PrecisionParams:
     """Set once before warmup; never toggled while running (docs/research/06 §5)."""
 
     tf32: bool = True
-    hubert_fp16: bool = False
+    hubert_fp16: bool = False  # legacy: True forces hubert_autocast = "fp16"
     decoder_fp16: bool = False
     graphs: str = "auto"  # CUDA graphs: "on" | "off" | "auto" (capture, verify, else eager)
+    # HuBERT autocast: "auto" tries fp16 then bf16 at warmup and keeps the first that
+    # matches the FP32 eager render (TARGET.md rule 2); "fp16" | "bf16" force; "off".
+    hubert_autocast: str = "auto"
+
+    @property
+    def hubert_candidates(self) -> tuple[str, ...]:
+        """Autocast modes to try, in order; the first that passes the eager-match wins."""
+        if self.hubert_fp16:
+            return ("fp16",)
+        return ("fp16", "bf16") if self.hubert_autocast == "auto" else (self.hubert_autocast,)
 
 
 # ----------------------------------------------------------------------------- profile files
@@ -161,7 +171,12 @@ class RuntimeProfile:
     hubert_fp16: bool = False
     decoder_fp16: bool = False
     graphs: str = "auto"
+    hubert_autocast: str = "auto"
     benchmark_ref: str = ""
+    # Persisted warmup decisions keyed by the fixed shape (TARGET.md rule 4): the HuBERT
+    # autocast that passed the eager-match and whether cuDNN autotune beat its heuristics,
+    # so startup applies them instead of re-measuring. Written by the engine at warmup.
+    tuned: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def shape(self, device_sr: int = 48000) -> ShapeParams:
         return ShapeParams(
@@ -179,6 +194,7 @@ class RuntimeProfile:
             hubert_fp16=self.hubert_fp16,
             decoder_fp16=self.decoder_fp16,
             graphs=self.graphs,
+            hubert_autocast=self.hubert_autocast,
         )
 
 

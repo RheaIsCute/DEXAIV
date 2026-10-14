@@ -65,14 +65,21 @@ def list_devices(hostapi: str | None = WASAPI) -> list[DeviceInfo]:
 
 def resolve_device(spec: str | int | None, kind: str, hostapi: str | None = WASAPI
                    ) -> DeviceInfo:
-    """``spec``: PortAudio index, name fragment, or None for the host API default.
+    """``spec``: PortAudio index, name fragment, or None for the default.
 
     ``kind`` is ``"input"`` or ``"output"``; the device must have channels of that kind.
+    The default output is the virtual cable's input line when one is present (TARGET.md
+    rule 6: the engine renders into the VAC, never onto the speakers by accident); the
+    default input is the host API's default microphone.
     """
     devices = list_devices(hostapi)
     want = "max_input_channels" if kind == "input" else "max_output_channels"
     usable = [d for d in devices if getattr(d, want) > 0]
     if spec is None or spec == "":
+        if kind == "output":
+            for d in usable:
+                if d.is_cable:
+                    return d
         for d in usable:
             if (d.default_input if kind == "input" else d.default_output):
                 return d

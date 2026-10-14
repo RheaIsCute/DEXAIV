@@ -30,7 +30,9 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True, help="model name under the models directory")
     p.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS)
     p.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
-    p.add_argument("--device", default=None, help="cuda | cpu (default: cuda if available)")
+    p.add_argument("--device", default=None,
+                   help="compute device (default: the RTX 5060 Ti, asserted at startup; "
+                        "cpu only with VOX_ALLOW_CPU=1, see TARGET.md)")
     p.add_argument("--pitch", type=float, default=None, dest="f0_up_key",
                    help="transpose in semitones")
     p.add_argument("--index-rate", type=float, default=None)
@@ -42,7 +44,10 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--block-ms", type=float, default=None)
     p.add_argument("--crossfade-ms", type=float, default=None)
     p.add_argument("--extra-ms", type=float, default=None)
-    p.add_argument("--hubert-fp16", action="store_true")
+    p.add_argument("--hubert-fp16", action="store_true", help="same as --hubert-autocast fp16")
+    p.add_argument("--hubert-autocast", choices=("auto", "fp16", "bf16", "off"), default=None,
+                   help="HuBERT autocast: auto (default; first of fp16, bf16 that matches "
+                        "the FP32 eager render at warmup, decision stored in the profile)")
     p.add_argument("--graphs", choices=("on", "off", "auto"), default=None,
                    help="CUDA graphs: on (fail if capture fails), off (eager), auto "
                         "(capture, verify against eager, else eager; the default)")
@@ -78,8 +83,11 @@ def resolve(args: argparse.Namespace):
     precision = profile.runtime.precision()
     if args.hubert_fp16:
         precision = dataclasses.replace(precision, hubert_fp16=True)
+    if getattr(args, "hubert_autocast", None):
+        precision = dataclasses.replace(precision, hubert_autocast=args.hubert_autocast)
     if getattr(args, "graphs", None):
         precision = dataclasses.replace(precision, graphs=args.graphs)
+    args.profile_obj = profile
     return shape, params, precision
 
 
@@ -90,7 +98,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
     shape, params, precision = resolve(args)
     summary = convert_file(args.input, args.output, args.models_dir, args.model, args.mode,
                            shape, params, precision, args.device, args.out_sr,
-                           gate=args.gate_config)
+                           gate=args.gate_config, profile_dir=args.profile)
     print(f"wrote {summary['path']} ({summary['seconds']:.2f} s @ {summary['sr']} Hz, "
           f"mode={args.mode})")
     result = summary.get("result")
@@ -210,7 +218,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                      output=args.output, exclusive=args.exclusive,
                      exclusive_input=args.exclusive_input, callback_ms=args.callback_ms,
                      fill_target_ms=args.fill_ms, input_file=args.input_file,
-                     loop_file=args.loop_file, device=args.device)
+                     loop_file=args.loop_file, device=args.device, profile_dir=args.profile,
+                     suppression={"on": True, "off": False}.get(args.suppression),
+                     suppression_profile=args.profile_obj.calibration.rnnoise_enabled)
     session = LiveSession(cfg)
     session.start()
     print(RUN_HELP)
@@ -308,6 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_engine_args(p)
     p.add_argument("--input", default=None, help="input device index or name fragment")
     p.add_argument("--output", default=None, help="output device index or name fragment")
+    p.add_argument("--suppression", choices=("on", "off"), default=None,
+                   help="the engine's noise suppression (default: the profile's setting, "
+                        "but off when the input is the NVIDIA Broadcast virtual mic)")
     p.add_argument("--exclusive", action="store_true",
                    help="WASAPI exclusive mode on the output stream (~5 ms instead of 22)")
     p.add_argument("--exclusive-input", action="store_true",

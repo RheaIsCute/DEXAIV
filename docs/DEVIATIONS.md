@@ -262,3 +262,21 @@ gate closed on a silent microphone (the output-ring term reads the full fill tar
 gated). For the microphone the shared-mode 22 ms stands until the
 driver's exclusive format is understood (PortAudio may be opening a different native rate
 and not converting); a USB microphone or ASIO would be the way around it.
+
+## 5. Single-target hardening (2026-10-13): RTX 5060 Ti only, and the expressive TTS layer
+
+`TARGET.md` (repo root) now defines the one supported machine; `CLAUDE.md` points every
+session at it. The rules it implies were implemented on `feature/expressive-tts` together
+with the expressive typed-speech layer (`docs/TTS_NOTES.md`, "Expressive typed speech").
+
+### 5.1 Deviations
+
+| # | Doc says | What was built | Why |
+|---|---|---|---|
+| D26 | Device = `cuda` if available else CPU (doc 12, Phase 0-3 code) | `config/target.py::select_device`: the engine resolves to the CUDA device whose name contains "5060 Ti" and asserts cc (12, 0), VRAM >= 15 GiB and the cu128 torch build; any other GPU, a `cuda:N` that is not it, or no CUDA is a `TargetError`. CPU only with `VOX_ALLOW_CPU=1` (set by `tests/conftest.py`). Every `load_engine` logs the check line | TARGET.md rule 1. The iGPU and the virtual display adapter are not CUDA devices, so CUDA enumeration could never pick them; the assertion guards against a second NVIDIA card, a wrong torch wheel, or running on another machine |
+| D27 | HuBERT FP16 autocast "default off until Phase 6 validates it" (D12) | `hubert_autocast: "auto"` (default): at warmup the ladder tries FP16 then BF16, renders 30 eager hops of the synthetic warmup signal with seeded decoder noise, and keeps the first candidate whose log-mel L1 against the FP32 eager render is <= 0.05 (the bar the graph replay has to clear). The choice is stored with the profile under the shape key and applied on later startups without measuring | TARGET.md rule 2. The gate is the eager-match check the doc 06 ladder asks for; the numbers are in R10 |
+| D28 | cuDNN `benchmark=False` always (doc 06 §5, D-less) | Still False everywhere a stage could run eagerly. During a graph capture's warmup runs `graphs._capture` may turn it on (`StageGraphs.autotune`), so cuDNN times its conv algorithms for the fixed shapes and the captured graph records the winners. Warmup captures once each way, times 60 replays of each, keeps autotune only if it is > 5% faster, and persists the decision under the shape key (`runtime.json: tuned`) | TARGET.md rule 4. PyTorch has no API to export cuDNN's algorithm cache, so the persisted thing is the decision plus the measurements; a later startup captures once (as before) and gets the same kernels because the shapes are the same. Live rebuilds (`worker._rebuild`) reuse the current decisions and never measure |
+| D29 | Index cap 200k vectors (doc 07, Phase 2) | `target.index_vector_cap(emb_dim)`: 2 GiB of the 12 GiB engine budget, ~700k vectors at 768-d; the startup log prints reserved/allocated memory against the budget | TARGET.md rule 3 |
+| D30 | Output device = host API default (doc 03 §8, Phase 3) | Default output = the first device whose name marks it as a virtual cable (VAC "Line 1"); default input unchanged (the host default microphone); `check_rate` keeps warning when the cable is not at 48 kHz | TARGET.md rule 6 |
+| D31 | No suppression setting at runtime (RNNoise is a calibration flag, Phase 5) | `LiveSession` resolves an effective `suppression` at start: explicit `--suppression on/off`, else the profile's `rnnoise_enabled`, except that an input named "NVIDIA Broadcast" defaults it off; the decision and its reason are logged and shown in the session line | TARGET.md: the Broadcast virtual mic is already denoised and double denoising hurts. The RNNoise stage itself is still Phase 5 work; this is the setting it will read |
+| D32 | `vox say` renders every piece at speed 1.0 and joins pieces with a constant 200 ms gap | Per-piece speed (kokoro `speed`, edge-tts `rate`), per-boundary pause and per-piece post-RVC gain from `tts/expressive.py`; the plain path is byte-identical (verified against the pre-change tree with a fixed TTS wav) | Feature prompt Part 1; see `docs/TTS_NOTES.md` |

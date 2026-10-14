@@ -94,3 +94,60 @@ measured once over all pieces.
   judge how close they are to the target voices.
 - `--play` ran on the system default device and with `--device` set to that same
   device's name; no second output device was tried.
+
+## Expressive typed speech (`vox.tts.expressive`)
+
+Informal text should sound informal. The RVC stage keeps whatever prosody the TTS renders,
+so every expressive decision is made before or at the TTS call, by the pure function
+`expressive.analyze(text) -> list[ExpressivePiece]` (text for the phonemizer + render
+hints); `speak.split_pieces` packs those pieces under the 30 s budget exactly as
+`split_text` packed sentences, except that neighbours with different hints never join and
+an explicit pause is never packed away. Rules, each unit-tested in
+`tests/tts/test_expressive.py`:
+
+| Mark | Phonemizer sees | Render hint |
+|---|---|---|
+| `...` `....` `…` `--` `—` | the dots removed; a piece boundary there | pause of 250 ms + 120 ms per dot beyond three, capped at 1.2 s (a dash = 250 ms), inserted as silence between the pieces instead of the usual 200 ms sentence gap |
+| letter repeated 3+ times ("heyyy", "nooooo") | two repeats ("heyy", "noo") | speed 0.92 at 3 repeats down to 0.78 at 6+, linear, from the longest run in the clause; a marked sentence is split at `, ; :` so only its clause slows down |
+| word in ALL CAPS (2+ letters, not in the `ACRONYMS` allowlist: TTS, GPU, OK, LOL, US, ...) | lowercased; `!` appended if the clause has no terminal punctuation (a trailing `,;:` becomes `!`) | speed 1.05 and +1.5 dB gain on that clause |
+| `!!` `??` `?!?!` | one mark | the same speed 1.05 and +1.5 dB |
+| anything else | untouched | none: no slang normalisation, no autocorrect |
+
+Speed goes to the backend per piece: kokoro's `create(..., speed=)`, edge-tts's prosody
+`rate` (`"-8%"` for 0.92; the parameter is only sent when the speed is not 1.0, so a plain
+render is the same request as before). Gain is applied to the **converted** audio of the
+piece: the converter peak-normalises its input, so gain before RVC would vanish. After the
+pieces are joined the utterance is scaled down only if a gained piece pushed its peak past
+0.99. One transposition for the whole utterance, as before.
+
+### Acceptance (2026-10-13, kokoro `af_heart`, `--pitch 0`, seed 0)
+
+`scripts/expressive_cases.py` renders each case and, as a reference, the normalised text
+through the pre-change path (`<case>_plain.wav`); it then measures the silent gap between
+the first two speech segments (10 ms RMS frames above -40 dBFS) and levels. Wavs are
+committed under `out/expressive/` (`base_f0_48k_v2`, 48 kHz) and `out/expressive/mae/`
+(`MaeASMR`, a real 32 kHz voice, for listening).
+
+| case | text | pieces | expressive | plain reference |
+|---|---|---|---|---|
+| dots + emphasis | `hey... hey!! are you fr right now` | `hey` (pause 250 ms) / `hey!` (1.05x, +1.5 dB) / `are you fr right now` | gap at the dots **430 ms** (base) / **530 ms** (Mae); "hey!" +0.9 / +1.7 dB over the first "hey", +1.1 / +1.9 dB over the plain render's "hey!" | gap 280 / 270 ms (`hey. hey! ...` as one piece: kokoro's own sentence pause) |
+| elongation | `nooooo waaaay` | `noo waay` at speed 0.83 (run of 5) | **1.14 s** (base) / 1.16 s (Mae) | 0.92 s for `noo waay` at 1.0: the marked text is 24% longer |
+| caps | `that is SO not what i said` | `that is so not what i said!` at 1.05, +1.5 dB | 1.56 s, overall level **+1.5 dB** (base) / +1.9 dB (Mae) over the plain render | 1.66 s |
+| formal | `Hello, this is a test of the text to speech path.` | one plain piece | 2.92 s, same level, same length | 2.92 s |
+
+- The measured pause at the dots is the inserted 250 ms plus the ~180 ms of trailing
+  silence kokoro leaves on a bare "hey" (it trims less than a full sentence end), which is
+  why it lands at the ~400 ms the acceptance asked for.
+- **Byte-identical formal path.** Kokoro is not bit-reproducible between runs (two renders
+  of the formal sentence differ by up to 0.10 in sample value), so the comparison feeds one
+  pre-rendered TTS wav through `speak.speak` on the pre-change tree (`feature/tts`, commit
+  e1d3ada) and on this tree, same seed, HuBERT FP32: the two output files are
+  byte-identical (`cmp`), and the formal sentence runs through the old code path
+  (one piece, speed 1.0, gain 0, 200 ms gap, no peak limiter).
+- Under the Part 2 defaults (HuBERT autocast ladder) `vox say` still runs HuBERT in FP32:
+  the full-file converter builds its engine without warmup, and the ladder is a warmup
+  decision on the streaming hop, so the TTS path's output is unchanged.
+- Not verified by ear: nobody has listened to the four cases yet; durations, gaps and
+  levels are what the table measures. "noo" / "waay" / "soo" is what the spec's
+  two-repeat normalisation gives the phonemizer; if espeak reads "soo" as "sue" the
+  normalisation should go to the dictionary spelling instead, which needs a word list.

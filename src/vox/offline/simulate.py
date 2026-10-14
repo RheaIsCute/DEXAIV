@@ -18,8 +18,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from vox.config import defaults
+from vox.config import defaults, target
 from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
+from vox.config.store import load_tuned, save_tuned
 from vox.engine import chunker, warmup
 from vox.engine.chunker import ChunkPlan
 from vox.engine.gate import GateConfig, GateDecision, SilenceGate, SileroVad
@@ -53,19 +54,33 @@ class Engine:
         return "graphs" if self.graphs.active else "eager"
 
 
+def tune_key(model_name: str, plan: ChunkPlan, params: RuntimeParams,
+             precision: PrecisionParams) -> str:
+    """Everything that fixes the hop's kernel shapes: the persisted decisions' key."""
+    return (f"{model_name}|hop{plan.block_ms:g}|extra{plan.extra_ms:g}|"
+            f"xf{plan.overlap_ms:g}|search{plan.search_ms:g}|sr{plan.device_sr}|"
+            f"{params.f0_method}|dec{'16' if precision.decoder_fp16 else '32'}|"
+            f"torch{torch.__version__}")
+
+
 def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = None,
                 params: RuntimeParams | None = None,
                 precision: PrecisionParams | None = None,
                 device: torch.device | str | None = None, warmup_hops: int = 5,
                 registry: ModelRegistry | None = None,
                 cache: dict | None = None, graphs: str | None = None,
-                gate: GateConfig | None = None, log=print) -> Engine:
+                gate: GateConfig | None = None, log=print,
+                profile_dir: Path | None = None) -> Engine:
     """Control-path construction: load models, plan, allocate, warm up, capture graphs.
 
-    ``cache`` lets a sweep reuse the loaded embedder and extractors across engine builds.
-    ``graphs`` overrides ``precision.graphs`` ("on" | "off" | "auto"). ``gate`` configures
-    the silence gate (default: enabled, Silero VAD, engine defaults); the Silero model is
-    loaded on the CPU here, never in the hot loop.
+    The device is resolved and asserted against TARGET.md first (``config.target``); the
+    check line is logged. ``cache`` lets a sweep reuse the loaded embedder and extractors
+    across engine builds. ``graphs`` overrides ``precision.graphs`` ("on" | "off" |
+    "auto"). ``gate`` configures the silence gate (default: enabled, Silero VAD, engine
+    defaults); the Silero model is loaded on the CPU here, never in the hot loop.
+    ``profile_dir`` is where warmup's one-time decisions (HuBERT autocast, cuDNN
+    autotune) are read from and written to (``runtime.json``, keyed by shape); without it
+    they are measured on every build and not stored.
     """
     shape = shape or defaults.DEFAULT_SHAPE
     precision = precision or defaults.DEFAULT_PRECISION
@@ -73,7 +88,8 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
         import dataclasses
 
         precision = dataclasses.replace(precision, graphs=graphs)
-    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device, check = target.select_device(device)
+    log(check)
     warmup.apply_precision(precision)
 
     registry = registry or ModelRegistry(models_dir)
@@ -83,11 +99,14 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
     params = params or RuntimeParams(sid=loaded.config.sid)
 
     cache = cache if cache is not None else {}
-    key = ("embedder", loaded.config.version, precision.hubert_fp16, str(device))
+    key = ("embedder", loaded.config.version, str(device))
     if key not in cache:
-        cache[key] = ContentVec(loaded.config.version, fp16=precision.hubert_fp16)
+        cache[key] = ContentVec(loaded.config.version)
         cache[key].load(device, Path(models_dir))
     embedder = cache[key]
+    # Off until warmup's ladder picks a candidate (or the profile already did). A build
+    # without warmup (the full-file converter, ``vox say``) therefore runs HuBERT in FP32.
+    embedder.autocast = "off"
     extractor = None
     f0_tail = 0
     if model.has_f0:
@@ -122,7 +141,15 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
     engine = Engine(plan, pipeline, sola, timers, device, loaded, params, precision,
                     stage_graphs, silence_gate)
     if warmup_hops:
-        engine.warmup_ms = warmup.run(pipeline, sola, warmup_hops, stage_graphs, log=log)
+        key = tune_key(model_name, plan, params, precision)
+        tuned = load_tuned(profile_dir, key)
+        engine.warmup_ms = warmup.run(pipeline, sola, warmup_hops, stage_graphs, log=log,
+                                      precision=precision, tune=True, tuned=tuned)
+        if stage_graphs.tuned and stage_graphs.tuned != tuned:
+            save_tuned(profile_dir, key, stage_graphs.tuned)
+            if profile_dir is not None:
+                log(f"tuning: saved to {Path(profile_dir) / 'runtime.json'} [{key}]")
+        log(target.memory_line(device))
     return engine
 
 

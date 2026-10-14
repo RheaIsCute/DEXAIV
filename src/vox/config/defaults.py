@@ -26,11 +26,12 @@ DEFAULT_RUNTIME = RuntimeParams(
     f0_method="rmvpe",
 )
 
-# TF32 on; HuBERT FP16 autocast exists but stays off until Phase 6 validates it against the
-# FP32 baseline (docs/research/13 Phase 6). Per-stage CUDA graphs are the default fast path
-# (docs/DEVIATIONS.md R1/R2): "auto" captures, verifies a replay against eager, else eager.
+# Blackwell defaults (TARGET.md rule 2): TF32 on; HuBERT autocast "auto" tries FP16 then
+# BF16 at warmup and keeps the first whose eager render matches FP32 (engine/warmup.py).
+# Per-stage CUDA graphs are the default fast path (docs/DEVIATIONS.md R1/R2): "auto"
+# captures, verifies a replay against eager, else eager.
 DEFAULT_PRECISION = PrecisionParams(
-    tf32=True, hubert_fp16=False, decoder_fp16=False, graphs="auto"
+    tf32=True, hubert_fp16=False, decoder_fp16=False, graphs="auto", hubert_autocast="auto"
 )
 
 ANALYSIS_SR = 16000  # ContentVec / F0 / index domain (docs/research/02 §1)

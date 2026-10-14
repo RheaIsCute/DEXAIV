@@ -79,15 +79,25 @@ class _Snapshot:
             t.copy_(s)
 
 
-def _capture(fn, device: torch.device) -> torch.cuda.CUDAGraph:
-    """Warm up on a side stream, then capture ``fn`` (which must allocate no new inputs)."""
+def _capture(fn, device: torch.device, autotune: bool = False) -> torch.cuda.CUDAGraph:
+    """Warm up on a side stream, then capture ``fn`` (which must allocate no new inputs).
+
+    ``autotune`` turns ``cudnn.benchmark`` on for the warmup runs only: cuDNN then times
+    its conv algorithms for these exact shapes and the capture records the winners. The
+    flag is back to False before the capture (and before the graph key is computed), so
+    no eager stage can ever re-benchmark mid-stream.
+    """
     side = torch.cuda.Stream(device)
     side.wait_stream(torch.cuda.current_stream(device))
-    with torch.cuda.stream(side), torch.inference_mode():
-        for _ in range(WARMUP_ITERS):
-            fn()
-    torch.cuda.current_stream(device).wait_stream(side)
-    torch.cuda.synchronize(device)
+    torch.backends.cudnn.benchmark = autotune
+    try:
+        with torch.cuda.stream(side), torch.inference_mode():
+            for _ in range(WARMUP_ITERS):
+                fn()
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.cuda.synchronize(device)
+    finally:
+        torch.backends.cudnn.benchmark = False
     graph = torch.cuda.CUDAGraph()
     with torch.inference_mode(), torch.cuda.graph(graph):
         fn()
@@ -115,15 +125,19 @@ class StageGraphs:
     """
 
     def __init__(self, pipeline: HopPipeline, sola: Sola, mode: GraphMode = "auto",
-                 whole_hop: bool | tuple[str, ...] = False) -> None:
+                 whole_hop: bool | tuple[str, ...] = False, autotune: bool = False) -> None:
         # ``whole_hop``: True = all GPU stages as one graph; a tuple = that consecutive run
         # of stages as one graph, the rest per stage (the Q16 bisection).
+        # ``autotune``: cuDNN benchmark during the capture warmup (TARGET.md rule 4); the
+        # decision is made once per shape by warmup.py and persisted with the profile.
         if mode not in MODES:
             raise ValueError(f"graphs mode must be one of {MODES}")
         self.pipeline = pipeline
         self.sola = sola
         self.mode = mode
         self.whole_hop = whole_hop
+        self.autotune = autotune
+        self.tuned: dict = {}  # warmup's persisted decisions for this shape (warmup.run)
         self.device = pipeline.device
         self.graphs: dict[str, torch.cuda.CUDAGraph] = {}
         self._key: tuple | None = None
@@ -141,7 +155,7 @@ class StageGraphs:
 
     def key(self) -> tuple:
         return (self.pipeline.static_key(), self.sola.mode, self.sola.buffer.data_ptr(),
-                self.whole_hop)
+                self.whole_hop, self.autotune)
 
     def stale(self) -> bool:
         return self.supported() and self._key != self.key()
@@ -176,7 +190,7 @@ class StageGraphs:
                     if not pipeline.stage_graph_safe(name):
                         self.report.stages[name] = "eager (stage not graph-safe)"
                         continue
-                    graph = _capture(pipeline.stage_fns[name], self.device)
+                    graph = _capture(pipeline.stage_fns[name], self.device, self.autotune)
                     self.graphs[name] = graph
                     pipeline.stage_impl[name] = _Replay(graph)
                     self.report.stages[name] = "graph"
@@ -196,7 +210,7 @@ class StageGraphs:
     def _capture_sola(self) -> None:
         sola, pipeline = self.sola, self.pipeline
         static = pipeline.out  # the only tensor the hop ever stitches
-        graph = _capture(lambda: sola._stitch_eager(static), self.device)
+        graph = _capture(lambda: sola._stitch_eager(static), self.device, self.autotune)
         self.graphs[SOLA] = graph
         self._sola_static = static
 
@@ -225,11 +239,11 @@ class StageGraphs:
             if pipeline.stage_fns[name] is pipeline._stage_noop or                     not pipeline.stage_graph_safe(name):
                 self.report.stages[name] = "eager"
                 continue
-            graph = _capture(pipeline.stage_fns[name], self.device)
+            graph = _capture(pipeline.stage_fns[name], self.device, self.autotune)
             self.graphs[name] = graph
             pipeline.stage_impl[name] = _Replay(graph)
             self.report.stages[name] = "graph"
-        graph = _capture(run, self.device)
+        graph = _capture(run, self.device, self.autotune)
         self.graphs[HOP] = graph
         # One graph stands in for the fused run: its first stage replays it, the others
         # become no-ops. (With synth inside, the noise fill in process_hop happens before
