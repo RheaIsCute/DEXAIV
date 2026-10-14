@@ -45,3 +45,19 @@ def test_keep_latest_and_fill():
     out = np.zeros(30, dtype=np.float32)
     ring.read(out)
     assert out[0] == 70 and out[-1] == 99
+
+
+def test_request_drop_is_applied_by_the_reader():
+    """The writer may not move the read position; it asks, and the next read discards."""
+    ring = SPSCRing(64)
+    ring.write(np.arange(40, dtype=np.float32))
+    ring.request_drop(25)
+    assert ring.drop_pending and ring.available() == 40  # nothing moved yet
+    out = np.zeros(5, dtype=np.float32)
+    assert ring.read(out) == 5
+    assert out.tolist() == [25.0, 26.0, 27.0, 28.0, 29.0]
+    assert not ring.drop_pending and ring.available() == 10 and ring.underruns == 0
+    ring.request_drop(1000)  # more than is queued: clamps, then the read underruns
+    assert ring.read(out) == 0 and ring.underruns == 1
+    ring.request_drop(-3)
+    assert not ring.drop_pending

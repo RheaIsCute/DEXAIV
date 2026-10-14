@@ -212,13 +212,17 @@ class InferenceWorker(threading.Thread):
             pipeline.upload(self._host_block)
         with timers.stage("gate"):
             decision: GateDecision = gate.decide(self._host_block)
-        if self.hold or self.override.active:
+        # Read the flag once: it is set from the control thread and must mean the same
+        # thing to the gate decision above and to the cushion logic below.
+        hold = self.hold
+        if hold or self.override.active:
             # A typed clip is being rendered or is playing: the live voice is silent
             # anyway, so close it the way the gate would (SOLA tail faded out once, the
             # context ring kept current) and leave the GPU to the clip. When the hold
             # ends, speech resumes exactly like a gate onset.
             decision = GateDecision(False, drain=s.gate_open, rms_dbfs=decision.rms_dbfs,
                                     vad_prob=decision.vad_prob)
+        silent = False  # this hop puts nothing but zeros in the ring
         if decision.speech:
             infer = pipeline.process_hop()
             with timers.stage("sola"):
@@ -228,8 +232,9 @@ class InferenceWorker(threading.Thread):
                 sola.begin_drain()
                 pipeline.forget_speech()
             pipeline.advance_context()
+            silent = not sola.draining  # else this hop still carries the fading tail
             with timers.stage("sola"):
-                stitched = sola.drain_step() if sola.draining else self._zeros
+                stitched = self._zeros if silent else sola.drain_step()
             s.gated_hops += 1
         if decision.onset or decision.drain:
             s.gate_transitions += 1
@@ -252,11 +257,14 @@ class InferenceWorker(threading.Thread):
             self._prefill(self.fill_target - fill_before)
             s.underrun_refills += 1
             fill_before = self.fill_target
-        if self.hold:
-            if not self._cushion and not decision.drain and not sola.draining:
+        releasing = False
+        if hold:
+            if not self._cushion and silent:
                 # The GPU is about to be shared with a clip render and hops may run late.
-                # Only silence is queued now, so queue more of it: a late hop then delays
-                # silence instead of running the device dry.
+                # The fade-out is in the ring and this hop is silence, so queue more
+                # silence in front of it: a late hop then delays silence instead of
+                # running the device dry. (Never in front of a hop that still carries
+                # the tail: that would play as a blip after the cushion.)
                 self._cushion = int(HOLD_CUSHION_S * plan.device_sr)
                 self._fill_before_hold = fill_before
                 self._prefill(self._cushion)
@@ -264,12 +272,16 @@ class InferenceWorker(threading.Thread):
             # Hold over: what is queued is still all silence, so trim back to the fill the
             # ring had before (never thinner than one hop under the target, where a clip
             # would start on the edge of an underrun) and the old latency is restored.
+            # Asked of the reader, which owns the read position (a drop from this thread
+            # can be lost against a callback read, leaving the cushion in as latency).
             keep = min(self.fill_target, max(self._fill_before_hold, self.fill_target - block))
-            self.out_ring.drop(max(0, self.out_ring.fill() - keep))
+            self.out_ring.request_drop(self.out_ring.fill() - keep)
             self._cushion = 0
+            releasing = True  # the reader trims; do not also drift-trim this hop
         overriding = self.override.mix(self._host_out_np)
         self.out_ring.write(self._host_out_np)
-        if (not decision.speech and not overriding and not self.hold
+        if (not decision.speech and not overriding and not hold and not releasing
+                and not self.out_ring.drop_pending
                 and fill_before > self.fill_target + block):
             # Silence is playing: trim clock-drift growth without anyone hearing it.
             self.out_ring.drop(fill_before - self.fill_target)

@@ -393,6 +393,27 @@ other tests (314) and the whole live acceptance were run again on an idle GPU: a
 window go through the expressive layer (speed, pauses and gain per piece) like `vox say`;
 the latency readout stays at ~130 ms while a clip renders (the cushion is not counted).
 
+Pre-push check of the merged branch found two faults in the hold (G6/G7), both fixed and
+now covered by `tests/engine/test_hold.py` and `tests/unit/test_rings.py`:
+
+- The worker read `hold` twice in one hop. When the control thread raised it in between,
+  the hop was a normal speech hop but the 0.5 s cushion was queued *in front of it*: the
+  live voice cut straight into silence and one hop of speech played half a second later
+  (3 of 14 clips). The flag is now read once per hop. The cushion also went in ahead of
+  the last 10 ms of the fade-out; it now waits for a hop that is pure silence.
+- The cushion was taken back out with `SPSCRing.drop` from the worker thread, which races
+  with the output callback's own position update; a lost update left the cushion in as
+  0.5 s of latency until the next drift trim cut it out of live speech (one underrun and a
+  cut 0.8 s after a clip). The worker now uses `SPSCRing.request_drop`, applied by the
+  reader on its next read.
+
+After the fixes: 24 clips in a row with no cut and no underrun; then "nooooo waaaay",
+"hey... hey!!" and "WAIT... what?! no way, that is SO cool!!" typed while live: the clips
+last what `vox say` renders (1.16 s, 1.67 s, 4.19 s), the pauses are there (0.41-0.53 s at
+-66 to -72 dB on the cable while live speech sat at about -13 dB before the clip, so the
+microphone does not leak into them), the largest step at a clip seam is 0.11 against 0.22
+inside ordinary speech, and a gained clip peaks at 0.985 with the same RMS as a plain one.
+
 ### 6.3 Not verified
 
 - A real microphone through the GUI: every live run used the file-backed input.

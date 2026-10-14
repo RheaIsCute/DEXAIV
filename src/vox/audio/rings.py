@@ -32,6 +32,7 @@ class SPSCRing:
         self.overrun_samples = 0
         self.underruns = 0  # reader-owned
         self.underrun_samples = 0
+        self._drop_request = 0  # writer -> reader, single slot (see ``request_drop``)
 
     # ------------------------------------------------------------------ either side
 
@@ -57,6 +58,16 @@ class SPSCRing:
             self._buf[:n - first] = x[first:]
         self.write_pos += n  # publish last
 
+    def request_drop(self, n: int) -> None:
+        """Writer side: have the reader discard ``n`` of the oldest unread samples at its
+        next read. The reader owns ``read_pos``; a ``drop`` from the writer's thread races
+        with a read in progress and one of the two position updates is lost."""
+        self._drop_request = max(0, int(n))
+
+    @property
+    def drop_pending(self) -> bool:
+        return self._drop_request > 0
+
     # ----------------------------------------------------------------------- reader
 
     def _recover(self) -> None:
@@ -72,6 +83,10 @@ class SPSCRing:
 
         Returns the number of real samples delivered.
         """
+        pending = self._drop_request
+        if pending:
+            self._drop_request = 0
+            self.read_pos += min(pending, self.available())
         if self.available() > self.capacity - self.guard:
             self._recover()
         n_want = out.shape[0]
