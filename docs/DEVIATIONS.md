@@ -280,3 +280,58 @@ with the expressive typed-speech layer (`docs/TTS_NOTES.md`, "Expressive typed s
 | D30 | Output device = host API default (doc 03 §8, Phase 3) | Default output = the first device whose name marks it as a virtual cable (VAC "Line 1"); default input unchanged (the host default microphone); `check_rate` keeps warning when the cable is not at 48 kHz | TARGET.md rule 6 |
 | D31 | No suppression setting at runtime (RNNoise is a calibration flag, Phase 5) | `LiveSession` resolves an effective `suppression` at start: explicit `--suppression on/off`, else the profile's `rnnoise_enabled`, except that an input named "NVIDIA Broadcast" defaults it off; the decision and its reason are logged and shown in the session line | TARGET.md: the Broadcast virtual mic is already denoised and double denoising hurts. The RNNoise stage itself is still Phase 5 work; this is the setting it will read |
 | D32 | `vox say` renders every piece at speed 1.0 and joins pieces with a constant 200 ms gap | Per-piece speed (kokoro `speed`, edge-tts `rate`), per-boundary pause and per-piece post-RVC gain from `tts/expressive.py`; the plain path is byte-identical (verified against the pre-change tree with a fixed TTS wav) | Feature prompt Part 1; see `docs/TTS_NOTES.md` |
+
+### 5.2 R10. What the hardening changed in the numbers (same machine, GPU otherwise idle)
+
+`vox bench perf --sweep benchmarks/sweeps/perf_graphs.yaml`, same clip, same model, same
+settings as the Phase 3 table in R5. New defaults: HuBERT autocast ladder (picked **FP16**
+at every point: eager-match log-mel L1 0.028-0.045 against the 0.05 bar, seeded noise,
+30 hops), cuDNN autotune measured and **rejected** at every point (persisted as
+`cudnn_autotune: false`), TF32 on as before. Logs: `out/perf_graphs_hardening.log`,
+`out/graph_probe_hardening_*.log`, `out/perf_locked_hardening.log`.
+
+| hop | extra | mode | Phase 3 p50 / p99 | hardened p50 / p99 | delta p50 / p99 |
+|---|---|---|---|---|---|
+| 20 ms | 500 | eager | 46.2 / 118.4 | 53.3 / 120.1 | +7.1 / +1.7 |
+| 30 ms | 500 | eager | 48.8 / 120.3 | 43.8 / 89.4 | -5.0 / -30.9 |
+| 20 ms | 1000 | eager | 41.7 / 114.0 | 40.3 / 113.3 | -1.4 / -0.7 |
+| 30 ms | 1000 | eager | 42.4 / 97.6 | 50.7 / 120.5 | +8.3 / +22.9 |
+| 20 ms | 500 | **graphs** | 16.9 / 19.1 | **15.8 / 18.4** | -1.1 / -0.7 |
+| 30 ms | 500 | **graphs** | 16.2 / 20.8 | **15.1 / 17.2** | -1.1 / -3.6 |
+| 20 ms | 1000 | **graphs** | 15.3 / 20.7 | **16.2 / 18.3** | +0.9 / -2.4 |
+| 30 ms | 1000 | **graphs** | 15.3 / 20.1 | **16.0 / 19.0** | +0.7 / -1.1 |
+
+- **Graphed p99 is 1-4 ms lower at every point; p50 is flat (within +-1 ms).** The eager
+  rows swing +-8 ms either way, which is the session-to-session host launch variance R5
+  already noted; eager is the fallback and is not tuned.
+- **HuBERT FP16 autocast buys nothing measurable per hop.** Graph probe, embed stage:
+  replay p50 3.25 ms (p99 3.85) with FP16 autocast against 2.6-3.0 ms FP32 in R2/R5; f0
+  7.36 ms and synth 4.77 ms are unchanged. At a 1.0-1.5 s window the HuBERT forward is
+  launch/memory-bound, so halving the matmul precision moves nothing and the autocast
+  casts add a few kernels. It passes the eager-match check (L1 0.02-0.045, against a
+  same-seed floor of ~0.001 for TF32 rounding and a new-seed floor of 0.30), so it stays
+  the default per TARGET.md rule 2; `--hubert-autocast off` is one flag away and the
+  decision is in `runtime.json`. **BF16** was never selected because FP16 passed first; in
+  the one engine build where FP16 failed before the noise was seeded (L1 0.076, a different
+  noise draw), BF16 scored 0.249: the lower mantissa shows, as doc 06 §5 predicted.
+- **cuDNN autotune vs heuristics: 14.5-16.2 ms either way, differences of -4% to +2%,
+  i.e. noise.** The 5% margin keeps the heuristics; a 2% margin flipped the decision from
+  run to run. The autotune path costs one extra capture (~1.2 s) and 2x60 timed replays
+  once per shape; subsequent startups read the record and capture once. The thing the
+  prompt asked to persist (the chosen algorithm configuration) cannot be exported from
+  PyTorch; the persisted decision gives the same kernels because the shapes are fixed.
+- **Q16 (power state), re-tested with the hardened engine:** `nvidia-smi -lgc 2000,3090`
+  (no admin prompt on this machine) and the hop 20 / extra 1000 graphed point: locked
+  15.7 / 18.7 ms against unlocked 16.2 / 18.3. Same result as R5: clocks are not the lever;
+  the GPU already sits at P1 / 2.8 GHz under the graphed load. "Prefer maximum performance"
+  in the NVIDIA control panel is a per-process driver profile that cannot be toggled from
+  the CLI; the clock lock is the stronger version of the same intervention and shows no
+  delta, so the control-panel setting is not worth a manual A/B. Q16 is closed.
+- **Startup log** now prints, in order: the hardware check line, `hubert autocast: ...`,
+  `cudnn autotune: ...` (or `(from profile)` for both), the graphs capture line, and a
+  memory line (`reserved 1.2-2.8 GiB of a 12 GiB engine budget`).
+- Nothing regressed in the engine tests (`tests/engine`, run after the sweep); the TTS
+  path is byte-identical for formal text (TTS_NOTES).
+- Caveat on measurement hygiene: a second checkout (`DEXAIV-tts`) was running GPU work
+  from another session during the first attempt (`vox run`, `pytest tests/engine`); those
+  numbers were discarded and the sweep re-run when `nvidia-smi` showed the GPU idle.
