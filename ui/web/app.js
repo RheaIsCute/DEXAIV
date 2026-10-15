@@ -14,6 +14,7 @@ let history = [];
 let meters = { running: false, in_db: -120, out_db: -120, gate_open: false, speaking: false };
 let modelsKey = "";
 let pendingIndexModel = null;
+let lastScreen = null;
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -104,6 +105,19 @@ function route() {
   for (const name of SCREENS) $("screen-" + name).hidden = name !== screen;
   document.querySelectorAll(".nav-item").forEach((a) => a.classList.toggle("active", a.dataset.screen === screen));
   closePopovers();
+  // Opening Settings re-scans devices, unless audio is open (PortAudio can't re-init then).
+  if (screen === "settings" && lastScreen !== "settings") refreshDevices(true);
+  lastScreen = screen;
+}
+
+function engineLive() {
+  const status = state && state.engine.status;
+  return status === "running" || status === "starting" || status === "stopping";
+}
+
+function refreshDevices(auto) {
+  if (auto && (!state || engineLive())) return;
+  cmd("refresh_devices");
 }
 
 // ----------------------------------------------------------------- rendering
@@ -208,6 +222,8 @@ function render() {
   fillDevices($("mic"), devices.inputs, devices.input);
   fillDevices($("out"), devices.outputs, devices.output);
   $("mic").disabled = !!devices.input_file;
+  $("refresh-devices").disabled = engineLive() || !!engine.busy;
+  $("refresh-devices").title = engineLive() ? "Stop the engine to refresh devices" : "Refresh audio devices";
   $("exclusive").checked = state.exclusive;
 
   // engine column
@@ -267,7 +283,7 @@ function fillDevices(select, list, current) {
   select.dataset.key = key;
   select.innerHTML = list.map((d) =>
     '<option value="' + esc(d.name) + '"' + (current && d.name === current.name ? " selected" : "") + ">"
-    + esc(d.name) + (d.cable ? " (virtual cable)" : "") + "</option>").join("") || "<option>No devices found</option>";
+    + esc(d.name) + (d.missing ? " (not connected)" : d.cable ? " (virtual cable)" : "") + "</option>").join("") || "<option>No devices found</option>";
 }
 
 function shortDate(iso) {
@@ -456,6 +472,7 @@ function wire() {
   $("tracker").addEventListener("change", (e) => cmd("set_shape", { f0_method: e.target.value }));
   $("graphs").addEventListener("change", (e) => cmd("set_graphs", { enabled: e.target.checked }));
   $("exclusive").addEventListener("change", (e) => cmd("set_exclusive", { enabled: e.target.checked }));
+  $("refresh-devices").addEventListener("click", () => refreshDevices(false));
   $("mic").addEventListener("change", (e) => cmd("set_device", { kind: "input", name: e.target.value }));
   $("out").addEventListener("change", (e) => cmd("set_device", { kind: "output", name: e.target.value }));
   $("calibrate").addEventListener("click", () => cmd("calibrate"));

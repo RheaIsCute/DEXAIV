@@ -100,6 +100,32 @@
           "hops": 50
         }
       }
+    },
+    "Mom|hop20|extra1000|xf30|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "off",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.09488221257925034,
+          "passed": false
+        },
+        "bf16": {
+          "log_mel_l1": 0.45621809363365173,
+          "passed": false
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 16.834950001793914,
+          "p99": 18.36639000204741,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 16.74425000237534,
+          "p99": 17.64071200392209,
+          "hops": 50
+        }
+      }
     }
   }
 }
