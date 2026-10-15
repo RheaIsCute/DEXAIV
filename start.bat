@@ -1,13 +1,22 @@
 @echo off
-rem DEXAIV launcher. Runs this folder's code (src\) with this folder's .venv, or with the
-rem main checkout's venv when this folder has none (a git worktree).
+rem DEXAIV launcher.
 rem   start.bat            -> the GUI
 rem   start.bat run        -> live on the CLI: Mom, pitch +12, gate -40, default mic -> VAC
 rem   start.bat raw        -> same with auto level off and gate -57 (the old raw-mic setting)
 rem   start.bat <args...>  -> any vox command, e.g. start.bat devices
+rem Runs the newest code: this folder once it has the live-quality work (src\vox\audio\
+rem conditioning.py), otherwise the DEXAIV-live worktree next to it. Python: this
+rem folder's .venv, else the main checkout's.
 setlocal
-cd /d "%~dp0"
-set "PYTHONPATH=%~dp0src"
+set "CODE=%~dp0"
+if not exist "%CODE%src\vox\audio\conditioning.py" set "CODE=%~dp0..\DEXAIV-live\"
+if not exist "%CODE%src\vox\audio\conditioning.py" (
+    echo Could not find the DEXAIV code with the live-quality fixes.
+    pause
+    exit /b 1
+)
+cd /d "%CODE%"
+set "PYTHONPATH=%CODE%src"
 set "PYTHONUTF8=1"
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=C:\Users\Asarii\Desktop\DEXAIV\.venv\Scripts\python.exe"
