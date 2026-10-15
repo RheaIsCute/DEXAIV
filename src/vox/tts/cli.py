@@ -40,6 +40,8 @@ def add_say_parser(sub, default_models: Path, default_profile: Path) -> None:
     p.add_argument("--protect", type=float, default=None)
     p.add_argument("--f0-method", choices=("rmvpe", "fcpe"), default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--plain", action="store_true",
+                   help="the model's own loudness instead of the TTS contour (the pre-8.8 path)")
     p.add_argument("--out", type=Path, default=None,
                    help=f"output WAV (default: {DEFAULT_OUT} unless --play is given)")
     p.add_argument("--play", action="store_true", help="play the result")
@@ -86,7 +88,8 @@ def run(args: argparse.Namespace) -> int:
         out = args.out if args.out or args.play else DEFAULT_OUT
         result = speak.speak(text, backend, args.models_dir, args.model, params, args.pitch,
                              speak.target_f0_hint(profile, config), profile.runtime.precision(),
-                             args.torch_device, args.seed, out)
+                             args.torch_device, args.seed, out,
+                             polish=speak.TypedPolish() if args.plain else None)
     except (TtsError, ValueError, OSError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

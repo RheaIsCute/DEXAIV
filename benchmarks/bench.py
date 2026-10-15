@@ -437,7 +437,9 @@ def cmd_accept(args) -> int:
 # everything else as ``reference`` (the engine after the Step 1 fixes, at the flags given on
 # the command line). Each: (shape, params, input conditioning) overrides, and what it is.
 AB_VARIANTS: dict[str, tuple[dict, dict, dict, str]] = {
-    "reference": ({}, {}, {}, "Step 1 engine, defaults"),
+    "reference": ({}, {}, {}, "the defaults (coherent hops since 8.8)"),
+    "classic": ({"decoder_context_ms": 0.0}, {"noise_roll": False, "sine_phase_carry": False},
+                {}, "the pre-8.8 defaults: no decoder context, noise redrawn, sine phase reset"),
     "sola_blend3": ({"crossfade_ms": 30, "overlap_beyond_hop": True}, {}, {},
                     "pre-fix SOLA geometry: 30 ms overlap at the 20 ms hop (3-render blend)"),
     "overlap_10": ({"crossfade_ms": 10}, {}, {}, "10 ms crossfade (half the hop single-render)"),
@@ -448,12 +450,10 @@ AB_VARIANTS: dict[str, tuple[dict, dict, dict, str]] = {
     "index_0.6": ({}, {"index_rate": 0.6}, {}, "paired index at 0.6"),
     "embed_pad": ({"embed_pad_ms": 15.0}, {}, {}, "ContentVec window replicate-padded 240 samples"),
     "f0_bridge": ({}, {"f0_bridge_ms": 60.0}, {}, "F0 dropouts <= 60 ms within 4 st filled"),
-    "decctx_80": ({"decoder_context_ms": 80.0}, {}, {}, "80 ms decoder left context (Q17)"),
-    "noise_roll": ({}, {"noise_roll": True}, {}, "decoder noise moves with the window"),
-    # section 8
-    "trimtail_2": ({}, {"f0_trim_tail": 2}, {}, "RMVPE right-edge guard: 2 frames dropped"),
+    "decctx_0": ({"decoder_context_ms": 0.0}, {}, {}, "no decoder left context (upstream)"),
+    "noise_redraw": ({}, {"noise_roll": False}, {}, "decoder noise redrawn every hop (upstream)"),
     "trimtail_1": ({}, {"f0_trim_tail": 1}, {}, "RMVPE right edge as upstream: 1 frame"),
-    "phase_carry": ({}, {"sine_phase_carry": True}, {}, "NSF sine phase carried across hops"),
+    "phase_reset": ({}, {"sine_phase_carry": False}, {}, "NSF sine phase reset every hop (upstream)"),
 }
 
 
@@ -600,18 +600,14 @@ def cmd_typed(args) -> int:
 SING_PRESET = {"index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0}
 SING_CONDITIONING = {"max_gain_db": 10.0, "trim_db": 0.0}
 SING_VARIANTS: dict[str, tuple[dict, dict, str]] = {
-    "phasecarry_off": ({}, {}, "Sing preset; the NSF sine restarts at phase 0 every hop"),
-    "phasecarry_on": ({}, {"sine_phase_carry": True}, "sine phase carried across hops"),
-    # Coherent renders need the same decoder noise for the same frames too (noise_roll),
-    # and a head that is not decoded against zero padding (decoder context).
-    "noiseroll": ({}, {"noise_roll": True}, "decoder noise moves with the window"),
-    "phasecarry_noiseroll": ({}, {"sine_phase_carry": True, "noise_roll": True},
-                             "phase carry + noise roll"),
-    "phasecarry_noiseroll_decctx80": ({"decoder_context_ms": 80.0},
-                                      {"sine_phase_carry": True, "noise_roll": True},
-                                      "phase carry + noise roll + 80 ms decoder context"),
-    "trimtail_1": ({}, {"f0_trim_tail": 1}, "RMVPE right edge as upstream (1 frame; the "
-                   "default before section 8)"),
+    "reference": ({}, {}, ("Sing preset on the defaults (phase carry + noise roll + 80 ms "
+                           "decoder context, the A/B the user chose)")),
+    "classic": ({"decoder_context_ms": 0.0}, {"sine_phase_carry": False, "noise_roll": False},
+                "the pre-8.8 engine: sine phase reset, noise redrawn, no decoder context"),
+    "phase_reset": ({}, {"sine_phase_carry": False}, "defaults but the sine phase reset per hop"),
+    "noise_redraw": ({}, {"noise_roll": False}, "defaults but the decoder noise redrawn per hop"),
+    "decctx_0": ({"decoder_context_ms": 0.0}, {}, "defaults but no decoder left context"),
+    "trimtail_1": ({}, {"f0_trim_tail": 1}, "RMVPE right edge as upstream (1 frame)"),
     "ceiling_off": ({}, {"f0_ceiling_hz": 0.0}, "Sing preset without the F0 ceiling"),
 }
 
@@ -622,10 +618,10 @@ def _sing_trace(engine, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
     between the F0 the previous hop rendered its saved tail with and the F0 this hop
     renders the same 10 ms frames with (voiced frames only)."""
     plan, pipe, sola, cond = engine.plan, engine.pipeline, engine.sola, engine.conditioner
+    torch.manual_seed(0)  # before the reset: it draws the window's first noise
     pipe.reset()
     sola.reset()
     cond.reset()
-    torch.manual_seed(0)
     block, hops = plan.block, len(audio) // plan.block
     out = np.zeros(hops * block, dtype=np.float32)
     offsets, steps = np.zeros(hops, dtype=np.int64), []

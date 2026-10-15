@@ -17,7 +17,9 @@ DEFAULT_SHAPE = ShapeParams(
     sola_search_ms=10.0,
     extra_ms=1000.0,  # was 500: pauses were ~2.8 dB too loud (docs/DEVIATIONS.md R4)
     device_sr=48000,
-    decoder_context_ms=0.0,
+    # 80 ms of decoder left context: with noise_roll and sine_phase_carry (below) the renders
+    # of consecutive hops stay coherent, the A/B the user chose by ear (docs/DEVIATIONS.md 8.8)
+    decoder_context_ms=80.0,
 )
 
 DEFAULT_RUNTIME = RuntimeParams(
@@ -29,6 +31,9 @@ DEFAULT_RUNTIME = RuntimeParams(
     # RMVPE right-edge guard (docs/DEVIATIONS.md §8.4): the seam pitch step on held notes
     # halves (p95 21 -> 10 cents); F0 lands 10 ms later against the features.
     f0_trim_tail=2,
+    # Chosen by ear with decoder_context_ms=80 (8.8): costs ~1.5 ms of hop p99 together
+    noise_roll=True,
+    sine_phase_carry=True,
 )
 
 # Blackwell defaults (TARGET.md rule 2): TF32 on; HuBERT autocast "auto" tries FP16 then

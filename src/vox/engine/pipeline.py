@@ -222,6 +222,11 @@ class HopPipeline:
         self.out.zero_()
         self.audio_model.zero_()
         self.sine_phase.zero_()
+        # Fresh decoder noise: with ``noise_roll`` the window would otherwise start on the
+        # previous stream's draws (and a seeded run would not be reproducible).
+        self.noise_z.normal_()
+        if self.noise_src is not None:
+            self.noise_src.normal_()
 
     def on_onset(self) -> None:
         """Gate onset (or new graphs): the carried sine phase restarts at zero, as on the

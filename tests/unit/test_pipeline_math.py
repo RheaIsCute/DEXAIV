@@ -144,7 +144,8 @@ def test_output_resampler_lengths():
 
 def test_noise_roll_keeps_each_frame_s_noise_as_the_window_moves():
     """``noise_roll``: frames still in the window keep their latent and excitation noise
-    (shifted one hop left); only the newest hop is drawn fresh. Off: everything is new."""
+    (shifted one hop left); only the newest hop is drawn fresh (the default since 8.8).
+    Off: everything is new."""
     from types import SimpleNamespace
 
     from vox.config.schemas import RuntimeParams
@@ -162,7 +163,7 @@ def test_noise_roll_keeps_each_frame_s_noise_as_the_window_moves():
     assert torch.equal(fake.noise_z[..., :-shift], z[..., shift:])
     assert not torch.equal(fake.noise_z[..., -shift:], z[..., -shift:])
     assert torch.equal(fake.noise_src[:, :-shift * upp], src[:, shift * upp:])
-    fake.params = RuntimeParams()
+    fake.params = RuntimeParams(noise_roll=False)  # upstream: redraw everything
     before = fake.noise_z.clone()
     HopPipeline.fill_noise(fake)
     assert not torch.equal(fake.noise_z[..., :-shift], before[..., shift:])

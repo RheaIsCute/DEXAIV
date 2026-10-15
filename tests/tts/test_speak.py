@@ -141,8 +141,9 @@ class FakeConverter:
         self.extractor = extractor
         self.calls = []
 
-    def convert(self, audio_16k, params):
+    def convert(self, audio_16k, params, rms_frame_ms=None, f0_contour_scale=1.0):
         self.calls.append((len(audio_16k), params))
+        self.polish = (params.volume_envelope, rms_frame_ms, f0_contour_scale)
         return np.repeat(audio_16k, 3)  # 16 kHz -> 48 kHz
 
 
@@ -275,3 +276,14 @@ def test_formal_text_takes_the_plain_path(fake_engine, tmp_path):
     result = speak.speak("Hello there. General greeting.", backend, tmp_path, "Voice", pitch=0)
     assert backend.speeds == [1.0] and not result.expressive and result.hints[0].plain
     assert result.audio is not None and len(converter.calls) == 1
+
+
+def test_typed_speech_follows_the_tts_loudness_by_default(fake_engine, tmp_path):
+    """The envelope polish chosen by ear (docs/DEVIATIONS.md 8.8) is what vox say and the
+    GUI render with; TypedPolish() is still the plain path."""
+    converter, _ = fake_engine
+    speak.speak("Hi.", ToneBackend(), tmp_path, "Voice", pitch=0)
+    assert converter.polish == (0.35, 40.0, 1.0)
+    assert speak.DEFAULT_POLISH == speak.TypedPolish(envelope=0.35, rms_frame_ms=40.0)
+    speak.speak("Hi.", ToneBackend(), tmp_path, "Voice", pitch=0, polish=speak.TypedPolish())
+    assert converter.polish == (1.0, None, 1.0)

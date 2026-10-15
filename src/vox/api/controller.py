@@ -1174,7 +1174,7 @@ class EngineController:
                 result = tts.convert_rendered(
                     FullFileConverter.from_engine(engine), engine.device,
                     engine.loaded.model.tgt_sr, rendered, params, None, target, seed=None,
-                    pieces=pieces)
+                    pieces=pieces, polish=tts.DEFAULT_POLISH)
             convert_s = time.perf_counter() - converting
             device_sr = self._shape().device_sr
             clip = resample_array(result.audio, result.sr, device_sr)

@@ -126,4 +126,5 @@ less index, more protect, a soft pitch ceiling at 360 Hz and a gentler input lev
 slider in Sing to keep your own value. **Suppression** runs RNNoise on the microphone
 (`pip install --no-deps -r requirements/suppression.txt`); its Amount slider keeps some of
 the dry voice for sustained notes. It defaults off on the NVIDIA Broadcast mic, which is
-already denoised. Section 8 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md) has the details.
+already denoised. Typed clips follow the TTS voice's own loudness (`vox say --plain` for the
+model's level). Section 8 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md) has the details.

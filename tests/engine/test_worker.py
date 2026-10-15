@@ -62,13 +62,13 @@ def run_live(engine, audio: np.ndarray, gate: bool, seed: int = 0, fill_ms: floa
     in_ring = SPSCRing(2 * SR, guard=4 * CALLBACK)
     out_ring = SPSCRing(SR, guard=2 * plan.block)
     hop_event = threading.Event()
+    torch.manual_seed(seed)  # before the reset: it draws the window's first noise
     engine.pipeline.reset()
     engine.sola.reset()
     engine.gate.reset()
     engine.gate.set_config(dataclasses.replace(engine.gate.config, enabled=gate))
     engine.conditioner.reset()
     engine.timers.reset()
-    torch.manual_seed(seed)
     fill = int(SR * fill_ms / 1000)
     # The same input chain the simulator runs, as LiveSession wires it.
     worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
@@ -190,7 +190,8 @@ def test_worker_rebuilds_shape_live_and_keeps_running(engine, clip_48k):
         live = np.concatenate(reader.chunks)
         tail = live[-int(1.0 * SR):]
         assert np.sqrt(np.mean(tail ** 2)) > 0.005  # audio flowing after the rebuild
-        assert worker.stats.last_rebuild_ms < 2500, worker.stats.last_rebuild_ms
+        # 1.8-2.4 s at decoder_context_ms 0; 2.9-3.0 s at the 80 ms default (8.8)
+        assert worker.stats.last_rebuild_ms < 3500, worker.stats.last_rebuild_ms
     finally:
         # restore the module-scoped engine for the other tests
         worker2 = worker

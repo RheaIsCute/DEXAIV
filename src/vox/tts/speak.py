@@ -64,6 +64,12 @@ class TypedPolish:
         return self == TypedPolish()
 
 
+# What typed speech ships with (vox say, the GUI): the output follows the TTS loudness
+# contour on 40 ms frames. Chosen by ear from out/ab/typed_*.wav (docs/DEVIATIONS.md 8.8);
+# TypedPolish() is the plain path, kept for A/Bs and the parity tests.
+DEFAULT_POLISH = TypedPolish(envelope=0.35, rms_frame_ms=40.0)
+
+
 def _pack(parts: list[str], limit: int) -> list[str]:
     """Greedily join consecutive parts with spaces while they fit in ``limit`` characters."""
     packed: list[str] = []
@@ -224,12 +230,13 @@ def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
           params: RuntimeParams | None = None, pitch: float | None = None,
           target_f0: float = DEFAULT_TARGET_F0_HZ, precision: PrecisionParams | None = None,
           device: str | None = None, seed: int | None = 0, out: Path | None = None,
-          max_piece_s: float = MAX_PIECE_S) -> SayResult:
+          max_piece_s: float = MAX_PIECE_S, polish: TypedPolish | None = None) -> SayResult:
     """Speak ``text`` in the voice of ``model_name``.
 
     ``pitch=None`` measures the rendered TTS audio and transposes its median F0 onto
     ``target_f0``; ``params.f0_up_key`` is ignored either way (it is calibrated for the
-    user's microphone voice, not for a TTS voice).
+    user's microphone voice, not for a TTS voice). ``polish`` defaults to ``DEFAULT_POLISH``
+    (``TypedPolish()`` is the plain path).
     """
     pieces = split_pieces(text, max_piece_s)
     if not pieces:
@@ -239,7 +246,8 @@ def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
     engine = load_engine(models_dir, model_name, None, params, precision, device, warmup_hops=0)
     result = convert_rendered(FullFileConverter.from_engine(engine), engine.device,
                               engine.loaded.model.tgt_sr, rendered, engine.params, pitch,
-                              target_f0, seed, pieces)
+                              target_f0, seed, pieces,
+                              DEFAULT_POLISH if polish is None else polish)
     if out is not None:
         save_audio(out, result.audio, result.sr)
         result.path = Path(out)

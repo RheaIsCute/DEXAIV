@@ -33,9 +33,10 @@ def env(tmp_path, monkeypatch):
                                voices=lambda: ["af_heart", "am_adam"])
 
     def fake_speak(text, backend, models_dir, model, params, pitch, target_f0, precision,
-                   device, seed, out):
+                   device, seed, out, polish=None):
         seen.speak = SimpleNamespace(text=text, model=model, params=params, pitch=pitch,
-                                     target_f0=target_f0, device=device, seed=seed, out=out)
+                                     target_f0=target_f0, device=device, seed=seed, out=out,
+                                     polish=polish)
         return speak.SayResult(np.zeros(48000, np.float32), 48000, 5.0 if pitch is None else pitch,
                                pitch is None, 150.0, target_f0, 1, 1.0, out)
 
@@ -54,6 +55,7 @@ def test_defaults(env, capsys):
     assert s.target_f0 == 150.0  # from the profile's model overrides
     assert (s.params.index_rate, s.params.sid, s.params.f0_method) == (0.5, 3, "rmvpe")
     assert s.out == DEFAULT_OUT and env.played is None
+    assert s.polish is None  # speak() then applies DEFAULT_POLISH
     out = capsys.readouterr().out
     assert "auto pitch: +5 semitones" in out and "150.0 Hz -> target 150.0 Hz" in out
 
@@ -62,8 +64,9 @@ def test_every_flag_reaches_its_destination(env, capsys):
     argv = ["say", "Hola.", "--model", "Voice", "--backend", "edge", "--voice",
             "es-MX-DaliaNeural", "--pitch", "-2", "--index-rate", "0.75", "--protect", "0.1",
             "--f0-method", "fcpe", "--seed", "7", "--out", "x.wav", "--play", "--device",
-            "Speakers", "--torch-device", "cpu", *env.base]
+            "Speakers", "--torch-device", "cpu", "--plain", *env.base]
     assert cli.main(argv) == 0
+    assert env.speak.polish == speak.TypedPolish()
     assert env.picked[:2] == ("edge", "es-MX-DaliaNeural")
     s = env.speak
     assert (s.pitch, s.seed, s.device, str(s.out)) == (-2.0, 7, "cpu", "x.wav")

@@ -611,16 +611,18 @@ work started (the user had not found the files), so none of them became a defaul
 | S6 | Speak / Sing preset switch, per model, each with its own pitch, index rate, protect, ceiling; Sing pitch = Speak - 5..6 st (configurable), index 0.3, protect 0.35 | Controller-level presets: the model entry of `gui_state.json` is Speak (as before), `models.<name>.sing` holds only the Sing values the user moved; Sing defaults: Speak pitch - 5 (`sing_pitch_offset` overrides), index 0.3, protect 0.35, ceiling 360 Hz; switching is hot (four `set_params` fields + the input chain), no recapture. Live screen: Speak / Sing next to Pitch; Settings: a Pitch ceiling slider (per preset) | The engine knows nothing of presets: they are four hot parameters and two input-chain bounds |
 | S7 | Soft F0 ceiling, semitone soft knee after transposition; off in Speak, ~360 Hz in Sing | `RuntimeParams.f0_ceiling_hz` (hot, 0 = off): `pitch.base.soft_ceiling`, unchanged up to 4 st below the ceiling, then `knee * 2^(4 tanh(st/4) / 12)`; a device scalar (inf = exact no-op), applied to the continuous F0 before the coarse buckets, live and in the full-file converter | It bends very high notes off-key and is a safety, not the fix: with the ceiling at 360 Hz a transposed 300 Hz note is untouched (0.01 st), 330 Hz comes out 0.28 st flat, 400 Hz 2.2 st flat, and 600 Hz is pinned near 360 Hz (8.9 st flat) (`tests/unit/test_pitch.py`) |
 | S8 | RMVPE right-edge guard: `TRIM_TAIL` 1 -> 2, A/B the pitch step at hop seams | `RuntimeParams.f0_trim_tail`, a recapture-class flag like `f0_bridge_ms`; **default 2** (the measurement in 8.4 agreed); `--f0-trim-tail 1` / `vox bench ... --set f0_trim_tail=1` is upstream | Like upstream, the trimmed estimate is written flush with the end of the cache, so the guard also puts F0 10 ms later against the features: it buys the seam frames 10 ms more right context that way. `test_pitch_cache_matches_full_window_f0` now states the alignment for either value |
-| S9 | Experimental `sine_phase_carry`: SineGen phase continuous across hops; persistent 0-dim buffer advanced by `shift_frames` each hop; reset on gate onset and recapture; graph-safe | As specified, but the buffer is the pipeline's (`HopPipeline.sine_phase`, `[1, 1, 1]`) and is passed down through `RvcModel.infer` -> `SineGen.forward(phase, phase_frames)`, which reads it and writes the phase at frame `shift_frames` in place. Off by default | The loaded model is shared with typed-clip renders on a second CUDA stream: a phase buffer stored on the model would be advanced by the clip render and raced by it |
+| S9 | Experimental `sine_phase_carry`: SineGen phase continuous across hops; persistent 0-dim buffer advanced by `shift_frames` each hop; reset on gate onset and recapture; graph-safe | As specified, but the buffer is the pipeline's (`HopPipeline.sine_phase`, `[1, 1, 1]`) and is passed down through `RvcModel.infer` -> `SineGen.forward(phase, phase_frames)`, which reads it and writes the phase at frame `shift_frames` in place. **On by default** since the listening in 8.8, together with `noise_roll` and 80 ms of decoder context | The loaded model is shared with typed-clip renders on a second CUDA stream: a phase buffer stored on the model would be advanced by the clip render and raced by it |
 | S10 | RNNoise (48 kHz, 10 ms frames) after the high-pass, before AGC and the gate; live toggle with ~20 ms crossfade; `suppression_mix` | `audio/suppression.py`: the `rnnoise.dll` of the **pyrnnoise 0.4.5** wheel (xiph RNNoise, installed `--no-deps`, `requirements/suppression.txt`) through ctypes on preallocated buffers, one state carried across hops; mix and toggle as specified, plus a 100 ms unheard warm-up after an idle period; the user's on/off is remembered per microphone (`gui_state.json`), so the Broadcast mic keeps its own default (off, TARGET.md) | pyrnnoise is maintained and ships a Windows DLL (the machine has no compiler); its Python layer allocates per frame and imports audiolab and matplotlib, so only the DLL is used. Measured: **20 ms delay** (960 samples, correlation 0.99) and **0.39 ms CPU per 10 ms frame** (8.5) |
 | S11 | Sing preset: AGC max +10 dB, trim 0 dB; one-time toast when Broadcast is the input while singing | As specified; the input-gain slider is locked at 0 in Sing; the toast shows once per app run, on switching to Sing, choosing the Broadcast mic, or starting with both | |
 
 Not followed from the report (hard rules or not approved): lowering SineGen's unvoiced
 noise (`sine_amp / 3` is what the models were trained with); `f0_unvoiced = "interp"` as a
-default (it disables protect, which keys on `pitchf < 1`); `decoder_context_ms = 60`,
-`embed_pad_ms = 20`, `f0_bridge_ms = 50`, `noise_roll`, `volume_envelope = 0.4`, protect
-0.35 / index 0.3 as engine defaults (no A/B approved: the Sing preset carries index and
-protect only for singing); a 40 ms default hop; an onset margin of 3 dB (measured as an
+default (it disables protect, which keys on `pitchf < 1`); `embed_pad_ms = 20`,
+`f0_bridge_ms = 50`, `volume_envelope = 0.4`, protect 0.35 / index 0.3 as engine defaults
+(the user heard no difference between index 0.35 and 0.6, 8.8; the Sing preset carries index
+and protect only for singing); `decoder_context_ms` and `noise_roll` did become defaults, at
+80 ms and together with the phase carry, because the user chose that combination by ear
+(8.8), not on the report's reasoning; a 40 ms default hop; an onset margin of 3 dB (measured as an
 A/B, 8.3); a protect floor above 300 Hz. Two of the report's factual claims did not hold:
 the gate no longer wipes the pitch cache on close (section 7, fix 3), and "Promise you" was
 not cut by 170 ms (8.3).
@@ -799,9 +801,12 @@ of 2026-10-13 (49 s, unity gain, no filters) and take 2's mic track; live number
 
 Defaults: hop choices snap to 20 ms; the gate takes the max VAD probability over a hop's
 chunks; the onset hop fades in over 5 ms; `f0_trim_tail = 2`; shape and precision come from
-the engine defaults unless a profile file sets them. New and opt-in: the Sing preset (Speak
-is the old behaviour), the soft ceiling (off in Speak), suppression (off unless switched on
-or `rnnoise_enabled` in calibration.json; off on the Broadcast mic). Off: `sine_phase_carry`.
+the engine defaults unless a profile file sets them; after the listening in 8.8,
+`sine_phase_carry` and `noise_roll` on with `decoder_context_ms = 80`, and typed speech
+(`vox say`, the GUI) rendered with `TypedPolish(envelope=0.35, rms_frame_ms=40)`. New and
+opt-in: the Sing preset (Speak is the old behaviour), the soft ceiling (off in Speak),
+suppression (off unless switched on or `rnnoise_enabled` in calibration.json; off on the
+Broadcast mic).
 
 Tests: 400 CPU tests (unit, api, tts; 368 before) and the GPU engine tests (28 pass, one
 seam xfail, one seam xpass) pass. New: profile fall-through
@@ -823,3 +828,37 @@ seed alone on the test clip, and trim tail 2 with seed 0 landed under the 1.25 g
   not click them in the window. The Broadcast toast was checked in the tests only.
 - Live runs used the file-backed input; the microphone path through the GUI was not run.
 - The 3 dB onset margin was not measured for false openings on a raw mic in pauses.
+
+### 8.8 The user's listening (2026-10-15, later)
+
+The user listened to every file in `out/ab/` (sections 7 and 8). Their verdicts, in their
+words where it matters:
+
+- Every mic render of the speech script "stutters BADLY", regardless of the section 7
+  variant (gate, SOLA geometry, interp, envelope, index, bridge); `overlap_10` "sounds
+  horrible", `raw_input` "stutters much less but still rough", `fix1_sola` "slightly
+  better". Index 0.35 vs 0.6: "no difference". Typed renders never stutter.
+- Singing (hop 20, GoatMommy): `sing_phasecarry_noiseroll_decctx80` is "the closest to
+  perfection"; `sing_phasecarry_noiseroll` "kinda goated, a small small stutter";
+  `sing_ceiling_off` "more human" but stutters; phase carry alone, trim tail 2 alone and the
+  reference are "meh". The hop 60 and Mom sets: "a bit better on singing, stutters there,
+  sounds a bit AI".
+- Typed: `typed_envelope` "may be the best one", `typed_blend` and `typed_contour` "really
+  good", `typed_all` "much more AI", `typed_plain` "not bad".
+
+What was made of it:
+
+| decision | measured consequence |
+|---|---|
+| `sine_phase_carry = True`, `noise_roll = True`, `decoder_context_ms = 80` (engine defaults) | GoatMommy hop 20: p99 19.5-19.7 ms (was 17.7-18.0), 0 underruns paced at extra 1000 / 2200; Mom 17.5-19.0. Live 2-minute soak (Sing values, gate -40, VAC exclusive): 1 underrun, window p99 median 18.9 ms, max 23.2 (18.3 / 23.4 before). A live hop change (rebuild + recapture) now mutes 2.9-3.0 s instead of 1.8-2.4 (the synth graph decodes 80 ms more). On the speech script (Mom +12 / GoatMommy +6, `out/ab/speech_{reference,coherent}.wav`, `speech_goat_*`) R3, voicing and HF/LF are within noise of the old defaults; the click ratio moves +0.03 / -0.12. The metrics did not predict the user's preference either way (8.4) |
+| `DEFAULT_POLISH = TypedPolish(envelope=0.35, rms_frame_ms=40)` for `vox say` and the GUI's typed clips; `vox say --plain` is the old path | Section 7.5: loudness sd 8.9 -> 8.2 dB, voicing and F0 spread unchanged. The blend and contour variants stay options (`vox say --voice "af_heart*0.7+af_bella*0.3"`; `TypedPolish(contour_scale=1.2)`) |
+| Index rate: nothing | |
+| `HopPipeline.reset()` draws fresh decoder noise; the simulator and the sing trace seed before resetting | With `noise_roll` a new stream otherwise started on the previous stream's draws, and a seeded run was not reproducible (found by `test_gate_onset_hop_keeps_its_head`, whose two runs compared different noise). The gated-clip seam ratio of `test_gate_streams...` then read 1.31-1.39 over seeds with either default set: it was the Q7 guard passing on a leaked draw, and is now left to the `OVERLAP_EQUALS_HOP` tests |
+
+The "stutter" in the mic renders is the open item. With the coherent defaults the hop-to-hop
+render differences are what the user's chosen sing file had; whether the speech script now
+sounds the same to them is the next listening (`speech_coherent.wav` vs `speech_reference.wav`).
+If it still stutters, the remaining candidates are the gate (150 ms of speech lost in 9
+cuts at -40; `raw_input` lost more yet sounded smoother, which points away from the gate
+and toward the input chain's gain ramps or the 20 ms hop's seam density: a 40 ms hop costs
+no extra compute, 8.2) and the two-render blend at overlap == hop (Q7).

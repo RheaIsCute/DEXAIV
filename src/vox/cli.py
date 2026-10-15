@@ -51,8 +51,12 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--f0-trim-tail", type=int, choices=(1, 2), default=None,
                    help="RMVPE frames dropped at the right edge (2 = guard, the default; "
                         "1 = upstream)")
-    p.add_argument("--sine-phase-carry", action="store_true", default=None,
-                   help="experimental: NSF sine phase continuous across hops")
+    p.add_argument("--sine-phase-carry", choices=("on", "off"), default=None,
+                   help="NSF sine phase continuous across hops (default on)")
+    p.add_argument("--noise-roll", choices=("on", "off"), default=None,
+                   help="decoder noise moves with the window (default on)")
+    p.add_argument("--decoder-context-ms", type=float, default=None,
+                   help="decoder left context in ms (default 80; 0 = upstream)")
     p.add_argument("--block-ms", type=float, default=None,
                    help="hop in ms, snapped to a multiple of 20 (whole HuBERT frames)")
     p.add_argument("--crossfade-ms", type=float, default=None)
@@ -118,10 +122,15 @@ def resolve(args: argparse.Namespace):
     args.gate_config = gate_config(profile, args)
     args.conditioning_config = conditioning_config(profile, args)
     config = ModelRegistry(args.models_dir).config(args.model)
-    params = resolve_runtime_params(profile, config, vars(args))
+    overrides_params = dict(vars(args))
+    for flag in ("sine_phase_carry", "noise_roll"):
+        if overrides_params.get(flag) is not None:
+            overrides_params[flag] = overrides_params[flag] == "on"
+    params = resolve_runtime_params(profile, config, overrides_params)
     shape = profile.runtime.shape()
     overrides = {k: getattr(args, k, None)
-                 for k in ("block_ms", "crossfade_ms", "extra_ms", "onset_ramp_ms")
+                 for k in ("block_ms", "crossfade_ms", "extra_ms", "onset_ramp_ms",
+                           "decoder_context_ms")
                  if getattr(args, k, None) is not None}
     if "block_ms" in overrides:
         snapped = chunker.snap_block_ms(overrides["block_ms"])

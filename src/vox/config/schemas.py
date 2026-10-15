@@ -47,7 +47,7 @@ class ShapeParams:
     sola_search_ms: float = 10.0
     extra_ms: float = 1000.0  # 500 -> 1000: pause loudness bias (docs/DEVIATIONS.md R4)
     device_sr: int = 48000
-    decoder_context_ms: float = 0.0  # decoder left context (0 = upstream); see Q17
+    decoder_context_ms: float = 80.0  # decoder left context (0 = upstream); 8.8, Q17
     # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
     overlap_beyond_hop: bool = False  # pre-fix SOLA geometry: the crossfade may exceed the hop
     embed_pad_ms: float = 0.0  # replicate-pad the window's right edge before ContentVec
@@ -71,15 +71,15 @@ class RuntimeParams:
     f0_unvoiced: str = "zero"  # "zero" (classic/Applio contract) | "interp" (current rvc-webui)
     sid: int = 0
     sola_mode: str = "plain"  # "plain" | "pv" (phase-vocoder crossfade, open question Q7)
-    # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
+    # A/B setting of the live-quality work (docs/DEVIATIONS.md §7), off by default:
     f0_bridge_ms: float = 0.0  # fill F0 = 0 runs this short between voiced runs (0 = off)
-    noise_roll: bool = False  # decoder noise follows the window: draw only the new hop's
+    noise_roll: bool = True  # decoder noise follows the window (on since 8.8; False = upstream)
     # Singing (docs/DEVIATIONS.md §8):
     f0_ceiling_hz: float = 0.0  # soft-knee F0 ceiling after transposition (0 = off); hot
     # Fresh RMVPE frames dropped at the right edge: 2 (default) halves the pitch step at
     # hop seams on held notes; 1 = upstream (docs/DEVIATIONS.md §8.4)
     f0_trim_tail: int = 2
-    sine_phase_carry: bool = False  # experimental: NSF sine phase continuous across hops
+    sine_phase_carry: bool = True  # NSF sine phase continuous across hops (8.8)
 
 
 @dataclass(frozen=True)

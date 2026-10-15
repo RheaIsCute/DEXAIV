@@ -246,6 +246,8 @@ class StreamSimulator:
         host_out = torch.zeros(block, pin_memory=cuda)
         host_out_np = host_out.numpy()
 
+        if seed is not None:
+            torch.manual_seed(seed)  # before the reset: it draws the window's first noise
         if reset:
             pipeline.reset()
             sola.reset()
@@ -255,8 +257,6 @@ class StreamSimulator:
                 conditioner.reset()
         timers.reset()
         self.alloc = AllocProbe(engine.device, capacity=hops)
-        if seed is not None:
-            torch.manual_seed(seed)
         pointers = {k: v.data_ptr() for k, v in pipeline.buffers().items()}
         rng = np.random.default_rng(0)
         hop_s = block / plan.device_sr
