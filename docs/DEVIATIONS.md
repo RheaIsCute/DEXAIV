@@ -862,3 +862,34 @@ If it still stutters, the remaining candidates are the gate (150 ms of speech lo
 cuts at -40; `raw_input` lost more yet sounded smoother, which points away from the gate
 and toward the input chain's gain ramps or the 20 ms hop's seam density: a 40 ms hop costs
 no extra compute, 8.2) and the two-render blend at overlap == hop (Q7).
+
+## 9. Auto pitch (2026-10-15, later)
+
+The user: "keep a specific pitch steady even if I speak low or high, cause my voice isn't
+always the same and it can break the pitch or the way the RVC model sounds." A fixed
+transposition (+6 on GoatMommy) lands their speech (~100 Hz) at ~150 Hz and their singing
+(180-280 Hz) at 255-395 Hz; the model was trained on one register.
+
+| # | Asked | Built | Why |
+|---|---|---|---|
+| A1 | Hold the output pitch steady whatever register the talker is in | `RuntimeParams.pitch_mode = "auto"`: `pitch.base.RegisterTracker`, a running mean of log2 F0 over each hop's fresh frames (time constant `pitch_follow_s`, default 2 s, counted in voiced frames so pauses move nothing), turned into a per-frame ratio that puts the register on `target_f0_hz`; the fixed `f0_up_key` applies until 50 voiced frames (0.5 s) were heard. `pitch_range` (default 1.0) scales the intonation around the target. State: two 0-dim device tensors updated inside the captured F0 stage (snapshotted with the pipeline, reset with the stream); the applied offset is read on the control thread for the GUI | Register normalisation, not pitch flattening: the user's intonation is what makes it theirs; `pitch_range` < 1 is there for sung lines a model cannot span. Graph replay verified against eager (`tests/engine/test_singing.py`); a 110 Hz LibriSpeech voice lands at 170-240 Hz median under replay |
+| A2 | Target | `target_f0_hz`, defaulting to the model's register as `vox say` already derives it (`target_f0_hint`: calibrated median, model config, else 200 Hz); per model and per preset in the GUI (`gui_state.json`: `auto_pitch`, `target_hz`, `pitch_range`) | One notion of "the model's pitch" for typed and live speech |
+| A3 | GUI | "Auto pitch" toggle under the Pitch offset slider with the live applied offset ("now +7"); Auto pitch target and range sliders on Settings (greyed while off); `vox run --pitch-mode auto --target-f0-hz --pitch-range --pitch-follow-s`, live commands `autopitch on|off`, `target HZ` | |
+
+Measured (`out/ab/autopitch_{speech,sing}_{fixed6,auto,auto_range70}.wav`, GoatMommy,
+target 200 Hz; the speech script and the first 14 s of the sung take, gate on, index 0.3,
+protect 0.35, no ceiling; output F0 by RMVPE over voiced frames):
+
+| input | input median (p10-p90) | fixed +6: output median (p10-p90) | auto: output (applied) | auto, range 0.7 |
+|---|---|---|---|---|
+| speech script | 101 Hz (80-117) | 143 Hz (118-169) | **193 Hz** (148-215), +12.1 st | 195 Hz (143-215) |
+| sung take | 159 Hz (139-210) | 225 Hz (196-299) | **194 Hz** (168-257), +4.2 st | 196 Hz (177-243) |
+
+One toggle puts both registers on the model's pitch; the intonation spread is the input's
+(p10-p90 ~0.6 octave for speech either way). Under graph replay the F0 stage costs the
+same (two extra reductions over the 32-frame tail). The applied offset is shown live in
+the GUI; the CLI's `stats` line does not carry it.
+
+Not verified: listening (`autopitch_*` are for the user); a voice that drifts *within* a
+phrase faster than the 2 s follow; what the tracker does on a sung line that spans more
+than the model's range (the `pitch_range` slider is the lever there).

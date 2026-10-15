@@ -543,7 +543,8 @@ def test_speak_and_sing_presets_keep_their_own_values_per_model(env):
     assert c.state()["input_level"]["trim_locked"] is True
     # hot: the four values and the singing input chain, nothing restarted
     assert session.calls == [
-        ("params", {"f0_up_key": 6.0, "index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0}),
+        ("params", {"f0_up_key": 6.0, "index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0,
+                    "target_f0_hz": 200.0, "pitch_range": 1.0}),
         ("conditioning", {"auto_level": True, "trim_db": 0.0, "max_gain_db": 10.0})]
     assert len(FakeSession.created) == 1
     c.set_param("pitch", 4)

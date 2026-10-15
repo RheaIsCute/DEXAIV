@@ -90,6 +90,7 @@
           <span class="sub">Pitch offset</span>
           <input type="range" id="pitch" min="-12" max="24" step="1" value="0" style="margin-top:6px">
         </label>
+        <label class="toggle" title="Measures how high you are actually speaking and transposes that onto the voice's own pitch, whatever register you drift into. Your intonation is kept. The fixed offset applies until half a second of voice was heard."><span>Auto pitch <span class="muted small num" id="auto-pitch-now"></span></span><input type="checkbox" id="auto-pitch"></label>
       </section>
     </div>
 
@@ -286,6 +287,14 @@
         <label class="col" style="gap:6px">
           <span class="row between sub">Protect consonants <span class="num strong" id="protect-value">0.33</span></span>
           <input type="range" id="protect" min="0" max="50" value="33">
+        </label>
+        <label class="col" style="gap:6px" id="target-row" title="Auto pitch: the pitch your voice is steered to (the model's own register by default)">
+          <span class="row between sub">Auto pitch target <span class="num strong" id="target-value">200 Hz</span></span>
+          <input type="range" id="target-hz" min="80" max="400" step="5" value="200">
+        </label>
+        <label class="col" style="gap:6px" id="range-row" title="Auto pitch: 100% keeps your intonation; lower squeezes your highs and lows toward the target">
+          <span class="row between sub">Auto pitch range <span class="num strong" id="range-value">100 %</span></span>
+          <input type="range" id="pitch-range" min="0" max="150" step="5" value="100">
         </label>
         <label class="col" style="gap:6px" title="Bends very high notes down softly so the voice does not crack. A safety, not a fix: notes far above it come out flat (off-key).">
           <span class="row between sub">Pitch ceiling <span class="num strong" id="ceiling-value">off</span></span>

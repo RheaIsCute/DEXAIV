@@ -61,6 +61,7 @@ function connect() {
     history.push({ t: perf.t, p50: perf.p50, p99: perf.p99 });
     if (history.length > 120) history.shift();
     renderPerf();
+    renderAutoPitch();
   });
   source.addEventListener("toast", (e) => { const t = JSON.parse(e.data); toast(t.message, t.kind); });
   source.onerror = () => { $("status-sub").textContent = "Lost the engine connection — retrying"; };
@@ -187,6 +188,15 @@ function render() {
     $("index-rate-value").textContent = fixed(params.index_rate, 2);
     setValue($("protect"), Math.round(params.protect * 100));
     $("protect-value").textContent = fixed(params.protect, 2);
+    $("auto-pitch").checked = !!params.auto_pitch;
+    $("pitch").closest("label").title = params.auto_pitch ? "With auto pitch on, this offset applies only until half a second of voice was heard" : "";
+    setValue($("target-hz"), Math.round(params.target_hz));
+    if (document.activeElement !== $("target-hz")) $("target-value").textContent = Math.round(params.target_hz) + " Hz";
+    setValue($("pitch-range"), Math.round(params.pitch_range * 100));
+    if (document.activeElement !== $("pitch-range")) $("range-value").textContent = Math.round(params.pitch_range * 100) + " %";
+    $("target-row").classList.toggle("off", !params.auto_pitch);
+    $("range-row").classList.toggle("off", !params.auto_pitch);
+    renderAutoPitch();
     setValue($("ceiling"), params.ceiling_hz > 0 ? params.ceiling_hz : CEILING_OFF);
     if (document.activeElement !== $("ceiling")) $("ceiling-value").textContent = ceilingText(params.ceiling_hz);
     setValue($("tracker"), params.f0_method);
@@ -315,6 +325,15 @@ function renderRecord() {
   const s = Math.floor(meters.rec_s || 0);
   $("record-label").textContent = on ? "Stop · " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0")
     : state.engine.busy === "Saving recording" ? "Saving…" : "Record";
+}
+
+// Auto pitch: the transposition it is applying right now (from the perf snapshot).
+function renderAutoPitch() {
+  const el = $("auto-pitch-now");
+  const on = state && state.params && state.params.auto_pitch;
+  const running = state && state.engine.status === "running";
+  const st = perf && perf.auto_pitch_st;
+  el.textContent = !on || !running ? "" : st == null ? "listening" : "now " + signed(Math.round(st));
 }
 
 // The trim the slider sets, plus (live, with auto level on) the total gain being applied.
@@ -522,6 +541,11 @@ function wire() {
     $("ceiling-value").textContent = ceilingText(hz);
     sendCeiling(hz);
   });
+  $("auto-pitch").addEventListener("change", (e) => cmd("set_auto_pitch", { enabled: e.target.checked }));
+  const sendTarget = throttled((v) => cmd("set_param", { name: "target_hz", value: v }));
+  $("target-hz").addEventListener("input", (e) => { $("target-value").textContent = e.target.value + " Hz"; sendTarget(+e.target.value); });
+  const sendRange = throttled((v) => cmd("set_param", { name: "pitch_range", value: v }));
+  $("pitch-range").addEventListener("input", (e) => { $("range-value").textContent = e.target.value + " %"; sendRange(e.target.value / 100); });
   $("preset").addEventListener("click", (e) => {
     const b = e.target.closest("[data-preset]");
     if (b && !b.classList.contains("on")) cmd("set_preset", { preset: b.dataset.preset });

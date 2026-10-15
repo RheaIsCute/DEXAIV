@@ -80,6 +80,14 @@ class RuntimeParams:
     # hop seams on held notes; 1 = upstream (docs/DEVIATIONS.md §8.4)
     f0_trim_tail: int = 2
     sine_phase_carry: bool = True  # NSF sine phase continuous across hops (8.8)
+    # Auto pitch (docs/DEVIATIONS.md §9): "fixed" transposes by f0_up_key; "auto" measures
+    # the talker's register (a running mean of log F0, time constant pitch_follow_s) and
+    # transposes it onto target_f0_hz, keeping the intonation (pitch_range 1.0; lower
+    # squeezes it toward the target). Until ~0.5 s of voice was heard, f0_up_key applies.
+    pitch_mode: str = "fixed"  # "fixed" | "auto"
+    target_f0_hz: float = 200.0  # the model's register (vox say's target_f0_hint)
+    pitch_follow_s: float = 2.0
+    pitch_range: float = 1.0
 
 
 @dataclass(frozen=True)

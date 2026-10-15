@@ -37,6 +37,7 @@ from vox.pitch.base import (
     COARSE_F0_MAX,
     COARSE_F0_MIN,
     PitchExtractor,
+    RegisterTracker,
     postprocess_f0,
     semitones_to_ratio,
 )
@@ -144,6 +145,8 @@ class HopPipeline:
         self.f0_min_t = torch.zeros((), device=dev)
         self.f0_max_t = torch.full((), math.inf, device=dev)
         self.f0_ceiling_t = torch.full((), math.inf, device=dev)  # inf = no soft ceiling
+        self.register = RegisterTracker(dev)  # auto pitch (set_params)
+        self.register.fresh = p.shift_frames
         # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
         # hop's decoded slice starts; written by the synth stage, zeroed at gate onsets.
         self.sine_phase = torch.zeros(1, 1, 1, device=dev)
@@ -193,6 +196,8 @@ class HopPipeline:
         self.f0_min_t.fill_(params.f0_min_hz if params.f0_min_hz > COARSE_F0_MIN else 0.0)
         self.f0_max_t.fill_(params.f0_max_hz if params.f0_max_hz < COARSE_F0_MAX else math.inf)
         self.f0_ceiling_t.fill_(params.f0_ceiling_hz if params.f0_ceiling_hz > 0 else math.inf)
+        self.register.set(params.pitch_mode == "auto", params.target_f0_hz,
+                          params.pitch_follow_s, params.pitch_range)
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
         interp = params.f0_unvoiced == "interp"
@@ -222,6 +227,7 @@ class HopPipeline:
         self.out.zero_()
         self.audio_model.zero_()
         self.sine_phase.zero_()
+        self.register.reset()
         # Fresh decoder noise: with ``noise_roll`` the window would otherwise start on the
         # previous stream's draws (and a seeded run would not be reproducible).
         self.noise_z.normal_()
@@ -252,6 +258,7 @@ class HopPipeline:
             tensors.append(self.noise_src)
         tensors.append(self.noise_z)
         tensors.append(self.sine_phase)
+        tensors.extend(self.register.state_tensors())
         return tensors
 
     def static_key(self) -> tuple:
@@ -326,7 +333,8 @@ class HopPipeline:
 
     def _stage_f0(self) -> None:
         f0 = self.extractor.extract(self.f0_tail)
-        coarse, cont = postprocess_f0(f0, self.ratio_t, self.f0_min_t, self.f0_max_t,
+        ratio = self.register.ratio(f0, self.ratio_t)  # per frame; the fixed ratio unless auto
+        coarse, cont = postprocess_f0(f0, ratio, self.f0_min_t, self.f0_max_t,
                                       self._interp, self._bridge, self.f0_ceiling_t)
         self.pitch_cache.roll_and_write(coarse, cont)
 

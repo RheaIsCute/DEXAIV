@@ -60,9 +60,11 @@ PREVIEW_TEXT = "Hi, this is a quick preview of this voice."
 STAGE_LABELS = {"f0": "F0", "embed": "ContentVec", "index": "Index kNN", "synth": "Synth",
                 "sola": "SOLA"}
 HOT_PARAMS = {"pitch": "f0_up_key", "index_rate": "index_rate", "protect": "protect",
-              "ceiling": "f0_ceiling_hz"}
+              "ceiling": "f0_ceiling_hz", "target_hz": "target_f0_hz",
+              "pitch_range": "pitch_range"}
 PARAM_RANGES = {"pitch": (-24.0, 24.0), "index_rate": (0.0, 1.0), "protect": (0.0, 0.5),
-                "ceiling": (0.0, 1100.0)}  # ceiling 0 = off
+                "ceiling": (0.0, 1100.0),  # ceiling 0 = off
+                "target_hz": (60.0, 600.0), "pitch_range": (0.0, 1.5)}
 INPUT_GAIN_RANGE = (-12.0, 24.0)  # the input-gain trim slider, dB
 # Speak / Sing presets, per model (docs/DEVIATIONS.md §8). Each keeps its own pitch, index
 # rate, protect and F0 ceiling; Speak is what the model entry always held. Sing starts from
@@ -277,9 +279,16 @@ class EngineController:
         if not calibrated:
             overrides.update({field: entry.get(key) for key, field in HOT_PARAMS.items()})
         params = resolve_runtime_params(self.profile, config, overrides)
+        if entry.get("target_hz") is None:  # the model's register, as vox say measures it
+            from vox.tts.speak import target_f0_hint
+
+            params = dataclasses.replace(params, target_f0_hz=target_f0_hint(self.profile, config))
+        if not calibrated and entry.get("auto_pitch"):
+            params = dataclasses.replace(params, pitch_mode="auto")
         if calibrated or self._preset(config.name) != "sing":
             return params
         sing = {**SING_DEFAULTS, "pitch": self._sing_pitch(params.f0_up_key),
+                "target_hz": params.target_f0_hz, "pitch_range": params.pitch_range,
                 **entry.get("sing", {})}
         return dataclasses.replace(params, **{field: float(sing[key])
                                               for key, field in HOT_PARAMS.items()})
@@ -565,6 +574,8 @@ class EngineController:
                     "pitch": params.f0_up_key, "index_rate": params.index_rate,
                     "protect": params.protect, "f0_method": params.f0_method,
                     "ceiling_hz": params.f0_ceiling_hz,
+                    "auto_pitch": params.pitch_mode == "auto",
+                    "target_hz": params.target_f0_hz, "pitch_range": params.pitch_range,
                     "preset": preset, "presets": list(PRESETS),
                     "calibrated_pitch": default_pitch,
                     "pitch_is_calibrated": params.f0_up_key == default_pitch,
@@ -773,6 +784,23 @@ class EngineController:
             self._save_store()
         self.publish_state()
         return {"pitch": value}
+
+    def set_auto_pitch(self, enabled: bool) -> dict[str, Any]:
+        """Auto pitch for the current model (docs/DEVIATIONS.md section 9): the talker's
+        register is measured live and transposed onto ``target_hz``; off = the fixed
+        pitch offset."""
+        with self._lock:
+            entry = self._model_store(self._config().name)
+            if enabled:
+                entry["auto_pitch"] = True
+            else:
+                entry.pop("auto_pitch", None)
+            params = self._params()
+            if self.session is not None:
+                self.session.set_params(pitch_mode=params.pitch_mode)
+            self._save_store()
+        self.publish_state()
+        return {"auto_pitch": params.pitch_mode == "auto", "target_hz": params.target_f0_hz}
 
     def set_preset(self, preset: str) -> dict[str, Any]:
         """Speak / Sing for the current model: its own pitch, index rate, protect and F0
@@ -1322,7 +1350,8 @@ class EngineController:
             "headroom_pct": 100.0 * (1.0 - p99 / plan.block_ms) if math.isfinite(p99) else None,
             "out_fill_ms": snap["out_fill_ms"], "gate_open": snap["gate_open"],
             "mode": snap["mode"], "hops": snap["hops"], "gated_hops": snap["gated_hops"],
-            "rebuilds": snap["rebuilds"], **_system(),
+            "rebuilds": snap["rebuilds"], "auto_pitch_st": snap.get("auto_pitch_st"),
+            **_system(),
         })
         self.perf = perf
         self.perf_history.append({"t": perf["t"], "p50": perf["p50"], "p99": perf["p99"]})
@@ -1343,6 +1372,7 @@ COMMANDS = {
     "set_param": "set_param", "reset_pitch": "reset_pitch", "set_gate": "set_gate",
     "set_input_level": "set_input_level", "record": "record",
     "set_suppression": "set_suppression", "set_preset": "set_preset",
+    "set_auto_pitch": "set_auto_pitch",
     "set_monitor": "set_monitor",
     "set_auto_tune": "set_auto_tune", "set_shape": "set_shape", "set_graphs": "set_graphs",
     "set_exclusive": "set_exclusive", "set_device": "set_device",

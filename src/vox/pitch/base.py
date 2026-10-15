@@ -143,3 +143,69 @@ def postprocess_f0(f0: Tensor, ratio: Tensor | float, f0_min: Tensor | float = C
 
 def semitones_to_ratio(f0_up_key: float) -> float:
     return 2.0 ** (f0_up_key / 12.0)
+
+
+REGISTER_WARM_FRAMES = 50  # voiced frames (0.5 s) heard before the auto ratio takes over
+REGISTER_MIN_ST, REGISTER_MAX_ST = -24.0, 24.0  # the auto transposition's range
+
+
+class RegisterTracker:
+    """Auto pitch: a running mean of the talker's log2 F0 over the fresh frames of every hop,
+    turned into a per-frame transposition that puts it on ``target`` (docs/DEVIATIONS.md
+    §9). Graph-safe: static shapes, 0-dim device state, no host sync; the state is updated
+    in place by ``ratio``, so it lives inside the captured F0 stage like the pitch cache.
+
+    ``level``: the register estimate in log2 Hz, moved toward each hop's mean voiced log2
+    F0 by ``1 - exp(-voiced_frames / tau_frames)`` (a hop of silence moves nothing).
+    ``heard``: voiced frames so far, saturating; below ``REGISTER_WARM_FRAMES`` the fixed
+    ratio applies. ``pitch_range`` r: log2 out = log2 target + r (log2 f0 - level).
+    """
+
+    def __init__(self, device: torch.device | str) -> None:
+        self.level = torch.zeros((), device=device)
+        self.heard = torch.zeros((), device=device)
+        self.auto = torch.zeros((), device=device)  # 1 = auto mode
+        self.target_log = torch.full((), math.log2(200.0), device=device)
+        self.tau_frames = torch.full((), 200.0, device=device)
+        self.range = torch.ones((), device=device)
+        self.fresh = 1  # frames at the end of ``f0`` that are new this hop
+
+    def set(self, auto: bool, target_hz: float, follow_s: float, pitch_range: float) -> None:
+        self.auto.fill_(1.0 if auto else 0.0)
+        self.target_log.fill_(math.log2(max(target_hz, 1.0)))
+        self.tau_frames.fill_(max(follow_s, 0.05) * 100.0)
+        self.range.fill_(max(pitch_range, 0.0))
+
+    def reset(self) -> None:
+        self.level.zero_()
+        self.heard.zero_()
+
+    def state_tensors(self) -> list[Tensor]:
+        return [self.level, self.heard]
+
+    @property
+    def offset_st(self) -> float:
+        """Control path: the auto transposition in semitones (nan before warm-up)."""
+        if float(self.heard) < REGISTER_WARM_FRAMES:
+            return float("nan")
+        st = 12.0 * (float(self.target_log) - float(self.level))
+        return min(REGISTER_MAX_ST, max(REGISTER_MIN_ST, st))
+
+    def ratio(self, f0: Tensor, fixed: Tensor) -> Tensor:
+        """Per-frame transposition ratio for ``f0`` (Hz, 0 = unvoiced) after updating the
+        register from its last ``fresh`` frames; ``fixed`` is the 0-dim manual ratio."""
+        tail = f0[-self.fresh:]
+        voiced = tail > 0
+        count = voiced.sum().to(f0.dtype)
+        log_f0 = torch.log2(f0.clamp(min=1.0))
+        mean = torch.where(voiced, log_f0[-self.fresh:], 0.0).sum() / count.clamp(min=1.0)
+        a = 1.0 - torch.exp(-count / self.tau_frames)
+        first = (self.heard == 0) & (count > 0)
+        level = torch.where(first, mean, self.level + a * (mean - self.level))
+        self.level.copy_(torch.where(count > 0, level, self.level))
+        self.heard.copy_((self.heard + count).clamp(max=1e6))
+        shift = (self.target_log - self.level).clamp(REGISTER_MIN_ST / 12, REGISTER_MAX_ST / 12)
+        # per frame: target * (f0 / level) ** range, as a ratio against f0
+        log_ratio = shift + (self.range - 1.0) * (log_f0 - self.level)
+        warmed = (self.auto > 0) & (self.heard >= REGISTER_WARM_FRAMES)
+        return torch.where(warmed, torch.exp2(log_ratio), fixed.expand_as(f0))

@@ -319,6 +319,7 @@ class LiveSession:
             "hops": w.stats.hops, "gated_hops": w.stats.gated_hops,
             "gate_open": w.stats.gate_open, "gate_rms_dbfs": w.stats.gate_rms_dbfs,
             "gate_vad": w.stats.gate_vad, "gate_transitions": w.stats.gate_transitions,
+            "auto_pitch_st": e.pipeline.register.offset_st,  # nan: fixed or not warmed up
             "input_gain_db": w.stats.input_gain_db,
             "stages": stages, "total": total,
             "headroom": plan.block_ms / total["p99"] if total["p99"] else float("nan"),

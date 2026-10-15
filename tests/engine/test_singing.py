@@ -52,6 +52,26 @@ def test_phase_carry_and_ceiling_replay_exactly_like_eager(device, cache):
     engine.graphs.release()
 
 
+def test_auto_pitch_replays_like_eager_and_lands_on_the_target(device, cache, clip_48k):
+    """The register tracker's state is updated inside the captured F0 graph; replay must
+    match eager, and a male clip (~110 Hz) must come out at the 200 Hz target."""
+    params = RuntimeParams(pitch_mode="auto", target_f0_hz=200.0, f0_up_key=0.0)
+    engine = load_engine(MODELS, TEST_MODEL, defaults.DEFAULT_SHAPE, params, device=device,
+                         cache=cache, graphs="on")
+    assert engine.mode == "graphs" and engine.graphs.report.verify["log_mel_l1"] < 0.01
+    result = StreamSimulator(engine).run(clip_48k[:6 * SR], seed=0)
+    offset = engine.pipeline.register.offset_st
+    assert 6.0 < offset < 14.0, offset  # LibriSpeech 1272 is a low male voice
+    from vox.audio.resample import resample_array
+
+    out = resample_array(result.aligned[:6 * SR], SR, 16000)
+    with torch.inference_mode():
+        f0 = engine.pipeline.extractor.extract(torch.from_numpy(out).to(device)).cpu().numpy()
+    voiced = f0[200:][f0[200:] > 0]  # after the warm-up and the first seconds
+    assert 170.0 < np.median(voiced) < 240.0, np.median(voiced)
+    engine.graphs.release()
+
+
 def test_gate_onset_hop_keeps_its_head_with_the_short_ramp(device, cache, clip_48k):
     """Same audio, seed and gate; only the onset fade differs. The hop the gate opens on
     must carry clearly more of the entrance with the 5 ms ramp than with the overlap fade."""

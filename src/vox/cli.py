@@ -21,6 +21,7 @@ RUN_HELP = """\
 live commands (type and press Enter):
   pitch N | index X | protect X | envelope X   hot parameters, applied before the next hop
   ceiling HZ                                   soft F0 ceiling after transposition (0 = off)
+  autopitch on|off | target HZ                 auto pitch: follow the register onto target
   gate on|off                                  silence gate
   level auto|off | level DB                    mic auto level on/off, or the input trim (dB)
   suppress on|off | suppress MIX               RNNoise on/off, or its wet/dry mix (0-1)
@@ -45,6 +46,15 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--f0-method", choices=("rmvpe", "fcpe"), default=None)
     p.add_argument("--f0-unvoiced", choices=("zero", "interp"), default=None)
     p.add_argument("--sola-mode", choices=("plain", "pv"), default=None)
+    p.add_argument("--pitch-mode", choices=("fixed", "auto"), default=None,
+                   help="auto: measure the register live and transpose it onto "
+                        "--target-f0-hz (the intonation is kept); fixed: --pitch (default)")
+    p.add_argument("--target-f0-hz", type=float, default=None, dest="target_f0_hz",
+                   help="auto pitch target, Hz (default: the model's register, else 200)")
+    p.add_argument("--pitch-range", type=float, default=None,
+                   help="auto pitch: 1 keeps the intonation, lower squeezes it")
+    p.add_argument("--pitch-follow-s", type=float, default=None,
+                   help="auto pitch: how fast the register estimate follows (default 2 s)")
     p.add_argument("--f0-ceiling-hz", type=float, default=None,
                    help="soft-knee F0 ceiling after transposition, Hz (0 = off; singing "
                         "safety: very high notes are bent flat)")
@@ -127,6 +137,10 @@ def resolve(args: argparse.Namespace):
         if overrides_params.get(flag) is not None:
             overrides_params[flag] = overrides_params[flag] == "on"
     params = resolve_runtime_params(profile, config, overrides_params)
+    if getattr(args, "target_f0_hz", None) is None:
+        from vox.tts.speak import target_f0_hint
+
+        params = dataclasses.replace(params, target_f0_hz=target_f0_hint(profile, config))
     shape = profile.runtime.shape()
     overrides = {k: getattr(args, k, None)
                  for k in ("block_ms", "crossfade_ms", "extra_ms", "onset_ramp_ms",
@@ -249,6 +263,10 @@ def _run_command(session, line: str) -> bool:
             print("params:", session.set_params(volume_envelope=float(arg)))
         elif cmd == "unvoiced":
             print("params:", session.set_params(f0_unvoiced=arg))
+        elif cmd == "autopitch":
+            print("params:", session.set_params(pitch_mode="auto" if arg == "on" else "fixed"))
+        elif cmd == "target":
+            print("params:", session.set_params(target_f0_hz=float(arg)))
         elif cmd == "ceiling":
             print("params:", session.set_params(f0_ceiling_hz=float(arg)))
         elif cmd == "gate":
