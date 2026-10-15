@@ -199,3 +199,58 @@ def test_worker_rebuilds_shape_live_and_keeps_running(engine, clip_48k):
         worker2._apply_pending()
         engine.sola = worker2.sola
         engine.gate = worker2.gate
+
+
+def test_auto_pitch_readout_never_syncs_during_a_live_rebuild(engine, clip_48k):
+    """The GUI reads the auto-pitch offset from another thread at 2 Hz. A device read there
+    during a graph capture poisoned the CUDA context (take 2026-10-15 11:40: a hop change
+    with auto pitch on killed the session). The readout must be a host mirror."""
+    audio = clip_48k[: 6 * SR]
+    plan = engine.plan
+    engine.pipeline.set_params(dataclasses.replace(engine.pipeline.params, pitch_mode="auto"))
+    in_ring = SPSCRing(2 * SR, guard=4 * CALLBACK)
+    out_ring = SPSCRing(SR, guard=2 * plan.block)
+    hop_event = threading.Event()
+    torch.manual_seed(0)
+    engine.pipeline.reset()
+    engine.sola.reset()
+    engine.gate.reset()
+    worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
+                             engine.timers, in_ring, out_ring, hop_event, int(0.05 * SR),
+                             log=lambda *_: None, conditioner=engine.conditioner)
+    feeder = FileInput(audio, SR, CALLBACK, in_ring, plan.block, hop_event)
+    reader = OutputReader(out_ring, len(audio) / SR + 0.5)
+    seen, stop = [], threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            seen.append(engine.pipeline.register.offset_st)
+            time.sleep(0.02)
+
+    poller = threading.Thread(target=poll, daemon=True)
+    worker.start()
+    worker.ready.wait(5.0)
+    feeder.start()
+    worker.first_hop.wait(5.0)
+    reader.start()
+    poller.start()
+    time.sleep(1.5)
+    worker.apply_shape(ShapeRequest(dataclasses.replace(defaults.DEFAULT_SHAPE, block_ms=40)))
+    hop_event.set()
+    reader.join()
+    stop.set()
+    poller.join()
+    feeder.stop()
+    worker.stop()
+    try:
+        assert worker.stats.errors == [], worker.stats.errors
+        assert worker.stats.rebuilds == 1 and engine.graphs.active
+        finite = [x for x in seen if x == x]
+        assert finite and 6.0 < finite[-1] < 14.0, finite[-5:]  # a low male voice -> 200 Hz
+    finally:
+        worker.apply_shape(ShapeRequest(defaults.DEFAULT_SHAPE))
+        worker._apply_pending()
+        engine.pipeline.set_params(dataclasses.replace(engine.pipeline.params,
+                                                       pitch_mode="fixed"))
+        engine.graphs.capture()
+

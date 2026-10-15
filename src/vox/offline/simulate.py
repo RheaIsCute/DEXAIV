@@ -320,6 +320,7 @@ class StreamSimulator:
                            decision.rms_dbfs)
             with timers.stage("download"):
                 host_out.copy_(stitched)  # the one device -> host copy; syncs the hop
+            pipeline.register.publish()
             self.alloc.end_hop()
             timers.end_hop()
             if playout is not None:

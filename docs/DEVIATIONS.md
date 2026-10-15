@@ -890,6 +890,15 @@ One toggle puts both registers on the model's pitch; the intonation spread is th
 same (two extra reductions over the 32-frame tail). The applied offset is shown live in
 the GUI; the CLI's `stats` line does not carry it.
 
+A first live run (take 2026-10-15 11:40) died on a hop change with auto pitch on: the
+GUI's 2 Hz snapshot read the tracker's offset straight off the device while the worker
+was capturing graphs, and the sync inside a capture poisoned the CUDA context (every
+restart then failed with "Offset increment outside graph capture" until the app was
+closed). The worker now mirrors the two scalars to the host after the hop's own sync
+(`RegisterTracker.publish`), `offset_st` reads only that mirror, and
+`test_auto_pitch_readout_never_syncs_during_a_live_rebuild` polls it at 50 Hz through a
+live rebuild. Rule restated: nothing off the hop thread touches a device tensor.
+
 Not verified: listening (`autopitch_*` are for the user); a voice that drifts *within* a
 phrase faster than the 2 s follow; what the tracker does on a sung line that spans more
 than the model's range (the `pitch_range` slider is the lever there).

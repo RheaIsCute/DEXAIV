@@ -32,6 +32,8 @@ def test_fixed_until_warm_then_lands_the_register_on_the_target():
     st, tracker = track(f0, fixed_st=3.0)
     assert np.all(st[:REGISTER_WARM_FRAMES - SHIFT] == pytest.approx(3.0))  # the manual pitch
     assert np.all(st[REGISTER_WARM_FRAMES:] == pytest.approx(12.0, abs=0.01))  # 100 -> 200 Hz
+    assert math.isnan(tracker.offset_st)  # nothing published yet: the hop thread does it
+    tracker.publish()
     assert tracker.offset_st == pytest.approx(12.0, abs=0.01)
 
 
@@ -70,6 +72,7 @@ def test_fixed_mode_is_an_exact_no_op_with_the_same_ops():
     f0 = torch.tensor([0.0, 100.0, 110.0, 0.0, 120.0])
     fixed = torch.tensor(1.5)
     assert torch.equal(tracker.ratio(f0, fixed), torch.full((5,), 1.5))
-    assert math.isnan(tracker.offset_st)
+    tracker.publish()
+    assert math.isnan(tracker.offset_st)  # 3 voiced frames: not warm
     tracker.reset()
     assert float(tracker.heard) == 0.0

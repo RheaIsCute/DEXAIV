@@ -291,6 +291,7 @@ class InferenceWorker(threading.Thread):
         s.gate_vad = decision.vad_prob
         with timers.stage("download"):
             self._host_out.copy_(stitched)  # syncs the hop
+        pipeline.register.publish()  # the GUI reads auto pitch from this host mirror
         fill_before = self.out_ring.fill()
         if s.hops == 0:
             # The output stream starts once this hop is in the ring (LiveSession waits for

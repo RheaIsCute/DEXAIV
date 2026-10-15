@@ -167,28 +167,45 @@ class RegisterTracker:
         self.auto = torch.zeros((), device=device)  # 1 = auto mode
         self.target_log = torch.full((), math.log2(200.0), device=device)
         self.tau_frames = torch.full((), 200.0, device=device)
+        self._target_log_host = math.log2(200.0)
         self.range = torch.ones((), device=device)
         self.fresh = 1  # frames at the end of ``f0`` that are new this hop
+        # Host mirror of (level, heard), written by ``publish`` on the hop thread after the
+        # hop has synced; ``offset_st`` reads only this, so no other thread ever syncs the
+        # device (a sync during a graph capture poisons the CUDA context).
+        self._pair = torch.zeros(2, device=device)
+        self._host = torch.zeros(2)
 
     def set(self, auto: bool, target_hz: float, follow_s: float, pitch_range: float) -> None:
         self.auto.fill_(1.0 if auto else 0.0)
         self.target_log.fill_(math.log2(max(target_hz, 1.0)))
+        self._target_log_host = math.log2(max(target_hz, 1.0))
         self.tau_frames.fill_(max(follow_s, 0.05) * 100.0)
         self.range.fill_(max(pitch_range, 0.0))
 
     def reset(self) -> None:
         self.level.zero_()
         self.heard.zero_()
+        self._host.zero_()
 
     def state_tensors(self) -> list[Tensor]:
         return [self.level, self.heard]
 
+    def publish(self) -> None:
+        """Hop thread, after the hop's download (which syncs): mirror the state to the
+        host for ``offset_st``. Two scalars; the copy is immediate on a synced stream."""
+        self._pair[0].copy_(self.level)
+        self._pair[1].copy_(self.heard)
+        self._host.copy_(self._pair)
+
     @property
     def offset_st(self) -> float:
-        """Control path: the auto transposition in semitones (nan before warm-up)."""
-        if float(self.heard) < REGISTER_WARM_FRAMES:
+        """Any thread: the auto transposition in semitones as of the last ``publish``
+        (nan before warm-up). Reads the host mirror only."""
+        level, heard = self._host.tolist()
+        if heard < REGISTER_WARM_FRAMES:
             return float("nan")
-        st = 12.0 * (float(self.target_log) - float(self.level))
+        st = 12.0 * (self._target_log_host - level)
         return min(REGISTER_MAX_ST, max(REGISTER_MIN_ST, st))
 
     def ratio(self, f0: Tensor, fixed: Tensor) -> Tensor:
