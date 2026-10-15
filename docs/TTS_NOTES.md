@@ -151,3 +151,22 @@ committed under `out/expressive/` (`base_f0_48k_v2`, 48 kHz) and `out/expressive
   levels are what the table measures. "noo" / "waay" / "soo" is what the spec's
   two-repeat normalisation gives the phonemizer; if espeak reads "soo" as "sue" the
   normalisation should go to the dictionary spelling instead, which needs a word list.
+
+## Typed-speech polish (2026-10-14, A/B only; docs/DEVIATIONS.md §7.5)
+
+Three options for the typed path, all off by default (the plain path is the old call, byte
+for byte); the live microphone never sees them:
+
+- `TypedPolish(envelope, rms_frame_ms, contour_scale)` passed to `convert_rendered`:
+  `envelope` is the `volume_envelope` of the clip alone; `rms_frame_ms` sets the frames of
+  that loudness mix (default rvc-webui's 1 s at a 0.5 s hop; 40 = 40 ms at a 10 ms hop);
+  `contour_scale` widens the voiced F0 around the utterance median in semitones
+  (`offline.convert.scale_contour`).
+- Kokoro voice blends: `--voice "af_heart*0.7+af_bella*0.3"` (weights normalised; any
+  number of voices, `tts.backends.parse_voice_blend`).
+
+`vox bench typed --model Mom` renders the report's two sentences once per variant into
+`out/ab/typed_<variant>.wav` and measures F0 spread, loudness spread, voicing and HF/LF.
+On Mom: contour x1.2 widens the F0 spread 3.0 -> 3.4 st; the blend is darker (+3.0 -> +1.6
+dB HF/LF) and narrower (2.7 st); the 40 ms envelope mix narrows the loudness spread
+(8.9 -> 8.2 dB), the opposite of what the report expected. Nothing has been listened to.

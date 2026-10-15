@@ -21,6 +21,7 @@ RUN_HELP = """\
 live commands (type and press Enter):
   pitch N | index X | protect X | envelope X   hot parameters, applied before the next hop
   gate on|off                                  silence gate
+  level auto|off | level DB                    mic auto level on/off, or the input trim (dB)
   hop MS | extra MS | crossfade MS | f0 rmvpe|fcpe   restart-class: brief gated pause
   stats                                        print one stats line now
   q                                            stop"""
@@ -53,14 +54,36 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                         "(capture, verify against eager, else eager; the default)")
     p.add_argument("--gate", choices=("on", "off"), default=None,
                    help="silence gate (energy + Silero VAD, hangover from the profile)")
+    p.add_argument("--gate-threshold", type=float, default=None,
+                   help="gate energy threshold in dBFS (default: calibration.json)")
+    p.add_argument("--auto-level", choices=("on", "off"), default=None,
+                   help="microphone auto level (AGC toward -20 dBFS speech; default on)")
+    p.add_argument("--input-gain-db", type=float, default=None,
+                   help="input trim in dB on top of auto level (default: calibration.json)")
+    p.add_argument("--conditioning", choices=("on", "off"), default=None,
+                   help="the whole input chain (high-pass, level, limiter); off = raw mic")
+
+
+def conditioning_config(profile, args: argparse.Namespace):
+    """``ConditioningConfig`` from calibration.json (noise floor, input gain) and flags."""
+    from vox.audio.conditioning import ConditioningConfig
+
+    cal = profile.calibration
+    trim = getattr(args, "input_gain_db", None)
+    return ConditioningConfig(enabled=getattr(args, "conditioning", None) != "off",
+                              auto_level=getattr(args, "auto_level", None) != "off",
+                              trim_db=cal.input_gain_db if trim is None else trim,
+                              noise_floor_dbfs=cal.noise_floor_dbfs)
 
 
 def gate_config(profile, args: argparse.Namespace):
-    """``GateConfig`` from calibration.json, with the CLI on/off switch."""
+    """``GateConfig`` from calibration.json, with the CLI on/off switch and threshold."""
     from vox.engine.gate import GateConfig
 
     cal = profile.calibration
-    return GateConfig(enabled=args.gate != "off", threshold_dbfs=cal.silence_gate_dbfs,
+    threshold = getattr(args, "gate_threshold", None)
+    return GateConfig(enabled=args.gate != "off",
+                      threshold_dbfs=cal.silence_gate_dbfs if threshold is None else threshold,
                       vad_threshold=cal.vad.threshold, hangover_ms=cal.vad.release_ms,
                       use_vad=cal.vad.engine == "silero")
 
@@ -74,6 +97,7 @@ def resolve(args: argparse.Namespace):
 
     profile = load_profile(args.profile)
     args.gate_config = gate_config(profile, args)
+    args.conditioning_config = conditioning_config(profile, args)
     config = ModelRegistry(args.models_dir).config(args.model)
     params = resolve_runtime_params(profile, config, vars(args))
     shape = profile.runtime.shape()
@@ -98,7 +122,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
     shape, params, precision = resolve(args)
     summary = convert_file(args.input, args.output, args.models_dir, args.model, args.mode,
                            shape, params, precision, args.device, args.out_sr,
-                           gate=args.gate_config, profile_dir=args.profile)
+                           gate=args.gate_config, profile_dir=args.profile,
+                           conditioning=args.conditioning_config)
     print(f"wrote {summary['path']} ({summary['seconds']:.2f} s @ {summary['sr']} Hz, "
           f"mode={args.mode})")
     result = summary.get("result")
@@ -191,6 +216,11 @@ def _run_command(session, line: str) -> bool:
             print("params:", session.set_params(f0_unvoiced=arg))
         elif cmd == "gate":
             print("gate:", session.set_gate(enabled=arg == "on"))
+        elif cmd == "level":
+            if arg in ("auto", "on", "off"):
+                print("input:", session.set_conditioning(auto_level=arg != "off"))
+            else:
+                print("input:", session.set_conditioning(trim_db=float(arg)))
         elif cmd == "hop":
             print("shape:", session.set_shape(block_ms=float(arg)))
         elif cmd == "extra":
@@ -208,19 +238,39 @@ def _run_command(session, line: str) -> bool:
     return True
 
 
+def _save_tap(path: Path, session) -> None:
+    """The output tap as WAV + mask, and the whole event log, for cut attribution."""
+    import numpy as np
+
+    from vox.audio.resample import save_audio
+
+    tap = session.audio.tap
+    sr = tap.sr
+    save_audio(path, tap.audio[:tap.pos], sr)
+    np.savez_compressed(path.with_suffix(".npz"), from_ring=tap.from_ring[:tap.pos], sr=sr)
+    events = session.engine.timers.events
+    path.with_suffix(".events.json").write_text(json.dumps(
+        {"counts": events.counts, "events": events.since(0),
+         "output_started_s": session.started_at - events.t0}, indent=1))
+    print(f"recorded {tap.pos / sr:.1f} s of output to {path} (+ .npz mask, .events.json)")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from vox.api.control import LiveConfig, LiveSession
     from vox.profiling.report import write_jsonl
 
     shape, params, precision = resolve(args)
     cfg = LiveConfig(model=args.model, models_dir=args.models_dir, shape=shape, params=params,
-                     precision=precision, gate=args.gate_config, input=args.input,
+                     precision=precision, gate=args.gate_config,
+                     conditioning=args.conditioning_config, input=args.input,
                      output=args.output, exclusive=args.exclusive,
                      exclusive_input=args.exclusive_input, callback_ms=args.callback_ms,
                      fill_target_ms=args.fill_ms, input_file=args.input_file,
                      loop_file=args.loop_file, device=args.device, profile_dir=args.profile,
                      suppression={"on": True, "off": False}.get(args.suppression),
-                     suppression_profile=args.profile_obj.calibration.rnnoise_enabled)
+                     suppression_profile=args.profile_obj.calibration.rnnoise_enabled,
+                     record_output_s=(60.0 * (args.minutes or 10.0) + 30.0
+                                      if args.record_output else 0.0))
     session = LiveSession(cfg)
     session.start()
     print(RUN_HELP)
@@ -259,6 +309,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         pass
     finally:
         session.stop()
+    if args.record_output and session.audio is not None and session.audio.tap is not None:
+        _save_tap(args.record_output, session)
     if snaps:
         last = snaps[-1]
         totals = [s["total"]["p99"] for s in snaps if s["total"]["p99"] == s["total"]["p99"]]
@@ -337,6 +389,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="software microphone: feed this WAV at real-time pace instead")
     p.add_argument("--loop-file", action="store_true")
     p.add_argument("--stats-log", type=Path, default=None, help="append 1 Hz snapshots (jsonl)")
+    p.add_argument("--record-output", type=Path, default=None,
+                   help="save what the output device was given (WAV) with an underrun mask "
+                        "(.npz) and the event log (.events.json) beside it")
     p.add_argument("--no-stdin", action="store_true", help="do not read commands from stdin")
     p.set_defaults(func=cmd_run)
 

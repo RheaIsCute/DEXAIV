@@ -43,11 +43,14 @@ class ShapeParams:
     """Restart-class parameters: every one of them changes a buffer shape."""
 
     block_ms: float = 20.0
-    crossfade_ms: float = 30.0
+    crossfade_ms: float = 20.0  # <= block_ms (the chunker clamps it)
     sola_search_ms: float = 10.0
     extra_ms: float = 1000.0  # 500 -> 1000: pause loudness bias (docs/DEVIATIONS.md R4)
     device_sr: int = 48000
     decoder_context_ms: float = 0.0  # decoder left context (0 = upstream); see Q17
+    # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
+    overlap_beyond_hop: bool = False  # pre-fix SOLA geometry: the crossfade may exceed the hop
+    embed_pad_ms: float = 0.0  # replicate-pad the window's right edge before ContentVec
 
 
 @dataclass
@@ -64,6 +67,9 @@ class RuntimeParams:
     f0_unvoiced: str = "zero"  # "zero" (classic/Applio contract) | "interp" (current rvc-webui)
     sid: int = 0
     sola_mode: str = "plain"  # "plain" | "pv" (phase-vocoder crossfade, open question Q7)
+    # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
+    f0_bridge_ms: float = 0.0  # fill F0 = 0 runs this short between voiced runs (0 = off)
+    noise_roll: bool = False  # decoder noise follows the window: draw only the new hop's
 
 
 @dataclass(frozen=True)
@@ -121,7 +127,7 @@ class VoiceProfile:
 class VadProfile:
     engine: str = "silero"
     threshold: float = 0.5
-    release_ms: int = 200  # hangover after the last speech (Applio uses 200 ms)
+    release_ms: int = 350  # hangover after the last speech (Applio: 200; 350 bridges mid-phrase dips)
 
 
 @dataclass
@@ -163,7 +169,7 @@ class RuntimeProfile:
     schema: int = SCHEMA_VERSION
     gpu: str = ""
     block_ms: float = 20.0
-    crossfade_ms: float = 30.0
+    crossfade_ms: float = 20.0
     context_extra_ms: float = 1000.0
     sola_search_ms: float = 10.0
     decoder_context_ms: float = 0.0

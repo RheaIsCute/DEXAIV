@@ -183,6 +183,10 @@ function render() {
   $("gate-tick").hidden = !gate.enabled;
   $("gate-on").checked = gate.enabled;
   $("gate-on-2").checked = gate.enabled;
+  const level = state.input_level || { auto: true, gain_db: 0 };
+  setValue($("input-gain"), level.gain_db);
+  $("auto-level").checked = level.auto;
+  renderInputGain();
   $("noise-floor").textContent = calibrated
     ? "Threshold set from your calibration noise floor (" + Math.round(gate.noise_floor_dbfs) + " dB)"
     : "Not calibrated yet: the threshold is the profile default";
@@ -258,7 +262,16 @@ function renderMeters() {
   $("meter-out").style.width = meterPct(meters.out_db ?? -120) + "%";
   $("meter-in-db").textContent = meters.running ? meterText(meters.in_db) : "–";
   $("meter-out-db").textContent = meters.running ? meterText(meters.out_db) : "–";
+  renderInputGain();
   renderStatus();
+}
+
+// The trim the slider sets, plus (live, with auto level on) the total gain being applied.
+function renderInputGain() {
+  const trim = +$("input-gain").value;
+  const text = signed(trim) + " dB";
+  const live = meters.running && $("auto-level").checked && meters.in_gain_db != null;
+  $("input-gain-value").textContent = live ? text + " · now " + signed(Math.round(meters.in_gain_db)) : text;
 }
 
 function fillDevices(select, list, current) {
@@ -443,6 +456,9 @@ function wire() {
     sendGate(v);
   });
   for (const id of ["gate-on", "gate-on-2"]) $(id).addEventListener("change", (e) => cmd("set_gate", { enabled: e.target.checked }));
+  const sendGain = throttled((v) => cmd("set_input_level", { gain_db: v }));
+  $("input-gain").addEventListener("input", (e) => { renderInputGain(); sendGain(+e.target.value); });
+  $("auto-level").addEventListener("change", (e) => cmd("set_input_level", { auto: e.target.checked }));
   const sendIndex = throttled((v) => cmd("set_param", { name: "index_rate", value: v }));
   $("index-rate").addEventListener("input", (e) => { $("index-rate-value").textContent = (e.target.value / 100).toFixed(2); sendIndex(e.target.value / 100); });
   const sendProtect = throttled((v) => cmd("set_param", { name: "protect", value: v }));

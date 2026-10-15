@@ -133,10 +133,71 @@ def test_incremental_resampler_matches_one_shot(device_sr, block_ms):
 
 
 def test_output_resampler_lengths():
-    assert OutputResampler(48000, 48000, "cpu").identity
-    out = OutputResampler(40000, 48000, "cpu").run(torch.randn(6 * 400))
+    assert OutputResampler(48000, 48000, "cpu", 6 * 480, 2 * 480).identity
+    out = OutputResampler(40000, 48000, "cpu", 6 * 400, 2 * 400).run(torch.randn(6 * 400))
     assert out.shape[0] == 6 * 480
-    assert OutputResampler(32000, 48000, "cpu").run(torch.randn(6 * 320)).shape[0] == 6 * 480
+    rs = OutputResampler(32000, 48000, "cpu", 6 * 320, 2 * 320)
+    assert rs.run(torch.randn(6 * 320)).shape[0] == 6 * 480
+    with pytest.raises(ValueError):
+        OutputResampler(32000, 48000, "cpu", 6 * 320, 100)  # advances less than 10 ms
+
+
+def test_noise_roll_keeps_each_frame_s_noise_as_the_window_moves():
+    """``noise_roll``: frames still in the window keep their latent and excitation noise
+    (shifted one hop left); only the newest hop is drawn fresh. Off: everything is new."""
+    from types import SimpleNamespace
+
+    from vox.config.schemas import RuntimeParams
+    from vox.engine.pipeline import HopPipeline
+
+    shift, upp = 2, 320
+    z = torch.randn(1, 192, 30)
+    src = torch.randn(1, 6 * upp, 1)
+    fake = SimpleNamespace(
+        params=RuntimeParams(noise_roll=True), plan=SimpleNamespace(shift_frames=shift),
+        model=SimpleNamespace(upp=upp), noise_z=z.clone(), noise_src=src.clone(),
+        _noise_z_tmp=torch.zeros(1, 192, 30 - shift),
+        _noise_src_tmp=torch.zeros(1, (6 - shift) * upp, 1))
+    HopPipeline.fill_noise(fake)
+    assert torch.equal(fake.noise_z[..., :-shift], z[..., shift:])
+    assert not torch.equal(fake.noise_z[..., -shift:], z[..., -shift:])
+    assert torch.equal(fake.noise_src[:, :-shift * upp], src[:, shift * upp:])
+    fake.params = RuntimeParams()
+    before = fake.noise_z.clone()
+    HopPipeline.fill_noise(fake)
+    assert not torch.equal(fake.noise_z[..., :-shift], before[..., shift:])
+
+
+@pytest.mark.parametrize("model_sr", [32000, 40000])
+def test_output_resampler_streams_like_one_shot(model_sr):
+    """32k/40k -> 48k: consecutive tails of one continuous signal (each starting one hop
+    after the last, as the decoder delivers them) resample to the whole-signal resample,
+    left seam included; only the newest samples, which lack right-hand context, differ."""
+    import torchaudio
+
+    device_sr, unit = 48000, model_sr // 100
+    shift, length = 2 * unit, 5 * unit  # hop 20 ms, tail 50 ms (hop + overlap + search)
+    hops = 30
+    t = torch.arange((hops + 4) * shift + length, dtype=torch.float64) / model_sr
+    signal = (0.5 * torch.sin(2 * torch.pi * 220 * t)
+              + 0.2 * torch.sin(2 * torch.pi * 3100 * t)).float()
+    whole = torchaudio.transforms.Resample(model_sr, device_sr)(signal)
+    resampler = OutputResampler(model_sr, device_sr, "cpu", length, shift)
+    edge = 24  # newest output samples: the right edge still zero-padded by the FIR
+    worst_streamed = worst_stateless = 0.0
+    for hop in range(hops):
+        start = hop * shift
+        tail = signal[start:start + length]
+        out = resampler.run(tail)
+        stateless = torchaudio.transforms.Resample(model_sr, device_sr)(tail)
+        first = start * device_sr // model_sr
+        expected = whole[first:first + out.shape[0]]
+        if hop == 0:
+            continue  # no previous tail: the history is silence
+        worst_streamed = max(worst_streamed, (out - expected)[:-edge].abs().max().item())
+        worst_stateless = max(worst_stateless, (stateless - expected)[:-edge].abs().max().item())
+    assert worst_streamed < 1e-4
+    assert worst_stateless > 1e-2  # the left-edge transient the history removes
 
 
 @pytest.mark.parametrize("layer", [torch.nn.Conv1d(4, 6, 3), torch.nn.ConvTranspose1d(4, 6, 4, 2)])

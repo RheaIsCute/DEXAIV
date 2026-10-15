@@ -74,6 +74,87 @@ def test_stream_of_misaligned_chunks_is_continuous(mode, block_ms, crossfade_ms)
     assert peaks.min() > 0.97 and peaks.max() < 1.02
 
 
+def sweep(start: int, n: int, f_start: float = 150.0, rate: float = 400.0) -> torch.Tensor:
+    """A linear chirp from ``f_start`` rising by ``rate`` Hz per second (unique alignment)."""
+    t = torch.arange(start, start + n, dtype=torch.float64) / SR
+    return torch.sin(2 * math.pi * (f_start * t + 0.5 * rate * t * t)).float()
+
+
+class SaveTailFirst(Sola):
+    """The order the external report proposed: copy the next tail, *then* crossfade."""
+
+    def _stitch_eager(self, infer):
+        offset = self.find_offset(infer)
+        torch.add(self._base, offset, out=self._index)
+        torch.index_select(infer, 0, self._index, out=self._aligned)
+        tail = self._aligned[self.block:self.block + self.overlap].clone()
+        self._aligned[:self.overlap].mul_(self.fade_in).addcmul_(self.buffer, self.fade_out)
+        self.buffer.copy_(tail)
+        self.offset_hist.index_add_(0, offset.view(1), self._one)
+        return self.out
+
+
+def stitched_envelope(plan, hops: int = 60, cls=Sola) -> tuple[np.ndarray, np.ndarray]:
+    """Stitch renders of one sweep whose level alternates 1.0 / 0.5 from hop to hop (two
+    renders of the same audio never match); return (envelope, valid) per output sample,
+    the envelope being output / sweep where the sweep is far from a zero crossing."""
+    sola = cls(plan, "cpu")
+    out, position = [], 0
+    for hop in range(hops):
+        gain = 1.0 if hop % 2 == 0 else 0.5
+        # the render of hop n starts where the previous hop's emitted block ended
+        out.append(sola.stitch(gain * sweep(position, plan.out_device)).clone())
+        assert sola.offset_hist[0] == hop + 1, "renders are coherent: SOLA must pick offset 0"
+        position += plan.block
+    stream = torch.cat(out).numpy()
+    reference = sweep(0, len(stream)).numpy()
+    valid = np.abs(reference) > 0.5
+    envelope = np.where(valid, stream / np.where(valid, reference, 1.0), np.nan)
+    return envelope, valid
+
+
+def max_envelope_step(plan, cls=Sola) -> float:
+    """Largest envelope move between neighbouring valid samples, relative to the most the
+    sin^2 crossfade itself can move it over that distance (gain difference 0.5, slope at
+    most pi / (2 (overlap - 1)) per sample). <= 1: only ever the crossfade; a step: >> 1."""
+    envelope, valid = stitched_envelope(plan, cls=cls)
+    idx = np.flatnonzero(valid)
+    idx = idx[idx > 3 * plan.block]  # past the initial fade-in from silence
+    gaps = np.diff(idx)
+    steps = np.abs(np.diff(envelope[idx]))
+    near = gaps < 40  # neighbours across one zero crossing at most
+    slope = 0.5 * math.pi / (2 * (plan.sola_buffer - 1))
+    return float((steps[near] / (gaps[near] * slope)).max())
+
+
+@pytest.mark.parametrize("block_ms, crossfade_ms", [(20, 20), (20, 30), (20, 10), (10, 40)])
+def test_stitched_sweep_has_no_amplitude_step_at_hop_seams(block_ms, crossfade_ms):
+    """overlap == block, the clamped case (30 and 40 requested at shorter hops), and overlap
+    < block: the envelope only ever moves along the sin^2 crossfade."""
+    plan = chunker.plan(block_ms, crossfade_ms, 500, 10, SR, SR)
+    assert plan.sola_buffer <= plan.block
+    assert max_envelope_step(plan) <= 1.05
+
+
+def test_overlap_longer_than_the_hop_is_a_continuous_three_render_blend():
+    """The pre-clamp geometry (30 ms overlap at a 20 ms hop, ``overlap_beyond_hop``): SOLA
+    saves its tail after the crossfade, so the next hop starts on the mixed sample the last
+    one ended on. No step: the weights of three renders still sum to one."""
+    plan = chunker.plan(20, 30, 500, 10, SR, SR, overlap_beyond_hop=True)
+    assert plan.sola_buffer > plan.block
+    assert max_envelope_step(plan) <= 1.05
+
+
+def test_saving_the_tail_before_the_crossfade_would_step_at_every_seam():
+    """The external report's patch (copy the tail first): harmless while overlap <= block,
+    where the ranges are disjoint, but with overlap > block the emitted head ends on a mix
+    and the next hop restarts on the raw render. Guards against reintroducing it."""
+    clamped = chunker.plan(20, 20, 500, 10, SR, SR)
+    assert max_envelope_step(clamped, SaveTailFirst) <= 1.05
+    long = chunker.plan(20, 30, 500, 10, SR, SR, overlap_beyond_hop=True)
+    assert max_envelope_step(long, SaveTailFirst) > 20  # 25% of the gain difference at once
+
+
 def test_hard_splice_without_sola_would_fail_the_same_check():
     """Sanity check of the test itself: naive concatenation does produce steps."""
     plan, _ = make()

@@ -38,6 +38,10 @@ they show; where behavior isn't visible in static HTML, this document defines it
   IN meter is the gate threshold; the slider below sets it live. Right column: Noise
   gate toggle, Suppression (RNNoise) toggle, both live. Caption shows the calibrated
   noise floor.
+  (Added 2026-10-14, docs/DEVIATIONS.md §7.) The IN meter shows the *conditioned* level,
+  the one the gate measures. "Auto level" toggle (default on) and an "Input gain" slider
+  (-12..+24 dB, a trim on top of auto level, or the whole gain with it off); its label
+  shows the gain being applied while live.
 - Type-to-speak bar: text + Enter (or Speak) renders TTS via src/vox/tts and plays it
   through the SAME output path as live conversion. While the clip plays, the converted
   mic feed is muted (priority override), then live resumes; the engine never stops.

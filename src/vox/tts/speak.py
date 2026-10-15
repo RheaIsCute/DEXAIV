@@ -40,7 +40,28 @@ MAX_PITCH = 24
 
 _CLAUSE_END = re.compile(r"(?<=[,;:])\s+")
 
-__all__ = ["ExpressivePiece", "analyze", "split_pieces", "split_sentences", "split_text"]
+__all__ = ["ExpressivePiece", "TypedPolish", "analyze", "split_pieces", "split_sentences",
+           "split_text"]
+
+
+@dataclass(frozen=True)
+class TypedPolish:
+    """Optional prosody treatment of typed speech (docs/DEVIATIONS.md §7, Step 3). The
+    defaults are the plain path, byte for byte; nothing here touches the live mic.
+
+    ``envelope``: ``volume_envelope`` for the typed clip only (1.0 = the model's own level;
+    lower keeps more of the TTS loudness contour). ``rms_frame_ms``: the loudness frames of
+    that mix (None = rvc-webui's 1 s; 40 carries syllable stress). ``contour_scale``: voiced
+    F0 widened around the utterance median in semitones (1.0 = as rendered).
+    """
+
+    envelope: float = 1.0
+    rms_frame_ms: float | None = None
+    contour_scale: float = 1.0
+
+    @property
+    def plain(self) -> bool:
+        return self == TypedPolish()
 
 
 def _pack(parts: list[str], limit: int) -> list[str]:
@@ -229,13 +250,16 @@ def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int
                      rendered: list[np.ndarray], params: RuntimeParams,
                      pitch: float | None = None, target_f0: float = DEFAULT_TARGET_F0_HZ,
                      seed: int | None = 0,
-                     pieces: list[ExpressivePiece] | None = None) -> SayResult:
+                     pieces: list[ExpressivePiece] | None = None,
+                     polish: TypedPolish | None = None) -> SayResult:
     """Convert rendered 16 kHz TTS pieces with an already loaded converter.
 
     The half of ``speak`` that needs the models; the control API calls it with the live
     engine's converter so a typed clip uses the voice that is already loaded. ``pieces``
     are the render hints the audio was made from; their per-piece gain is applied here.
+    ``polish`` (default: none) applies the typed-speech prosody options.
     """
+    polish = polish or TypedPolish()
     measured = 0.0
     auto = pitch is None
     if auto:
@@ -245,6 +269,8 @@ def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int
             measured = median_voiced_f0(converter.extractor, rendered, device)
             pitch = auto_pitch(measured, target_f0)
     params = dataclasses.replace(params, f0_up_key=float(pitch))
+    if not polish.plain:
+        params = dataclasses.replace(params, volume_envelope=polish.envelope)
 
     gains = [p.gain_db for p in pieces] if pieces else [0.0] * len(rendered)
     converted = []
@@ -252,7 +278,9 @@ def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int
         if seed is not None:
             torch.manual_seed(seed)
         # Gain goes on the converted audio: applied before RVC it would be normalised away.
-        converted.append(apply_gain(converter.convert(audio, params), gain_db))
+        out = (converter.convert(audio, params) if polish.plain else
+               converter.convert(audio, params, polish.rms_frame_ms, polish.contour_scale))
+        converted.append(apply_gain(out, gain_db))
     joined = crossfade_concat(converted, sr)
     if any(gains):
         joined = limit_peak(joined)

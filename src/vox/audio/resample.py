@@ -2,7 +2,8 @@
 
 Hot path (docs/research/03 §6): ``device_sr -> 16 kHz`` incrementally, resampling only the
 new block plus two 10 ms units of history and discarding the first 160 output samples
-(the filter's left-edge transient); and ``model_sr -> device_sr`` for the decoded tail.
+(the filter's left-edge transient); and ``model_sr -> device_sr`` for the decoded tail, with
+10 ms of the previous tail as history in the same way.
 """
 
 from __future__ import annotations
@@ -49,19 +50,50 @@ class IncrementalResampler16k:
 
 
 class OutputResampler:
-    """``model_sr -> device_sr`` for the decoded tail. Identity when the rates match."""
+    """``model_sr -> device_sr`` for the decoded tail, with history like the input side.
 
-    def __init__(self, model_sr: int, device_sr: int, device: torch.device | str) -> None:
+    Every hop decodes a fresh ``length``-sample tail whose start moves ``shift`` samples
+    (one hop at the model rate) per hop. Resampled on its own, each tail would be zero-padded
+    at both ends by the FIR: a transient at every edge, every hop. Instead the resampler
+    runs over ``[history | tail]``, the history being the 10 ms of the previous tail just
+    before where this one starts (``previous[shift - h:shift]``), and drops the output under
+    the history (the warm-up). The right edge has no future to borrow without adding
+    latency; it is the region SOLA fades out. Buffers are allocated once (graph-safe,
+    pointer-stable). Identity when the rates match.
+    """
+
+    def __init__(self, model_sr: int, device_sr: int, device: torch.device | str,
+                 length: int, shift: int) -> None:
         self.identity = model_sr == device_sr
         self._resample = None
+        self.hist = model_sr // 100  # one 10 ms unit: far beyond the sinc kernel's reach
+        self.hist_out = device_sr // 100
+        self.length, self.shift = length, shift
         if not self.identity:
             import torchaudio
 
+            if not self.hist <= shift <= length:
+                raise ValueError("the tail must advance by at least 10 ms and at most its length")
             self._resample = torchaudio.transforms.Resample(
                 model_sr, device_sr, dtype=torch.float32).to(device)
+            self._window = torch.zeros(self.hist + length, device=device)
 
     def run(self, audio: Tensor) -> Tensor:
-        return audio if self.identity else self._resample(audio)
+        if self.identity:
+            return audio
+        h = self.hist
+        self._window[h:].copy_(audio)
+        out = self._resample(self._window)[self.hist_out:]
+        # the next tail starts ``shift`` samples later: its history ends where it begins
+        self._window[:h].copy_(audio[self.shift - h:self.shift])
+        return out
+
+    def reset(self) -> None:
+        if not self.identity:
+            self._window.zero_()
+
+    def state_tensors(self) -> list[Tensor]:
+        return [] if self.identity else [self._window]
 
 
 # ------------------------------------------------------------------ control path (files)

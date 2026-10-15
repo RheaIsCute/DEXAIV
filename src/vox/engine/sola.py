@@ -15,8 +15,11 @@ so the hop has no ``.item()`` sync and the stage is CUDA-graph capturable. ``sti
 Gate protocol hooks (docs/research/03 §5, Applio): ``begin_drain`` / ``drain_step`` fade
 the saved tail out over exactly one overlap when the gate closes; ``zero`` forgets it. A
 zero tail makes the next hop fade in from silence through the ordinary crossfade, which is
-the onset fade (the crossfade windows carry the ramp across hop boundaries even when the
-overlap is longer than the hop).
+the onset fade.
+
+The overlap does not exceed the hop (the chunker clamps it unless ``overlap_beyond_hop``
+asks otherwise, an A/B setting): every emitted sample is then a sin^2 / cos^2 mix of at
+most two renders.
 """
 
 from __future__ import annotations
@@ -83,6 +86,12 @@ class Sola:
             head.copy_(self._phase_vocoder(self.buffer, head))
         else:
             head.mul_(self.fade_in).addcmul_(self.buffer, self.fade_out)
+        # The tail is saved *after* the crossfade. With overlap <= block (always, unless
+        # ``overlap_beyond_hop``) the two ranges are disjoint and the order is immaterial.
+        # With overlap > block it is what keeps the seam continuous: the saved tail starts
+        # on the mixed sample the emitted block ended on (a three-render blend whose weights
+        # still sum to one). Saving it before the crossfade would restart the next hop on
+        # the raw render: a step at every seam (tests/unit/test_sola.py).
         self.buffer.copy_(self._aligned[self.block:self.block + self.overlap])
         self.offset_hist.index_add_(0, offset.view(1), self._one)
         return self.out

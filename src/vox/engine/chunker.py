@@ -33,7 +33,7 @@ class ChunkPlan:
     # device-rate sizes (all multiples of zc)
     block: int
     crossfade: int  # requested overlap, after 10 ms rounding
-    sola_buffer: int  # overlap actually used: min(crossfade, 40 ms)
+    sola_buffer: int  # overlap actually used: min(crossfade, 40 ms, block)
     sola_search: int
     extra: int
     # 16 kHz sizes
@@ -52,6 +52,7 @@ class ChunkPlan:
     # output sizes
     decoder_out: int  # samples at model_sr
     out_device: int  # samples at device_sr: block + sola_buffer + sola_search
+    embed_pad_16k: int = 0  # replicated right edge appended before ContentVec (A/B)
 
     def ms(self, device_samples: int) -> float:
         return 1000.0 * device_samples / self.device_sr
@@ -87,6 +88,16 @@ class ChunkPlan:
         return self.block_ms + self.overlap_ms + self.search_ms
 
     @property
+    def overlap_note(self) -> str:
+        """Why the overlap in use is shorter than the one asked for ("" when it is not)."""
+        if self.sola_buffer == self.crossfade:
+            return ""
+        why = ("the overlap cannot exceed the hop" if self.sola_buffer == self.block
+               else f"the overlap is capped at {MAX_SOLA_UNITS * 10} ms")
+        return (f"crossfade {self.ms(self.crossfade):.0f} ms -> {self.overlap_ms:.0f} ms: {why} "
+                f"(hop {self.block_ms:.0f} ms)")
+
+    @property
     def hubert_phase_stable(self) -> bool:
         """True when the hop is a whole number of 20 ms HuBERT frames.
 
@@ -104,13 +115,24 @@ def _units(ms: float, minimum: int) -> int:
     return max(minimum, math.floor(ms / 10.0 + 0.5))
 
 
+def from_shape(shape, model_sr: int, f0_tail_16k: int = 0) -> ChunkPlan:
+    """``plan`` for a ``ShapeParams`` (read by attribute: the chunker imports nothing)."""
+    return plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms, shape.sola_search_ms,
+                shape.device_sr, model_sr, f0_tail_16k, shape.decoder_context_ms,
+                shape.overlap_beyond_hop, round(ANALYSIS_SR * shape.embed_pad_ms / 1000.0))
+
+
 def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: float,
          device_sr: int, model_sr: int, f0_tail_16k: int = 0,
-         decoder_context_ms: float = 0.0) -> ChunkPlan:
+         decoder_context_ms: float = 0.0, overlap_beyond_hop: bool = False,
+         embed_pad_16k: int = 0) -> ChunkPlan:
     """Derive every size from the four user-facing durations.
 
     ``f0_tail_16k`` is the pitch extractor's tail requirement; when it exceeds the
-    conversion window the 16 kHz ring is simply made that long.
+    conversion window the 16 kHz ring is simply made that long. ``overlap_beyond_hop``
+    lifts the overlap <= hop clamp (the pre-fix geometry, for A/B listening only).
+    ``embed_pad_16k`` samples of replicated right edge are appended to the window before
+    ContentVec (A/B: so its last 50 Hz frame covers the end of the window).
     """
     if device_sr % 100 or model_sr % 100:
         raise ChunkPlanError("sample rates must be multiples of 100 Hz")
@@ -121,7 +143,13 @@ def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: 
     crossfade_u = _units(crossfade_ms, 1)
     search_u = _units(sola_search_ms, 1)
     extra_u = _units(extra_ms, 0)
+    # The overlap does not exceed the hop: then every emitted sample is a two-render mix and
+    # the overlap costs no more latency than it buys smoothing. A longer overlap blends
+    # three renders per sample (SOLA's tail then overlaps its own crossfade); kept only as
+    # an A/B setting. See docs/DEVIATIONS.md §7, fix 1.
     sola_u = min(crossfade_u, MAX_SOLA_UNITS)
+    if not overlap_beyond_hop:
+        sola_u = min(sola_u, block_u)
 
     # One 10 ms device unit is exactly 160 samples at 16 kHz.
     block_16k = FRAME_16K * block_u
@@ -133,7 +161,9 @@ def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: 
     convert_frames = convert_16k // FRAME_16K
     return_length = block_u + sola_u + search_u
     skip_head = convert_frames - return_length
-    hubert_frames = (convert_16k - HUBERT_FIELD) // HUBERT_STRIDE + 1
+    if embed_pad_16k < 0:
+        raise ChunkPlanError("embed_pad_16k must be >= 0")
+    hubert_frames = (convert_16k + embed_pad_16k - HUBERT_FIELD) // HUBERT_STRIDE + 1
     p_len = min(convert_frames, 2 * (hubert_frames + 1))
     if p_len != convert_frames:
         raise ChunkPlanError("embedder cannot cover the conversion window")
@@ -149,4 +179,5 @@ def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: 
         dec_context=min(_units(decoder_context_ms, 0), skip_head),
         shift_frames=block_u, hubert_frames=hubert_frames, p_len=p_len,
         decoder_out=return_length * (model_sr // 100), out_device=return_length * zc,
+        embed_pad_16k=embed_pad_16k,
     )

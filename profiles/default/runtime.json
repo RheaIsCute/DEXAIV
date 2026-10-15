@@ -2,7 +2,7 @@
   "schema": 1,
   "gpu": "NVIDIA GeForce RTX 5060 Ti",
   "block_ms": 20.0,
-  "crossfade_ms": 30.0,
+  "crossfade_ms": 20.0,
   "context_extra_ms": 1000.0,
   "sola_search_ms": 10.0,
   "decoder_context_ms": 0.0,
@@ -97,6 +97,32 @@
         "autotune": {
           "p50": 16.13445000111824,
           "p99": 17.038646998553304,
+          "hops": 50
+        }
+      }
+    },
+    "Mom|hop20|extra1000|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "off",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.07657665759325027,
+          "passed": false
+        },
+        "bf16": {
+          "log_mel_l1": 0.35476014018058777,
+          "passed": false
+        }
+      },
+      "cudnn_autotune": true,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 15.7679999992979,
+          "p99": 16.655449999761913,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 14.753600000403821,
+          "p99": 15.618165000178124,
           "hops": 50
         }
       }

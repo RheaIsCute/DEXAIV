@@ -95,6 +95,7 @@ class HopPipeline:
         self.index = index
         self.params = params
         self._interp = params.f0_unvoiced == "interp"
+        self._bridge = round(params.f0_bridge_ms / 10.0)  # F0 frames (10 ms each)
         self.set_plan(plan)
         self.set_params(params)
 
@@ -116,11 +117,17 @@ class HopPipeline:
         self._upload_done = torch.cuda.Event() if pin else None
         self.in_block = torch.zeros(p.block, device=dev)
         self.resampler_in = IncrementalResampler16k(p.device_sr, p.block, dev)
-        self.resampler_out = OutputResampler(p.model_sr, p.device_sr, dev)
+        self.resampler_out = OutputResampler(p.model_sr, p.device_sr, dev, p.decoder_out,
+                                             p.decoder_out * p.block // p.out_device)
         self.ring_16k = torch.zeros(p.history_16k, device=dev)
         self._ring_tmp = torch.zeros(p.history_16k - p.block_16k, device=dev)
         self._fresh_len = self.resampler_in.out_len
         self.window_16k = self.ring_16k[-p.convert_16k:].unsqueeze(0)
+        # A/B (``embed_pad_ms``): the window plus its last sample replicated, so the last
+        # 50 Hz ContentVec frame reaches the end of the window instead of stopping short
+        # and being held for the final decoded frames.
+        self._window_padded = (torch.zeros(1, p.convert_16k + p.embed_pad_16k, device=dev)
+                               if p.embed_pad_16k else None)
         self.f0_tail = self.ring_16k[-p.f0_tail_16k:] if self.extractor else None
         self.pitch_cache = PitchCache(p.convert_frames, p.shift_frames, p.p_len, dev)
         self.feats50 = torch.zeros(1, p.hubert_frames, self.model.emb_dim, device=dev)
@@ -137,6 +144,11 @@ class HopPipeline:
                                                  p.dec_context)
         self.noise_z = torch.zeros(latent, device=dev)
         self.noise_src = torch.zeros(source, device=dev) if source is not None else None
+        # A/B (``noise_roll``): scratch for shifting the noise with the window.
+        self._noise_z_tmp = torch.zeros_like(self.noise_z[..., p.shift_frames:])
+        self._noise_src_tmp = (torch.zeros_like(
+            self.noise_src[:, p.shift_frames * self.model.upp:])
+            if self.noise_src is not None else None)
         self.audio_model = torch.zeros(p.decoder_out, device=dev)
         self.out = torch.zeros(p.out_device, device=dev)
         # Device-rate copy of the input under the decoded tail: the RMS-mix reference.
@@ -161,8 +173,9 @@ class HopPipeline:
     def set_params(self, params: RuntimeParams) -> bool:
         """Apply hot parameters between hops. Scalars go into existing device tensors.
 
-        Returns True when the change alters a stage's op sequence (``f0_unvoiced``), which
-        means any captured graph of that stage is stale and must be recaptured.
+        Returns True when the change alters a stage's op sequence (``f0_unvoiced``,
+        ``f0_bridge_ms``), which means any captured graph of that stage is stale and must
+        be recaptured.
         """
         self.params = params
         self.ratio_t.fill_(semitones_to_ratio(params.f0_up_key))
@@ -175,8 +188,9 @@ class HopPipeline:
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
         interp = params.f0_unvoiced == "interp"
-        changed = interp != self._interp
-        self._interp = interp
+        bridge = round(params.f0_bridge_ms / 10.0)
+        changed = interp != self._interp or bridge != self._bridge
+        self._interp, self._bridge = interp, bridge
         return changed
 
     def set_index(self, index: GpuIndex | None) -> None:
@@ -187,6 +201,7 @@ class HopPipeline:
     def reset(self) -> None:
         """Zero all streaming state (start of a stream, or after warmup)."""
         self.resampler_in.reset()
+        self.resampler_out.reset()
         self.ring_16k.zero_()
         self.in_tail.zero_()
         self.pitch_cache.zero()
@@ -206,7 +221,8 @@ class HopPipeline:
         """Every tensor a stage mutates: snapshot/restore around graph warmup and capture."""
         tensors = [self.in_block, self.ring_16k, self.in_tail, self.pitch_cache.pitch,
                    self.pitch_cache.pitchf, self.feats50, self.feats, self.feats0,
-                   self.audio_model, self.out, self.resampler_in._window]
+                   self.audio_model, self.out, self.resampler_in._window,
+                   *self.resampler_out.state_tensors()]
         if self.noise_src is not None:
             tensors.append(self.noise_src)
         tensors.append(self.noise_z)
@@ -217,7 +233,7 @@ class HopPipeline:
         return (
             tuple(sorted((k, v.data_ptr()) for k, v in self.buffers().items())),
             self.plan, id(self.model), id(self.embedder), id(self.extractor),
-            id(self.index), self._interp, self.model.decoder_fp16,
+            id(self.index), self._interp, self._bridge, self.model.decoder_fp16,
             getattr(self.embedder, "autocast", None), self.post.rms_mix.graph_safe,
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
             torch.backends.cudnn.benchmark,
@@ -247,10 +263,26 @@ class HopPipeline:
             self._upload_done.record()
 
     def fill_noise(self) -> None:
-        """Draw this hop's decoder noise. Outside every graph: RNG never lives in a capture."""
-        self.noise_z.normal_()
+        """Draw this hop's decoder noise. Outside every graph: RNG never lives in a capture.
+
+        With ``noise_roll`` (A/B) the noise moves with the window instead: shifted left by
+        one hop and drawn only for the frames that entered, so the 40 ms two consecutive
+        hops both decode see the same latent and excitation noise.
+        """
+        if not self.params.noise_roll:
+            self.noise_z.normal_()
+            if self.noise_src is not None:
+                self.noise_src.normal_()
+            return
+        s = self.plan.shift_frames
+        self._noise_z_tmp.copy_(self.noise_z[..., s:])
+        self.noise_z[..., :-s].copy_(self._noise_z_tmp)
+        self.noise_z[..., -s:].normal_()
         if self.noise_src is not None:
-            self.noise_src.normal_()
+            s = s * self.model.upp
+            self._noise_src_tmp.copy_(self.noise_src[:, s:])
+            self.noise_src[:, :-s].copy_(self._noise_src_tmp)
+            self.noise_src[:, -s:].normal_()
 
     def _stage_noop(self) -> None:
         return None
@@ -268,11 +300,17 @@ class HopPipeline:
     def _stage_f0(self) -> None:
         f0 = self.extractor.extract(self.f0_tail)
         coarse, cont = postprocess_f0(f0, self.ratio_t, self.f0_min_t, self.f0_max_t,
-                                      self._interp)
+                                      self._interp, self._bridge)
         self.pitch_cache.roll_and_write(coarse, cont)
 
     def _stage_embed(self) -> None:
-        self.feats50.copy_(self.embedder.embed(self.window_16k))
+        window = self.window_16k
+        if self._window_padded is not None:
+            n = self.plan.convert_16k
+            self._window_padded[:, :n].copy_(window)
+            self._window_padded[:, n:].copy_(window[:, -1:].expand(-1, self.plan.embed_pad_16k))
+            window = self._window_padded
+        self.feats50.copy_(self.embedder.embed(window))
 
     def _stage_index(self) -> None:
         protect = self.index is not None and self.extractor is not None
@@ -320,19 +358,23 @@ class HopPipeline:
 
     @torch.inference_mode()
     def advance_context(self) -> None:
-        """Gate closed: keep the 16 kHz ring and the RMS reference current, nothing else.
+        """Gate closed: keep the 16 kHz ring, the RMS reference and the pitch cache current.
 
         The ring is then the true recent history when the gate reopens, with no stale
-        speech to replay and no refill stall (docs/research/03 §5, Applio protocol).
+        speech to replay and no refill stall (docs/research/03 §5, Applio protocol). The
+        pitch cache shifts with it (the closed hop's frames unvoiced), so at the reopen the
+        F0 history lines up with the audio ContentVec sees.
         """
         with self.timers.stage("resample_in"):
             self.stage_impl["resample_in"]()
+            self.pitch_cache.advance_silent()
 
     def forget_speech(self) -> None:
-        """Gate closed: drop everything derived from the audio that just ended."""
-        self.pitch_cache.zero()
-        self.feats.zero_()
-        self.feats0.zero_()
-        self.feats50.zero_()
+        """Gate closed: drop the rendered output of the audio that just ended.
+
+        Features and pitch are left alone: the features are recomputed from the ring at
+        every open hop, and the pitch cache advances with the ring (``advance_context``).
+        """
         self.audio_model.zero_()
         self.out.zero_()
+        self.resampler_out.reset()  # its history would splice old speech into the onset

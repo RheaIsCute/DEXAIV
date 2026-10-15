@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vox.audio.conditioning import ConditioningConfig, InputConditioner
 from vox.config import defaults, target
 from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
 from vox.config.store import load_tuned, save_tuned
@@ -47,6 +48,7 @@ class Engine:
     graphs: StageGraphs
     gate: SilenceGate | None = None
     warmup_ms: float = 0.0
+    conditioner: InputConditioner | None = None  # the live mic's input chain
 
     @property
     def mode(self) -> str:
@@ -70,7 +72,8 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
                 registry: ModelRegistry | None = None,
                 cache: dict | None = None, graphs: str | None = None,
                 gate: GateConfig | None = None, log=print,
-                profile_dir: Path | None = None) -> Engine:
+                profile_dir: Path | None = None,
+                conditioning: ConditioningConfig | None = None) -> Engine:
     """Control-path construction: load models, plan, allocate, warm up, capture graphs.
 
     The device is resolved and asserted against TARGET.md first (``config.target``); the
@@ -80,7 +83,9 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
     defaults); the Silero model is loaded on the CPU here, never in the hot loop.
     ``profile_dir`` is where warmup's one-time decisions (HuBERT autocast, cuDNN
     autotune) are read from and written to (``runtime.json``, keyed by shape); without it
-    they are measured on every build and not stored.
+    they are measured on every build and not stored. ``conditioning`` configures the live
+    microphone's input chain (high-pass, auto level, trim, soft limit; default on), which
+    the worker and the simulator run on each block before the upload and the gate.
     """
     shape = shape or defaults.DEFAULT_SHAPE
     precision = precision or defaults.DEFAULT_PRECISION
@@ -115,12 +120,10 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
             cache[key] = make_extractor(params.f0_method)
             cache[key].load(device, Path(models_dir))
         extractor = cache[key]
-        block_16k = chunker.plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms,
-                                 shape.sola_search_ms, shape.device_sr, model.tgt_sr).block_16k
-        f0_tail = extractor.tail_samples(block_16k)
-    plan = chunker.plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms,
-                        shape.sola_search_ms, shape.device_sr, model.tgt_sr, f0_tail,
-                        shape.decoder_context_ms)
+        f0_tail = extractor.tail_samples(chunker.from_shape(shape, model.tgt_sr).block_16k)
+    plan = chunker.from_shape(shape, model.tgt_sr, f0_tail)
+    if plan.overlap_note:
+        log(f"warning: {plan.overlap_note}")
 
     index = None
     if params.index_rate > 0 and loaded.index_path is not None:  # lazy: P6
@@ -138,8 +141,10 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
             cache["vad"].load(Path(models_dir))
         vad = cache["vad"]
     silence_gate = SilenceGate(plan, gate_config, vad)
+    conditioner = InputConditioner(plan.device_sr, plan.block,
+                                   conditioning or ConditioningConfig())
     engine = Engine(plan, pipeline, sola, timers, device, loaded, params, precision,
-                    stage_graphs, silence_gate)
+                    stage_graphs, silence_gate, conditioner=conditioner)
     if warmup_hops:
         key = tune_key(model_name, plan, params, precision)
         tuned = load_tuned(profile_dir, key)
@@ -168,12 +173,39 @@ class SimResult:
     gate_open: np.ndarray | None = None  # per hop: True when the hop ran through the model
     gate_transitions: int = 0
     closed_hop_ms: np.ndarray | None = None  # host ms of hops the gate skipped
+    # Paced runs: underruns of a modelled output ring (``_PlayoutModel``); None otherwise.
+    underruns: int | None = None
+    events: list[dict] = field(default_factory=list)  # timers.events: gate / underrun log
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def aligned(self) -> np.ndarray:
         """The stream advanced by the nominal SOLA delay, so it lines up with the input."""
         return self.audio[self.plan.stream_delay:]
+
+
+class _PlayoutModel:
+    """The live output ring, modelled for a paced run: playback starts when the first hop
+    is written, on top of a ``fill`` prefill, and drains at the device rate. A hop that
+    lands after the ring would have run dry is an underrun; the ring is then topped back up
+    to the target, as ``InferenceWorker`` does after one."""
+
+    def __init__(self, fill: int, block: int, sr: int) -> None:
+        self.fill, self.block, self.sr = fill, block, sr
+        self.t0: float | None = None
+        self.written = 0  # samples handed to the "device" since t0
+
+    def hop_written(self, now: float) -> int:
+        """Returns the samples the device got as zeros before this hop (0 = on time)."""
+        if self.t0 is None:
+            self.t0, self.written = now, self.fill + self.block
+            return 0
+        missing = int((now - self.t0) * self.sr) - self.written
+        if missing > 0:
+            self.t0, self.written = now, self.fill + self.block
+            return missing
+        self.written += self.block
+        return 0
 
 
 class StreamSimulator:
@@ -183,16 +215,24 @@ class StreamSimulator:
 
     def run(self, audio: np.ndarray, realtime: bool = False, jitter_ms: float = 0.0,
             sync_debug: bool = False, reset: bool = True, seed: int | None = 0,
-            gate: bool = False) -> SimResult:
+            gate: bool = False, fill_ms: float | None = None,
+            condition: bool = True) -> SimResult:
         """Feed ``audio`` (mono float32 at the device rate) through the engine.
 
         ``sync_debug`` makes any implicit host<->device synchronisation inside the hop raise
         (after a few settling hops), which is how the no-``.item()`` rule is enforced.
-        ``gate`` runs the engine's silence gate exactly as the live worker does.
+        ``gate`` runs the engine's silence gate exactly as the live worker does, on the
+        block after ``engine.conditioner`` (the live input chain; ``condition=False``
+        feeds the raw audio, as the engine did before it existed).
+        ``realtime`` paces the input and models the output ring (fill target ``fill_ms``,
+        default two hops + a 10 ms callback, as ``LiveSession``) to count underruns.
+        Gate transitions and underruns are logged in ``engine.timers.events`` with stream
+        time (hop index x hop duration) and returned in ``SimResult.events``.
         """
         engine = self.engine
         plan, pipeline, sola, timers = engine.plan, engine.pipeline, engine.sola, engine.timers
         silence_gate = engine.gate if gate else None
+        conditioner = engine.conditioner if condition else None
         always = GateDecision(True)
         cuda = engine.device.type == "cuda"
         block = plan.block
@@ -211,6 +251,8 @@ class StreamSimulator:
             sola.reset()
             if silence_gate is not None:
                 silence_gate.reset()
+            if conditioner is not None:
+                conditioner.reset()
         timers.reset()
         self.alloc = AllocProbe(engine.device, capacity=hops)
         if seed is not None:
@@ -222,6 +264,11 @@ class StreamSimulator:
         gate_open = np.ones(hops, dtype=bool)
         closed_ms: list[float] = []
         transitions = 0
+        events = timers.events
+        fill = round(plan.device_sr * (fill_ms if fill_ms is not None
+                                       else 2 * plan.block_ms + 10.0) / 1000.0)
+        playout = _PlayoutModel(fill, block, plan.device_sr) if realtime else None
+        underruns = 0
 
         compute = 0.0
         start = time.perf_counter()
@@ -239,6 +286,8 @@ class StreamSimulator:
             self.alloc.begin_hop()
             host_block = padded[n * block:(n + 1) * block]
             with timers.stage("upload"):
+                if conditioner is not None:
+                    host_block = conditioner.process(host_block)
                 pipeline.upload(host_block)
             with timers.stage("gate"):
                 decision = silence_gate.decide(host_block) if silence_gate else always
@@ -264,10 +313,18 @@ class StreamSimulator:
             if decision.onset or decision.drain:
                 transitions += 1
                 timers.counters.vad_transitions += 1
+                events.add("gate_open" if decision.onset else "gate_close", n, n * hop_s,
+                           decision.rms_dbfs)
             with timers.stage("download"):
                 host_out.copy_(stitched)  # the one device -> host copy; syncs the hop
             self.alloc.end_hop()
             timers.end_hop()
+            if playout is not None:
+                missing = playout.hop_written(time.perf_counter())
+                if missing:
+                    underruns += 1
+                    timers.counters.output_underruns += 1
+                    events.add("underrun", n, n * hop_s, missing)
             hop_ms = time.perf_counter() - hop_start
             compute += hop_ms
             if not decision.speech:
@@ -290,4 +347,6 @@ class StreamSimulator:
             gate_open=gate_open if silence_gate is not None else None,
             gate_transitions=transitions,
             closed_hop_ms=np.asarray(closed_ms, dtype=np.float64),
+            underruns=underruns if realtime else None,
+            events=events.since(0),
         )

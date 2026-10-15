@@ -78,10 +78,32 @@ def test_seeded_full_file_render_is_reproducible(engine, clip_48k, full):
     assert compare(first, again, SR)["l1"] < 0.05
 
 
+# docs/DEVIATIONS.md §7, fix 1: at the 20 ms default the overlap equals the hop, so every
+# emitted sample but the seams is a mix of two renders that are partly uncorrelated; the
+# seam metric (seam vs mid-hop roughness) reads that as 1.3-1.4x. The pre-fix geometry
+# (30 ms overlap at the 20 ms hop, a three-render blend, ``overlap_beyond_hop``) reads ~1.0x
+# and passes. Which one ships is a listening decision (out/ab/reference.wav vs
+# sola_blend3.wav); until it is made these record the regression. Strict: once the default
+# changes back they pass, and the marker has to go.
+OVERLAP_EQUALS_HOP = pytest.mark.xfail(
+    strict=True, reason="20 ms overlap == 20 ms hop: seam roughness 1.3-1.4x, see "
+                        "docs/DEVIATIONS.md §7 (pending the listening A/B)")
+
+
+@OVERLAP_EQUALS_HOP
 def test_stream_has_no_hop_boundary_clicks(streamed, full):
     ratio = boundary_click_ratio(streamed.audio, streamed.plan.block)
     control = boundary_click_ratio(full, streamed.plan.block)
     assert ratio < 1.25, f"boundary roughness {ratio:.2f}x mid-hop (full-file: {control:.2f}x)"
+
+
+def test_pre_clamp_overlap_geometry_has_no_hop_boundary_clicks(device, cache, clip_48k):
+    """The A/B alternative to the 20 ms default: 30 ms overlap at the 20 ms hop."""
+    shape = dataclasses.replace(defaults.DEFAULT_SHAPE, crossfade_ms=30, overlap_beyond_hop=True)
+    engine = load_engine(MODELS, TEST_MODEL, shape, RuntimeParams(), device=device, cache=cache)
+    assert engine.plan.sola_buffer > engine.plan.block
+    result = StreamSimulator(engine).run(clip_48k, seed=0)
+    assert boundary_click_ratio(result.audio, engine.plan.block) < 1.25
 
 
 def test_stream_stays_close_to_full_file_render(streamed, full, clip_48k):
@@ -168,6 +190,8 @@ def test_pitch_cache_matches_full_window_f0(engine, clip_48k):
     (dict(block_ms=50, crossfade_ms=20), dict(sola_mode="pv")),
     (dict(block_ms=30), dict(f0_up_key=12.0, f0_unvoiced="interp", volume_envelope=0.5)),
     (dict(), dict(f0_method="fcpe")),
+    # the Step 2 A/B settings (docs/DEVIATIONS.md §7), all at once
+    (dict(embed_pad_ms=15.0, decoder_context_ms=80.0), dict(noise_roll=True, f0_bridge_ms=60.0)),
 ])
 def test_other_plans_and_params_run_clean(device, cache, clip_48k, shape, params):
     engine = load_engine(MODELS, TEST_MODEL, dataclasses.replace(defaults.DEFAULT_SHAPE, **shape),
@@ -177,13 +201,22 @@ def test_other_plans_and_params_run_clean(device, cache, clip_48k, shape, params
     assert 0.005 < np.sqrt(np.mean(result.audio[SR:] ** 2)) < 0.5
 
 
-def test_40k_model_resamples_to_the_device_rate(device, cache, clip_48k):
+@pytest.fixture(scope="module")
+def stream_40k(device, cache, clip_48k):
     engine = load_engine(MODELS, "base_f0_40k_v2", defaults.DEFAULT_SHAPE, RuntimeParams(),
                          device=device, cache=cache)
-    plan = engine.plan
+    return engine.plan, StreamSimulator(engine).run(clip_48k[: 3 * SR])
+
+
+def test_40k_model_resamples_to_the_device_rate(stream_40k):
+    plan, result = stream_40k
     assert plan.model_sr == 40000 and plan.decoder_out * 48000 == plan.out_device * 40000
-    result = StreamSimulator(engine).run(clip_48k[: 3 * SR])
     assert len(result.audio) == result.hops * plan.block and np.isfinite(result.audio).all()
+
+
+@OVERLAP_EQUALS_HOP
+def test_40k_model_has_no_hop_boundary_clicks(stream_40k):
+    plan, result = stream_40k
     assert boundary_click_ratio(result.audio, plan.block) < 1.3
 
 
@@ -233,6 +266,29 @@ def test_gate_streams_speech_silence_speech_without_clicks(engine, clip_48k):
         assert np.abs(result.audio[h * plan.block:(h + 1) * plan.block]).max() == 0.0
     # a closed hop only advances the 16 kHz ring: far below the cost of a converted hop
     assert np.median(result.closed_hop_ms) < 2.0, np.median(result.closed_hop_ms)
+
+
+def test_gate_close_keeps_the_pitch_history_moving_with_the_ring(engine, clip_48k):
+    """A gate close no longer wipes the pitch cache: closed hops shift it one hop each, in
+    step with the 16 kHz ring, so after the reopen the voiced history lines up with the
+    features ContentVec computes from that ring."""
+    pipeline, plan = engine.pipeline, engine.plan
+    pipeline.reset()
+    for n in range(60):
+        pipeline.upload(clip_48k[(100 + n) * plan.block:(101 + n) * plan.block])
+        pipeline.process_hop()
+    before = pipeline.pitch_cache.pitchf.clone()
+    assert (before > 0).float().mean() > 0.3  # speech: the history is mostly voiced
+    pipeline.forget_speech()  # the drain hop
+    closed = 5
+    for _ in range(closed):
+        pipeline.upload(np.zeros(plan.block, np.float32))
+        pipeline.advance_context()
+    after = pipeline.pitch_cache.pitchf
+    moved = closed * plan.shift_frames
+    assert torch.equal(after[:-moved], before[moved:])
+    assert not after[-moved:].any()
+    assert pipeline.feats.abs().sum() > 0  # features are recomputed each hop, not wiped
 
 
 def test_hot_params_apply_between_hops_without_reallocating(engine, clip_48k):

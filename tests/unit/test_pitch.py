@@ -6,6 +6,7 @@ import torch
 
 from vox.pitch import make_extractor
 from vox.pitch.base import (
+    bridge_gaps,
     clamp_voicing,
     f0_to_coarse,
     interp_unvoiced,
@@ -128,6 +129,51 @@ def test_pitch_cache_pointers_are_stable_and_zero_forgets():
     assert cache.pitchf.max() == 200.0
     cache.zero()
     assert cache.pitchf.abs().sum() == 0 and torch.all(cache.pitch == 1)  # 1 = unvoiced
+
+
+def test_bridge_gaps_fills_short_in_vowel_dropouts_only():
+    f0 = torch.tensor([0, 200, 200, 0, 0, 0, 220, 220,  # 3-frame gap, +1.7 st: filled
+                       0, 0, 0, 0, 0, 0, 0, 0, 220,  # 8-frame gap: a pause, kept
+                       0, 0, 440,  # 2-frame gap but an octave jump: kept
+                       0, 0], dtype=torch.float32)  # trailing: no right neighbour, kept
+    out = bridge_gaps(f0, max_frames=6)
+    filled = out[3:6]
+    assert torch.all(filled > 200) and torch.all(filled < 220)
+    assert torch.all(filled[1:] >= filled[:-1])  # a monotone glide in log-F0
+    assert torch.equal(out[8:16], f0[8:16]) and torch.equal(out[17:19], f0[17:19])
+    assert torch.equal(out[20:], f0[20:]) and out[0] == 0  # edges stay unvoiced
+    assert torch.equal(out[f0 > 0], f0[f0 > 0])  # voiced frames untouched
+    coarse, cont = postprocess_f0(f0, 1.0, bridge_frames=6)
+    assert torch.equal(cont, out) and torch.all(coarse[3:6] > 1)
+
+
+@pytest.mark.parametrize("closed_hops", [1, 3, 9])
+def test_pitch_cache_advance_silent_keeps_history_aligned(closed_hops):
+    """Closed hops shift the history like open ones (new frames unvoiced): after the reopen
+    every frame the fresh estimate does not rewrite is the old history moved by exactly
+    one hop per hop that passed, closed or open."""
+    convert_frames, shift = 30, 2
+    cache = PitchCache(convert_frames, shift, p_len=30, device="cpu")
+    rng = np.random.default_rng(closed_hops)
+    for _ in range(20):  # speech: fill the whole cache with voiced frames
+        f = torch.from_numpy(rng.uniform(80, 300, 12).astype(np.float32))
+        cache.roll_and_write(torch.full((12,), 100), f)
+    before = cache.pitchf.numpy().copy()
+    length = len(before)
+    for _ in range(closed_hops):
+        cache.advance_silent()
+    shifted = closed_hops * shift
+    np.testing.assert_array_equal(cache.pitchf.numpy()[:length - shifted], before[shifted:])
+    assert not cache.pitchf[length - shifted:].any() and torch.all(cache.pitch[-shifted:] == 1)
+    # reopen: one open hop shifts once more and rewrites the newest 8 frames (12 - 3 - 1)
+    cache.roll_and_write(torch.full((12,), 100), torch.full((12,), 222.0))
+    kept = length - 8
+    expected = np.zeros(kept, np.float32)
+    moved = (closed_hops + 1) * shift
+    tail = before[moved:moved + kept]
+    expected[:len(tail)] = tail
+    np.testing.assert_array_equal(cache.pitchf.numpy()[:kept], expected)
+    assert torch.all(cache.pitchf[kept:] == 222.0)
 
 
 def test_pitch_cache_tail_longer_than_cache_keeps_the_newest_frames():

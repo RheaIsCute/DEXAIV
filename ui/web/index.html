@@ -106,9 +106,14 @@
           <span class="row between sub">Gate threshold <span class="num strong" id="gate-value">-48 dB</span></span>
           <input type="range" id="gate-threshold" min="-80" max="-20" step="1" value="-48">
         </label>
+        <label class="col" style="gap:5px" title="Trim on top of auto level (or the whole input gain with auto level off)">
+          <span class="row between sub">Input gain <span class="num strong" id="input-gain-value">0 dB</span></span>
+          <input type="range" id="input-gain" min="-12" max="24" step="1" value="0">
+        </label>
       </div>
       <div class="col side" style="gap:12px">
         <label class="toggle"><span>Noise gate</span><input type="checkbox" id="gate-on"></label>
+        <label class="toggle" title="Brings your microphone to a steady speaking level before conversion"><span>Auto level</span><input type="checkbox" id="auto-level"></label>
         <label class="toggle" id="suppression-row"><span>Suppression</span><input type="checkbox" id="suppression"></label>
         <div class="hint" id="noise-floor"></div>
       </div>

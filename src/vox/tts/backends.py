@@ -100,21 +100,52 @@ class KokoroBackend(TtsBackend):
         if self.unavailable_reason() or not all((directory / f).is_file() for f in KOKORO_FILES):
             return
         kokoro = self._model()
-        if self.voice in kokoro.get_voices():
-            kokoro.create("Hi.", voice=self.voice, speed=1.0,
-                          lang=KOKORO_LANGS.get(self.voice[0], "en-us"))
+        try:
+            style = self._style(kokoro)
+        except TtsError:
+            return  # an unknown voice: synthesize() reports it
+        kokoro.create("Hi.", voice=style, speed=1.0, lang=KOKORO_LANGS.get(self.voice[0], "en-us"))
+
+    def _style(self, kokoro):
+        """The voice argument for ``kokoro.create``: a name, or for a blend such as
+        ``af_heart*0.7+af_bella*0.3`` the weighted sum of the style vectors (weights
+        normalised to 1). Unknown names are an error either way."""
+        parts = parse_voice_blend(self.voice)
+        known = kokoro.get_voices()
+        for name, _ in parts:
+            if name not in known:
+                raise TtsError(f"kokoro has no voice {name!r} (see 'vox say --list-voices')")
+        if len(parts) == 1:
+            return parts[0][0]
+        return sum(weight * kokoro.get_voice_style(name) for name, weight in parts)
 
     def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
         from vox.audio.resample import save_audio
 
         self._require()
         kokoro = self._model()
-        if self.voice not in kokoro.get_voices():
-            raise TtsError(f"kokoro has no voice {self.voice!r} (see 'vox say --list-voices')")
+        style = self._style(kokoro)
         lang = KOKORO_LANGS.get(self.voice[0], "en-us")
-        samples, sr = kokoro.create(text, voice=self.voice, speed=float(speed), lang=lang)
+        samples, sr = kokoro.create(text, voice=style, speed=float(speed), lang=lang)
         save_audio(out_wav_path, samples, sr)
         return sr
+
+
+def parse_voice_blend(spec: str) -> list[tuple[str, float]]:
+    """``"af_heart*0.7+af_bella*0.3"`` -> ``[("af_heart", 0.7), ("af_bella", 0.3)]`` with the
+    weights normalised to sum to 1; a plain name -> ``[(name, 1.0)]``."""
+    parts = []
+    for term in spec.split("+"):
+        name, _, weight = term.strip().partition("*")
+        try:
+            value = float(weight) if weight else 1.0
+        except ValueError as err:
+            raise TtsError(f"bad voice blend {spec!r}: {err}") from err
+        if not name.strip() or value <= 0:
+            raise TtsError(f"bad voice blend {spec!r}")
+        parts.append((name.strip(), value))
+    total = sum(w for _, w in parts)
+    return [(n, w / total) for n, w in parts]
 
 
 def edge_rate(speed: float) -> str:

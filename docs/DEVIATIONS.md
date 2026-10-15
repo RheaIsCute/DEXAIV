@@ -420,3 +420,170 @@ inside ordinary speech, and a gained clip peaks at 0.985 with the same RMS as a 
 - Listening: clicks and gaps were judged from the cable recording, not by ear.
 - The window itself under long use; headless Chrome rendered the captures.
 - Kokoro's first use after a fresh install (weights download) from inside the GUI.
+
+## 7. Live-mic quality (2026-10-14): the external audio report, checked against the code
+
+A code-aware report on a real session (live mic raspy, whispery and chopped; typed speech
+clean) listed nine "bugs". Each was re-checked at 5fa21d2, the confirmed ones fixed, the
+rest turned into A/B variants. Same machine; NVIDIA Broadcast, OBS and browsers were
+resident on the GPU (~4.5 GB, 8-13% utilisation) for every run, so "idle GPU" means no
+other compute job.
+
+**Test material.** The report's recording used **MaeASMR** (32 kHz, no index); the work
+used **Mom** (32 kHz, 43,857-vector index), the voice the GUI had selected. The raw
+microphone is the OBS capture of 2026-10-13 22:55 (default mic at unity, no filters): a male
+voice, F0 median ~100 Hz (p10 67 Hz), speech at **-42 dBFS** active RMS over a -60..-98 dBFS
+floor, with quiet bleed (another voice, ~200 Hz, 20 dB below) in the pauses. Its two speech
+passages make `benchmarks/corpus/mic_script.wav` (25.75 s, not committed). Settings: Mom,
+pitch +12 (the saved GUI value), hop 20, overlap 30 requested, extra 1000, index rate 0,
+`f0_unvoiced` zero, envelope 1.0.
+
+**Gate threshold.** The prompt said -31 dB; the GUI state saved at the end of the reported
+session says -57 dBFS. At this mic level a -31 gate never opens (0.1% of 20 ms blocks reach
+it; measured: 100% of hops closed), so the baseline is at -57. After input conditioning the
+gate measures the lifted level and -40 is the setting that works (7.3).
+
+**Measures** (`vox bench accept`, `offline/metrics.py`): gate transitions per 8 s of script;
+*phrases* = input frames within 18 dB of its loud frames, gaps < 250 ms bridged (11 spans,
+13.2 s: the talker, not the bleed); *speech lost* = digital-zero runs >= 10 ms inside
+phrases, each attributed to gated hops or an underrun; voicing = RMVPE on the output over
+active frames; HF/LF = 90th percentile of the 3-12 kHz / 0.1-1 kHz energy ratio; R3 =
+speech-frame log-mel L1 of the gate-off stream against the full-file render, over the
+new-seed floor. "Typed" = the report's two sentences through Kokoro `af_heart` + Mom.
+
+### 7.1 Deviations
+
+| # | Prompt / report said | What was built | Why |
+|---|---|---|---|
+| L1 | SOLA: with overlap > block the saved tail is double-windowed; copy it before the crossfade **and** clamp, default 20 ms | Clamp (overlap <= hop) and the 20 ms default; the **save order kept** (tail saved after the crossfade); `overlap_beyond_hop` keeps the old geometry as an A/B setting | The old order is not a seam bug: the tail it saves starts on the mixed sample the emitted block ended on, a three-render blend whose weights sum to one (envelope step / crossfade slope 1.00, `test_sola.py`). Copying first, at overlap > block, steps at every seam (229x). Under the clamp the order is immaterial. The 20 ms default costs seam smoothness (7.3) |
+| L2 | Strong onset (>= threshold + 6 dB) opens before the VAD | Also needs a 12 dB rise over the quietest block of the last 200 ms; held 100 ms unless the VAD confirms | After auto level the room tone of this mic sits above threshold + 6 on its own: without the rise rule the gate reopened every ~120 ms through pauses |
+| L3 | Hysteresis: close at threshold - 6 dB | Same, plus VAD hysteresis (stay open down to 0.5 - 0.15) | Silero's own neg_threshold rule |
+| L4 | Hangover 300-350 ms | 350 ms (`calibration.json` `release_ms`, `VadProfile` default, `GateConfig`) | The profile's 200 overrode the gate's default |
+| L5 | AGC: target -20 dBFS active RMS, max +18 dB, frozen below the noise floor, soft limit near -3 dBFS; HPF 70-80 Hz | As specified (`audio/conditioning.py`): level = 500 ms mean power of blocks above floor + 6 dB, gain up 400 ms / down 60 ms ramped per block, gain held in pauses, tanh knee from -6 to -3 dBFS, 2nd-order HPF at **70 Hz** | A symmetric power average is the active RMS; a fast-up dB tracker followed the syllable peaks and landed 3.6 dB low. 70 Hz: this talker's F0 reaches 67 Hz |
+| L6 | The gate measures the post-conditioning level | So does the IN meter (the gate's level) | A threshold set on the raw mic (-57) then passes lifted room tone and bleed to the VAD: 12.4 toggles / 8 s. The setting moves to about -40 dBFS |
+| L7 | Typed speech must not pass the input chain | By construction: clips go to the output ring | |
+| L8 | (none) | Step 0 tooling: `StageTimers.events` (gate open/close, underrun; hop + time), `SimResult.events` and a modelled output ring in paced runs, `OutputTap` + `vox run --record-output` + `scripts/analyze_tap.py`, `vox bench ab` / `typed` | Every cut needs a cause |
+| L9 | GUI input-gain slider as a trim | Added (there was none): "Input gain" -12..+24 dB and "Auto level", stored in `gui_state.json`, hot | |
+
+This supersedes part of D7 (the overlap in use is now `min(crossfade, 40 ms, hop)`) and of
+D20 (on close the pitch cache advances with the ring instead of being zeroed, and the
+features are no longer zeroed; the SOLA drain and the output buffers are as before).
+
+### 7.2 Step 0: attribution, and the baseline (5fa21d2)
+
+Gate closures and underruns are logged apart with hop index and time; `vox bench accept`
+prints both and the cut attribution; the live tap marks every sample the output callback
+zero-filled. Baseline, gate -57 dBFS raw, hangover 200 ms:
+
+| | baseline |
+|---|---|
+| gate transitions / 8 s (closures in 25.7 s) | 8.7 (14) |
+| speech lost to cuts | 860 ms in 3 cuts, all gate (the report's measure, which counts the bleed as speech: 7 cuts, 1,260 ms) |
+| underruns | 0 (paced simulation); live, 90 s looped through the VAC: 0, no zero-filled sample, 54 zero runs all from gated hops, 21 of them mid-speech |
+| voiced: stream (its active frames; on the frames shared with the full-file render) / full-file (shared frames) / typed | 74.3% (76.5%) / 75.0% / 79.3% |
+| HF/LF p90, same columns | +11.8 (+12.0) / +14.5 / +2.8 dB |
+| R3 (Mom) | 0.671 vs floor 0.266 = **2.52x** (test voice: 1.82x); seam click ratio 1.02 |
+| latency | algorithmic 60 ms; live estimate median 124 ms; tap trails input 90 ms |
+
+So on this machine every cut was the gate; none was an underrun. The HF/LF excess is not
+a streaming artefact: the full-file render of the same input is brighter still.
+
+### 7.3 Step 1: the five fixes, measured cumulatively
+
+Same script and settings; gate -57 raw until the input chain is in.
+
+| after | trans / 8 s | closures | lost ms | click | R3 | voiced | HF/LF |
+|---|---|---|---|---|---|---|---|
+| baseline | 8.7 | 14 | 860 | 1.02 | 2.52x | 74.3% | +11.8 |
+| 1 SOLA clamp, overlap 20 | 8.7 | 14 | 880 | **1.33** | 2.56x | 71.1% | +11.9 |
+| 2 output resampler, 3 pitch cache | 8.7 | 14 | 880 | 1.34 | 2.56x | 71.4% | +12.1 |
+| 5 gate (raw input) | 6.8 | 11 | 50 | 1.34 | 2.56x | 70.3% | +13.0 |
+| 4 input chain, gate -57 | 12.4 | 20 | 40 | 1.38 | 2.73x | 67.2% | +12.6 |
+| 4 input chain, **gate -40** | **5.6** | **9** | **150** | 1.39 | 2.73x | 68.4% | +12.6 |
+| 4 input chain, gate -31 | 5.6 | 9 | 181 | 1.43 | 2.73x | 70.4% | +12.6 |
+
+(voiced and HF/LF over the gated stream's own active frames; click ratio of the gate-off
+stream, +-0.03 between identical runs. The gate row "5" predates the onset rise rule of
+L2, which only matters once the input chain lifts the room tone.)
+
+1. **SOLA.** Latency -10 ms (algorithmic 60 -> 50). The seam ratio rises to 1.33-1.4 on Mom,
+   1.34 on the test voice, 1.41 on the 40 k test voice: with overlap == hop every sample but
+   the seams is a 50/50 mix of two partly uncorrelated renders, the seams are single
+   renders. The engine's own seam guard (< 1.25) fails; `tests/engine/test_engine.py`
+   records it as two strict xfails pending the listening A/B, and checks that the old
+   geometry passes. Noise rolling does not cure it (7.4).
+2. **Output resampler.** Now carries 10 ms of the previous tail; a 32 k / 40 k streamed
+   sine matches the whole-signal resample to < 1e-4 (stateless: > 1e-2 at the left edge).
+   No measurable effect on the stream: SOLA already weights both edges ~0.
+3. **Pitch cache.** Closed hops shift it like open ones (`advance_silent`), aligned with the
+   ring; features are no longer zeroed. Within the metrics' noise: after a reopen RMVPE
+   rewrites the newest 280 ms, the decoded tail reads only the newest 50 ms.
+4. **Input chain.** Lifts this mic by the full +18 dB (speech -42.7 -> -24.7 dBFS). With the
+   gate at -40 it ends the soft-word cuts; at -57 the lifted room tone and bleed reach the
+   VAD (gate open 6.5 s outside phrases). R3 rises 2.56 -> 2.73x: the stream's input is now
+   high-passed and lifted, the full-file reference's is not.
+5. **Gate.** The VAD sees every block; hysteresis, 350 ms hangover, onset rule (L2). At -40
+   after the input chain: one open and one close per phrase (5.6 per 8 s is exactly 2 x 9
+   phrases), none inside a phrase, 150 ms of speech lost against 860.
+
+### 7.4 Step 2: A/B variants (on the Step 1 engine, gate -40; defaults unchanged)
+
+`vox bench ab --model Mom --audio mic_script.wav --pitch 12 --gate-threshold -40`; each wav
+is the gated stream in `out/ab/<variant>.wav`.
+
+| variant | R3 | click | voiced | HF/LF | level | reading |
+|---|---|---|---|---|---|---|
+| reference (Step 1) | 2.73x | 1.39 | 68.3% | +12.6 | -13.9 | |
+| sola_blend3 (30 ms at the 20 ms hop) | **2.65x** | **1.00** | 71.8% | +13.3 | -13.9 | better seams and R3, +10 ms |
+| overlap_10 | 2.89x | 0.86 | 69.4% | +10.9 | -14.6 | smooth seams, worse R3 |
+| raw_input (no input chain) | 2.56x | 1.33 | 80.2% | +10.7 | -13.6 | 2.6 s lost at -40 (gate tuned for the lifted level) |
+| **f0_interp** | 2.73x | 1.33 | **76.8%** | **+8.3** | -13.8 | 4.3 dB less hiss, 8.5 points more voicing |
+| envelope_0.3 | 6.64x | 1.28 | 64.7% | +11.6 | -21.1 | follows the mic envelope: 7 dB quieter |
+| index_0.35 | 2.64x | 1.36 | 68.1% | +12.9 | -14.4 | |
+| index_0.6 | 2.62x | 1.33 | 68.2% | +13.2 | -15.0 | |
+| embed_pad (240 samples) | 2.87x | 1.35 | 68.8% | +13.8 | -14.6 | worse on both |
+| f0_bridge (<= 60 ms, 4 st) | 2.73x | 1.39 | 69.9% | +12.8 | -13.9 | no measurable change |
+| decctx_80 | 2.73x | 1.36 | 69.6% | +12.7 | -13.7 | no measurable change (as Q17) |
+| noise_roll | 2.74x | 1.44 | 70.7% | +13.4 | -13.8 | no measurable change |
+
+Gate behaviour is identical across variants (5.6 / 8 s, 0 inside phrases, 140-160 ms lost)
+except raw_input. Hop p99 17.6-18.8 ms for all.
+
+### 7.5 Step 3: typed speech (A/B, defaults unchanged)
+
+`vox bench typed --model Mom`: the report's two sentences, Kokoro, auto pitch;
+`out/ab/typed_<variant>.wav`. Options: `TypedPolish(envelope, rms_frame_ms,
+contour_scale)` in `convert_rendered`, voice blends as `"af_heart*0.7+af_bella*0.3"`.
+
+| variant | F0 sd | loudness sd | voiced | HF/LF |
+|---|---|---|---|---|
+| plain | 3.01 st | 8.93 dB | 77.9% | +3.0 |
+| envelope 0.35, 40 ms frames | 3.11 | 8.17 | 78.2% | +3.3 |
+| contour x1.2 | **3.43** | 9.03 | 79.1% | +2.6 |
+| blend 0.7 af_heart + 0.3 af_bella | 2.74 | 8.92 | 80.0% | +1.6 |
+| all three | 3.30 | 8.60 | 78.9% | +0.9 |
+
+The report's "flat wall of sound" (`_change_rms` skipped) does not show: the plain render
+already varies 8.9 dB, and the 40 ms envelope mix narrows it. The contour scale does what
+it says (+14% F0 spread, median unchanged).
+
+### 7.6 Acceptance
+
+| check | before | after (gate -40) | target | |
+|---|---|---|---|---|
+| Step 1 fixes in, with tests | | 368 CPU tests pass; engine 25 pass + 2 strict xfail (L1) | suite green | met except the 20 ms seam guard |
+| gate toggles / 8 s | 8.7 | 5.6, 0 inside phrases | <= 4 | not reachable on this script without bridging real pauses: 9 phrases with gaps of 0.5-1.4 s need 5.6 |
+| mid-speech zeros attributed | 100% gate | 100% gate (sim and live tap) | all | met |
+| underruns, idle GPU | 0 | 0 (sim; live 90 s: 0, no zero-filled sample) | 0 | met |
+| voiced ratio vs typed (79.1%) | 74.3% | 68.4% (f0_interp: 76.8%) | within 8 points | met only with f0_interp |
+| HF/LF p90 vs typed (+2.5) | +11.8 | +12.6 (f0_interp +8.3) | within 4 dB | not met; the full-file render of the same input is +18.9 |
+| R3 for Mom | 2.52x | 2.73x | recorded | |
+| latency | 60 / 124 / 90 ms | 50 / 119 / 80 ms | ~-20 ms | -5 to -10 ms (algorithmic / live estimate / tap lag) |
+
+### 7.7 Not verified
+
+- Nothing was listened to: the A/B wavs are for the user's ears, and no Step 2/3 default
+  was changed.
+- The engine's input level as heard in the GUI session: taken equal to the OBS capture.
+- MaeASMR, the model of the report's own recording.
+- Live runs used the file-backed input; the Shure MV6 was not connected.

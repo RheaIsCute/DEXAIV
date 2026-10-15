@@ -74,19 +74,43 @@ def interp_unvoiced(f0: Tensor) -> Tensor:
     return left + (right - left) * weight.clamp(0.0, 1.0)
 
 
+def bridge_gaps(f0: Tensor, max_frames: int, max_semitones: float = 4.0) -> Tensor:
+    """Fill ``f0 == 0`` runs of at most ``max_frames`` that sit between two voiced frames no
+    more than ``max_semitones`` apart, interpolating in log-F0: a tracker dropout inside a
+    vowel, not a consonant (those border on a jump or a longer gap). Longer gaps and the
+    edges are left unvoiced. Static shapes, no host round-trip (graph-safe)."""
+    n = f0.shape[-1]
+    idx = torch.arange(n, device=f0.device)
+    voiced = f0 > 0
+    prev = torch.cummax(torch.where(voiced, idx, -1), dim=-1).values
+    nxt = torch.flip(
+        torch.cummin(torch.flip(torch.where(voiced, idx, n), [-1]), dim=-1).values, [-1])
+    log_prev = torch.log(f0.gather(-1, prev.clamp(min=0)).clamp(min=1.0))
+    log_next = torch.log(f0.gather(-1, nxt.clamp(max=n - 1)).clamp(min=1.0))
+    span = (nxt - prev).clamp(min=1)
+    weight = (idx - prev).to(f0.dtype) / span.to(f0.dtype)
+    interpolated = torch.exp(log_prev + (log_next - log_prev) * weight)
+    close = (log_next - log_prev).abs() <= max_semitones * math.log(2.0) / 12.0
+    fill = ~voiced & (prev >= 0) & (nxt < n) & (span - 1 <= max_frames) & close
+    return torch.where(fill, interpolated, f0)
+
+
 def postprocess_f0(f0: Tensor, ratio: Tensor | float, f0_min: Tensor | float = COARSE_F0_MIN,
-                   f0_max: Tensor | float = COARSE_F0_MAX, interp: bool = False
-                   ) -> tuple[Tensor, Tensor]:
+                   f0_max: Tensor | float = COARSE_F0_MAX, interp: bool = False,
+                   bridge_frames: int = 0) -> tuple[Tensor, Tensor]:
     """Raw extractor output -> ``(coarse int64, continuous Hz)`` after transposition.
 
     ``ratio`` is ``2 ** (f0_up_key / 12)``; pass a 0-dim device tensor on the hot path so
     changing the key never changes the op sequence. The same goes for the voicing bounds:
     as tensors they are always applied (use 0 / inf to disable), as floats only when
-    tighter than the coarse-pitch contract.
+    tighter than the coarse-pitch contract. ``bridge_frames`` > 0 fills short dropouts
+    first (``bridge_gaps``).
     """
     tensors = isinstance(f0_min, Tensor) or isinstance(f0_max, Tensor)
     if tensors or f0_min > COARSE_F0_MIN or f0_max < COARSE_F0_MAX:
         f0 = clamp_voicing(f0, f0_min, f0_max)
+    if bridge_frames > 0:
+        f0 = bridge_gaps(f0, bridge_frames)
     if interp:
         f0 = interp_unvoiced(f0)
     pitchf = f0 * ratio

@@ -2,7 +2,10 @@
 the stream simulator; there is no separate batch path.
 
     vox bench accept                  Phase 2 acceptance: streamed vs full-file, clicks,
-                                      sync-free hop, allocation stability
+                                      sync-free hop, allocation stability; plus the live
+                                      path (paced, gated): gate closures, underruns, cuts
+    vox bench ab [--variants a,b]     one setting per variant -> out/ab/<name>.wav + metrics
+    vox bench typed                   typed-speech prosody variants -> out/ab/typed_*.wav
     vox bench perf  [--sweep FILE]    perf sweep: block x extra x f0 method   (open question Q1)
     vox bench extra                   quality vs EXTRA context                (Q3)
     vox bench sola                    overlap x {plain, pv} stitching         (Q7)
@@ -39,17 +42,82 @@ def _setup(args):
     return audio, ModelRegistry(args.models_dir), {}
 
 
-def _engine(args, registry, cache, shape_kw=None, **param_kw):
+def _overrides(args) -> dict[str, dict]:
+    """``--set key=value`` (repeatable) sorted by the dataclass that owns each key, plus the
+    explicit convenience flags. Values are parsed as JSON where they can be. Input
+    conditioning fields take a ``cond_`` prefix (``--set cond_target_dbfs=-24``)."""
+    import json
+
+    from vox.audio.conditioning import ConditioningConfig
+    from vox.config.schemas import RuntimeParams, ShapeParams
+    from vox.engine.gate import GateConfig
+
+    owners = {"shape": ShapeParams, "params": RuntimeParams, "gate": GateConfig}
+    out: dict[str, dict] = {k: {} for k in (*owners, "conditioning")}
+    cond_fields = {f.name for f in dataclasses.fields(ConditioningConfig)}
+    for item in getattr(args, "set", None) or []:
+        key, _, raw = item.partition("=")
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        if key.startswith("cond_") and key[5:] in cond_fields:
+            out["conditioning"][key[5:]] = value
+            continue
+        for name, cls in owners.items():
+            if key in {f.name for f in dataclasses.fields(cls)}:
+                out[name][key] = value
+                break
+        else:
+            raise SystemExit(f"--set: unknown key {key!r}")
+    if getattr(args, "crossfade_ms", None) is not None:
+        out["shape"]["crossfade_ms"] = args.crossfade_ms
+    if getattr(args, "index_rate", None) is not None:
+        out["params"]["index_rate"] = args.index_rate
+    if getattr(args, "gate_threshold", None) is not None:
+        out["gate"]["threshold_dbfs"] = args.gate_threshold
+    if getattr(args, "conditioning", None) is not None:
+        out["conditioning"]["enabled"] = args.conditioning == "on"
+    if getattr(args, "auto_level", None) is not None:
+        out["conditioning"]["auto_level"] = args.auto_level == "on"
+    return out
+
+
+def _conditioning_config(args):
+    """The live input chain as ``vox run`` builds it (calibration.json), then overrides."""
+    from vox.audio.conditioning import ConditioningConfig
+    from vox.config.store import load_profile
+
+    cal = load_profile(args.profile).calibration
+    base = ConditioningConfig(trim_db=cal.input_gain_db, noise_floor_dbfs=cal.noise_floor_dbfs)
+    return dataclasses.replace(base, **_overrides(args)["conditioning"])
+
+
+def _gate_config(args):
+    """The profile's gate (calibration.json), as ``vox run`` builds it, then overrides."""
+    from vox.config.store import load_profile
+    from vox.engine.gate import GateConfig
+
+    cal = load_profile(args.profile).calibration
+    base = GateConfig(threshold_dbfs=cal.silence_gate_dbfs, vad_threshold=cal.vad.threshold,
+                      hangover_ms=cal.vad.release_ms, use_vad=cal.vad.engine == "silero")
+    return dataclasses.replace(base, **_overrides(args)["gate"])
+
+
+def _engine(args, registry, cache, shape_kw=None, cond_kw=None, **param_kw):
     from vox.config import defaults
     from vox.config.schemas import PrecisionParams, RuntimeParams
     from vox.offline.simulate import load_engine
 
-    shape = dataclasses.replace(defaults.DEFAULT_SHAPE, **(shape_kw or {}))
-    params = RuntimeParams(f0_up_key=args.pitch, **param_kw)
+    extra = _overrides(args)
+    shape = dataclasses.replace(defaults.DEFAULT_SHAPE, **{**extra["shape"], **(shape_kw or {})})
+    params = RuntimeParams(f0_up_key=args.pitch, **{**extra["params"], **param_kw})
     precision = PrecisionParams(hubert_fp16=args.hubert_fp16, graphs=args.graphs,
                                 hubert_autocast=args.hubert_autocast)
+    conditioning = dataclasses.replace(_conditioning_config(args), **(cond_kw or {}))
     return load_engine(args.models_dir, args.model, shape, params, precision,
-                       registry=registry, cache=cache, profile_dir=args.profile)
+                       registry=registry, cache=cache, profile_dir=args.profile,
+                       gate=_gate_config(args), conditioning=conditioning)
 
 
 def _record(name: str, record: dict) -> None:
@@ -78,6 +146,168 @@ def _quality(reference: np.ndarray, result, sr: int, start_s: float) -> dict[str
     out = compare(reference, stream, sr, lag_search_ms=15.0, start_s=start_s)
     out["click_ratio"] = boundary_click_ratio(result.audio, result.plan.block)
     return out
+
+
+def _f0_100hz(engine, audio: np.ndarray) -> np.ndarray:
+    """Pitch track of device-rate audio with the engine's own extractor (RMVPE), 100 Hz."""
+    from vox.audio.resample import resample_array
+
+    x = resample_array(audio, engine.plan.device_sr, 16000)
+    with torch.inference_mode():
+        f0 = engine.pipeline.extractor.extract(torch.from_numpy(x).to(engine.device))
+    return f0.float().cpu().numpy()
+
+
+def _voice_metrics(engine, audio: np.ndarray, mask: np.ndarray | None = None
+                   ) -> dict[str, float]:
+    """Voiced ratio, 90th-pct HF/LF and level of one rendered signal over ``mask`` (10 ms
+    frames; default: its own active frames)."""
+    from vox.offline.metrics import active_frames, frame_rms_dbfs, hf_lf_p90, voiced_ratio
+
+    sr = engine.plan.device_sr
+    mask = active_frames(audio, sr) if mask is None else mask
+    level = frame_rms_dbfs(audio, sr)[:len(mask)]
+    power = np.mean(10 ** (level[mask[:len(level)]] / 10.0)) if mask.any() else 1e-12
+    out = {"hf_lf_p90_db": hf_lf_p90(audio, sr, mask),
+           "active_rms_dbfs": float(10 * np.log10(power + 1e-12)),
+           "active_share": float(mask.mean())}
+    if engine.pipeline.extractor is not None:
+        out["voiced_ratio"] = voiced_ratio(_f0_100hz(engine, audio), mask)
+    return out
+
+
+def _cuts(result, audio_in: np.ndarray) -> dict:
+    """Digital-zero runs >= 10 ms that overlap the input's phrases by >= 10 ms, each
+    attributed to the gate (>= 95% of its samples left the engine in gated hops; the
+    onset hop's fade-in starts at exactly 0) or an underrun (an event within 2 hops)."""
+    from vox.offline.metrics import phrases, zero_runs
+
+    plan = result.plan
+    sr, block = plan.device_sr, plan.block
+    stream = result.aligned[:len(audio_in)]
+    spans = phrases(audio_in, sr)
+    in_phrase = np.zeros(len(stream), dtype=bool)
+    for s, e in spans:
+        in_phrase[s:e] = True
+    under_hops = np.array([e["hop"] for e in result.events if e["kind"] == "underrun"])
+    cuts = []
+    for a, b in zero_runs(stream, sr // 100):
+        lost = int(in_phrase[a:b].sum())
+        if lost < sr // 100:
+            continue
+        # aligned sample k left the engine in hop (k + stream_delay) // block
+        hops = (np.arange(a, b) + plan.stream_delay) // block
+        closed = (np.mean(~result.gate_open[np.minimum(hops, len(result.gate_open) - 1)])
+                  if result.gate_open is not None else 0.0)
+        h0, h1 = int(hops[0]), int(hops[-1])
+        under = under_hops.size > 0 and bool(np.any((under_hops >= h0 - 2)
+                                                    & (under_hops <= h1 + 2)))
+        cause = "gate" if closed >= 0.95 else "underrun" if under else "unattributed"
+        cuts.append({"t": a / sr, "ms": 1000.0 * (b - a) / sr,
+                     "speech_ms": 1000.0 * lost / sr, "cause": cause})
+    speech_s = float(in_phrase.sum()) / sr
+    # Chatter: gate transitions while the input is inside a phrase (an honest gate opens
+    # and closes once per phrase, at its edges, so these should be ~0). The hop's audio is
+    # [n * block, (n + 1) * block) of the input.
+    inside = [e for e in result.events if e["kind"] in ("gate_open", "gate_close")
+              and 0 < e["hop"] * block < len(in_phrase) and in_phrase[e["hop"] * block]
+              and in_phrase[max(0, e["hop"] * block - sr // 10)]]
+    return {"cuts": cuts, "speech_s": speech_s, "phrases": len(spans),
+            "toggles_in_phrases": len(inside),
+            "by_cause": {c: sum(1 for x in cuts if x["cause"] == c)
+                         for c in ("gate", "underrun", "unattributed")},
+            "cut_ms": float(sum(x["ms"] for x in cuts)),
+            "speech_lost_ms": float(sum(x["speech_ms"] for x in cuts))}
+
+
+def _print_events(result, limit: int = 40) -> None:
+    """The two logs the cut attribution rests on, kept apart (Step 0 of the live fixes)."""
+    closes = [e for e in result.events if e["kind"] == "gate_close"]
+    unders = [e for e in result.events if e["kind"] == "underrun"]
+    print(f"gate closures: {len(closes)}" + ("" if not closes else "   at " + ", ".join(
+        f"{e['t']:.2f}s" for e in closes[:limit]) + (" ..." if len(closes) > limit else "")))
+    shown = "n/a (throughput run)" if result.underruns is None else str(result.underruns)
+    print(f"output-ring underruns: {shown}" + ("" if not unders else "   at " + ", ".join(
+        f"{e['t']:.2f}s ({e['value'] / result.plan.device_sr * 1000:.0f} ms)"
+        for e in unders[:limit])))
+
+
+def live_report(engine, audio: np.ndarray, full: np.ndarray, result,
+                typed: np.ndarray | None = None) -> dict:
+    """The report's live-vs-typed measures for one gated, paced stream of ``audio``.
+
+    Stream and full-file render are compared on the frames active in *both* (the gate
+    silences pauses the full render still voices, which would bias either measure); each
+    is also reported over its own active frames, and the typed clip over its own.
+    """
+    from vox.offline.metrics import active_frames
+
+    sr = engine.plan.device_sr
+    stream = result.aligned[:len(audio)]
+    cuts = _cuts(result, audio)
+    seconds = len(audio) / sr
+    own = active_frames(stream, sr)
+    shared = own & active_frames(full, sr)[:len(own)]
+    report = {
+        "seconds": seconds, "gate_transitions": result.gate_transitions,
+        "toggles_per_8s": result.gate_transitions / (seconds / 8.0),
+        "gate_closures": sum(1 for e in result.events if e["kind"] == "gate_close"),
+        "underruns": result.underruns, "closed_share": float(1.0 - result.gate_open.mean())
+        if result.gate_open is not None else 0.0,
+        "mid_speech_cuts": cuts, "stream": _voice_metrics(engine, stream, own),
+        "stream_shared": _voice_metrics(engine, stream, shared),
+        "full_shared": _voice_metrics(engine, full, shared),
+        "full": _voice_metrics(engine, full),
+    }
+    if typed is not None:
+        report["typed"] = _voice_metrics(engine, typed)
+    return report
+
+
+def _print_live(report: dict) -> None:
+    c = report["mid_speech_cuts"]
+    print(f"gate: {report['gate_transitions']} transitions in {report['seconds']:.1f} s = "
+          f"{report['toggles_per_8s']:.1f} per 8 s ({c['phrases']} input phrases: 2 each is "
+          f"{2 * c['phrases'] / (report['seconds'] / 8):.1f} per 8 s); "
+          f"{c['toggles_in_phrases']} inside phrases; {report['closed_share'] * 100:.0f}% "
+          f"of hops closed")
+    print(f"mid-speech zero cuts: {len(c['cuts'])} ({c['speech_lost_ms']:.0f} ms of the "
+          f"{c['speech_s']:.1f} s of input phrases lost) by cause {c['by_cause']}"
+          + ("" if not c["cuts"] else "\n  " + ", ".join(
+              f"{x['t']:.2f}s {x['speech_ms']:.0f}ms {x['cause']}" for x in c["cuts"][:30])))
+    rows = [("stream, own frames", report["stream"]),
+            ("stream, shared frames", report["stream_shared"]),
+            ("full-file, shared frames", report["full_shared"]),
+            ("full-file, own frames", report["full"])]
+    if "typed" in report:
+        rows.append(("typed clip (TTS), own", report["typed"]))
+    print(f"{'render':<26} {'frames':>7} {'voiced':>7} {'HF/LF p90':>10} {'active dBFS':>12}")
+    for label, m in rows:
+        voiced = m.get("voiced_ratio", float("nan")) * 100
+        print(f"{label:<26} {m['active_share'] * 100:>6.0f}% {voiced:>6.1f}% "
+              f"{m['hf_lf_p90_db']:>+9.2f} {m['active_rms_dbfs']:>12.1f}")
+
+
+def _typed_clip(engine, text: str, models_dir: Path) -> np.ndarray | None:
+    """``text`` through Kokoro and the engine's model, as the GUI's Speak does, at the
+    device rate (the typed-path reference). None when no TTS backend is installed."""
+    from vox.audio.resample import resample_array
+    from vox.offline.convert import FullFileConverter
+    from vox.tts.backends import pick_backend
+    from vox.tts.cli import TTS_DIR
+    from vox.tts.speak import convert_rendered, render_tts, split_pieces
+
+    try:
+        backend = pick_backend("kokoro", cache_dir=models_dir / TTS_DIR)
+        backend.load()
+    except Exception as err:  # noqa: BLE001
+        print(f"typed reference skipped: {err}")
+        return None
+    pieces = split_pieces(text)
+    said = convert_rendered(FullFileConverter.from_engine(engine), engine.device,
+                            engine.loaded.model.tgt_sr, render_tts(backend, pieces),
+                            engine.params, None, seed=0, pieces=pieces)
+    return resample_array(said.audio, said.sr, engine.plan.device_sr)
 
 
 # ------------------------------------------------------------------------------- accept
@@ -111,10 +341,20 @@ def cmd_accept(args) -> int:
     stream_floor = compare(result.aligned[:len(audio)], again.aligned[:len(audio)], sr,
                            start_s=start_s)
     full_click = boundary_click_ratio(full_a, plan.block)
+    # The live path: paced input, the modelled output ring, the gate as configured. Its
+    # event log separates gate closures from underruns (cut attribution).
+    live = sim.run(audio, realtime=True, seed=0, gate=args.gate == "on")
+    typed = _typed_clip(engine, args.tts_text, args.models_dir) if args.tts_text else None
+    live_rep = live_report(engine, audio, full_a, live, typed)
 
     out = ROOT / "out"
     save_audio(out / "accept_full.wav", full_a, sr)
     save_audio(out / "accept_stream.wav", result.aligned[:len(audio)], sr)
+    save_audio(out / "accept_live.wav", live.aligned[:len(audio)], sr)
+    if args.save_as:
+        save_audio(out / "ab" / f"{args.save_as}.wav", live.aligned[:len(audio)], sr)
+        if typed is not None:
+            save_audio(out / "ab" / f"{args.save_as}_typed.wav", typed, sr)
 
     ratio = quality["l1_speech"] / floor["l1_speech"]
     alloc = result.alloc or {}
@@ -145,20 +385,197 @@ def cmd_accept(args) -> int:
           f"{quality['lag_ms']:+.1f} ms)")
     print(f"boundary click ratio  stream {quality['click_ratio']:.3f}   "
           f"full-file (control) {full_click:.3f}")
+    gate = engine.gate.config
+    print(f"\nlive path (paced, gate {args.gate}: threshold {gate.threshold_dbfs:g} dBFS, VAD "
+          f"{gate.vad_threshold:g}, hangover {gate.hangover_ms:g} ms; latency estimate "
+          f"{plan.algorithmic_latency_ms:.0f} ms algorithmic + fill + devices)")
+    cond = engine.conditioner
+    if cond is not None and cond.config.enabled:
+        level = cond.level_db
+        print(f"input chain: high-pass {cond.config.highpass_hz:g} Hz, auto level "
+              f"{'on' if cond.config.auto_level else 'off'}, trim {cond.config.trim_db:+g} dB; "
+              f"gain at the end {cond.gain_db:+.1f} dB (speech level "
+              f"{'-' if level is None else f'{level:.1f}'} dBFS -> target "
+              f"{cond.config.target_dbfs:g})")
+    else:
+        print("input chain: off (raw microphone)")
+    _print_events(live)
+    _print_live(live_rep)
     print()
     for name, ok in checks.items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
     met = "met" if ratio <= 1.5 else "NOT met"
     print(f"  [info] strict equivalence target (<= 1.5x floor): {met} at {ratio:.2f}x; "
           "see docs/research/14 Q14")
-    _record("accept", {"model": args.model, "plan": dataclasses.asdict(plan), "rtf": result.rtf,
+    _record("accept", {"model": args.model, "audio": str(args.audio), "pitch": args.pitch,
+                       "label": args.save_as, "overrides": _overrides(args),
+                       "plan": dataclasses.asdict(plan), "rtf": result.rtf,
                        "mode": engine.mode, "graphs": dataclasses.asdict(engine.graphs.report),
                        "noise_floor": floor, "stream_floor": stream_floor,
-                       "quality": quality,
+                       "quality": quality, "ratio": ratio,
                        "full_click_ratio": full_click, "alloc": alloc,
                        "stage_p50_ms": _stage_p50(engine, SKIP),
+                       "gate": dataclasses.asdict(gate), "live": live_rep,
+                       "events": live.events,
                        "checks": {k: bool(v) for k, v in checks.items()}})
     return 0 if all(checks.values()) else 1
+
+
+# ----------------------------------------------------------------------------------- ab
+
+# Step 2 of the live-quality work (docs/DEVIATIONS.md §7): one setting changed per variant,
+# everything else as ``reference`` (the engine after the Step 1 fixes, at the flags given on
+# the command line). Each: (shape, params, input conditioning) overrides, and what it is.
+AB_VARIANTS: dict[str, tuple[dict, dict, dict, str]] = {
+    "reference": ({}, {}, {}, "Step 1 engine, defaults"),
+    "sola_blend3": ({"crossfade_ms": 30, "overlap_beyond_hop": True}, {}, {},
+                    "pre-fix SOLA geometry: 30 ms overlap at the 20 ms hop (3-render blend)"),
+    "overlap_10": ({"crossfade_ms": 10}, {}, {}, "10 ms crossfade (half the hop single-render)"),
+    "raw_input": ({}, {}, {"enabled": False}, "no input conditioning (fix 4 off)"),
+    "f0_interp": ({}, {"f0_unvoiced": "interp"}, {}, "unvoiced F0 interpolated (Q15)"),
+    "envelope_0.3": ({}, {"volume_envelope": 0.3}, {}, "output follows the mic envelope (R4)"),
+    "index_0.35": ({}, {"index_rate": 0.35}, {}, "paired index at 0.35"),
+    "index_0.6": ({}, {"index_rate": 0.6}, {}, "paired index at 0.6"),
+    "embed_pad": ({"embed_pad_ms": 15.0}, {}, {}, "ContentVec window replicate-padded 240 samples"),
+    "f0_bridge": ({}, {"f0_bridge_ms": 60.0}, {}, "F0 dropouts <= 60 ms within 4 st filled"),
+    "decctx_80": ({"decoder_context_ms": 80.0}, {}, {}, "80 ms decoder left context (Q17)"),
+    "noise_roll": ({}, {"noise_roll": True}, {}, "decoder noise moves with the window"),
+}
+
+
+def cmd_ab(args) -> int:
+    """Render the script once per variant (gated stream, the live path) to out/ab/<name>.wav
+    and measure each the same way: R3 against its own full-file render, hop-seam click
+    ratio, gate behaviour, voicing and HF/LF tilt, compute cost."""
+    from vox.audio.resample import save_audio
+    from vox.offline.convert import render_full
+    from vox.offline.metrics import compare
+    from vox.offline.simulate import StreamSimulator
+
+    audio, registry, cache = _setup(args)
+    names = list(AB_VARIANTS) if not args.variants else args.variants.split(",")
+    out = ROOT / "out" / "ab"
+    rows = []
+    for name in names:
+        shape_kw, param_kw, cond_kw, note = AB_VARIANTS[name]
+        engine = _engine(args, registry, cache, shape_kw, cond_kw, **param_kw)
+        plan, sr = engine.plan, engine.plan.device_sr
+        start_s = _settle_s(plan)
+        full = render_full(engine, audio, seed=0)
+        floor = compare(full, render_full(engine, audio, seed=1), sr, start_s=start_s)
+        sim = StreamSimulator(engine)
+        open_run = sim.run(audio, seed=0)
+        quality = _quality(full, open_run, sr, start_s)
+        p99 = _stage_p50(engine, SKIP)  # host p50 per stage (keys: stages + total)
+        from vox.profiling.report import stage_table
+
+        total = stage_table(engine.timers, SKIP)["total"]
+        gated = sim.run(audio, seed=0, gate=True)
+        report = live_report(engine, audio, full, gated)
+        save_audio(out / f"{args.prefix}{name}.wav", gated.aligned[:len(audio)], sr)
+        cuts = report["mid_speech_cuts"]
+        row = {"name": name, "note": note, "r3": quality["l1_speech"],
+               "r3_ratio": quality["l1_speech"] / floor["l1_speech"], "bias": quality["bias"],
+               "click": quality["click_ratio"], "toggles_8s": report["toggles_per_8s"],
+               "toggles_in_phrases": cuts["toggles_in_phrases"],
+               "speech_lost_ms": cuts["speech_lost_ms"],
+               "voiced": report["stream"].get("voiced_ratio", float("nan")),
+               "hf_lf": report["stream"]["hf_lf_p90_db"],
+               "hf_lf_shared": report["stream_shared"]["hf_lf_p90_db"],
+               "hf_lf_full_shared": report["full_shared"]["hf_lf_p90_db"],
+               "active_dbfs": report["stream"]["active_rms_dbfs"],
+               "hop_p50": total["host"]["p50"], "hop_p99": total["host"]["p99"]}
+        rows.append(row)
+        _record("ab", {"model": args.model, "audio": str(args.audio), "pitch": args.pitch,
+                       "overrides": _overrides(args), "variant": name,
+                       "shape": shape_kw, "params": param_kw, "conditioning": cond_kw,
+                       "plan": dataclasses.asdict(plan), "noise_floor": floor,
+                       "quality": quality, "live": report, "row": row, "p50": p99})
+        print(f"[{name}] {note}: R3 {row['r3']:.3f} ({row['r3_ratio']:.2f}x floor) click "
+              f"{row['click']:.2f} toggles {row['toggles_8s']:.1f}/8s lost "
+              f"{row['speech_lost_ms']:.0f} ms voiced {row['voiced'] * 100:.1f}% HF/LF "
+              f"{row['hf_lf']:+.1f} dB hop p99 {row['hop_p99']:.1f} ms", flush=True)
+        engine.graphs.release()
+        del engine
+    print(f"\n{'variant':<14} {'R3':>6} {'xflr':>5} {'bias':>6} {'click':>6} {'tog/8s':>6} "
+          f"{'in-ph':>5} {'lost':>6} {'voiced':>7} {'HF/LF':>6} {'shared':>7} {'full':>6} "
+          f"{'dBFS':>6} {'p99':>5}")
+    for r in rows:
+        print(f"{r['name']:<14} {r['r3']:>6.3f} {r['r3_ratio']:>5.2f} {r['bias']:>+6.2f} "
+              f"{r['click']:>6.2f} {r['toggles_8s']:>6.1f} {r['toggles_in_phrases']:>5d} "
+              f"{r['speech_lost_ms']:>6.0f} {r['voiced'] * 100:>6.1f}% {r['hf_lf']:>+6.1f} "
+              f"{r['hf_lf_shared']:>+7.1f} {r['hf_lf_full_shared']:>+6.1f} "
+              f"{r['active_dbfs']:>6.1f} {r['hop_p99']:>5.1f}")
+    print(f"\nwavs: {out}\\{args.prefix}<variant>.wav (gated stream, aligned to the input)")
+    return 0
+
+
+# -------------------------------------------------------------------------------- typed
+
+TYPED_TEXT = ("This is text alone, not microphone input. It sounds robotic, as you can tell, "
+              "but the voice conversion is clear, and it works.")
+# Step 3 (typed speech only): (Kokoro voice, TypedPolish fields, what it is)
+TYPED_VARIANTS: dict[str, tuple[str, dict, str]] = {
+    "plain": ("af_heart", {}, "today's path"),
+    "envelope": ("af_heart", {"envelope": 0.35, "rms_frame_ms": 40.0},
+                 "volume_envelope 0.35 on 40 ms / 10 ms frames"),
+    "contour": ("af_heart", {"contour_scale": 1.2}, "F0 contour x1.2 around the median"),
+    "blend": ("af_heart*0.7+af_bella*0.3", {}, "Kokoro style 0.7 af_heart + 0.3 af_bella"),
+    "all": ("af_heart*0.7+af_bella*0.3",
+            {"envelope": 0.35, "rms_frame_ms": 40.0, "contour_scale": 1.2}, "all three"),
+}
+
+
+def cmd_typed(args) -> int:
+    """Typed text through Kokoro and the model once per variant -> out/ab/typed_<name>.wav,
+    with the prosody measures: F0 spread (semitones), loudness swing, voicing, HF/LF."""
+    from vox.audio.resample import resample_array, save_audio
+    from vox.config.schemas import RuntimeParams
+    from vox.offline.convert import FullFileConverter
+    from vox.offline.metrics import active_frames, frame_rms_dbfs
+    from vox.offline.simulate import load_engine
+    from vox.tts.backends import KokoroBackend
+    from vox.tts.cli import TTS_DIR
+    from vox.tts.speak import TypedPolish, convert_rendered, render_tts, split_pieces
+
+    engine = load_engine(args.models_dir, args.model, None, RuntimeParams(), None,
+                         warmup_hops=0, profile_dir=args.profile)
+    converter = FullFileConverter.from_engine(engine)
+    sr, device_sr = engine.loaded.model.tgt_sr, engine.plan.device_sr
+    text = args.tts_text or TYPED_TEXT
+    names = list(TYPED_VARIANTS) if not args.variants else args.variants.split(",")
+    out = ROOT / "out" / "ab"
+    print(f"text: {text!r}")
+    print(f"{'variant':<10} {'F0 med':>7} {'F0 sd st':>8} {'loud sd':>8} {'voiced':>7} "
+          f"{'HF/LF':>6} {'s':>5}  what")
+    for name in names:
+        voice, fields, note = TYPED_VARIANTS[name]
+        backend = KokoroBackend(voice, args.models_dir / TTS_DIR)
+        backend.load()
+        pieces = split_pieces(text)
+        said = convert_rendered(converter, engine.device, sr, render_tts(backend, pieces),
+                                engine.params, None, seed=0, pieces=pieces,
+                                polish=TypedPolish(**fields))
+        save_audio(out / f"typed_{name}.wav", said.audio, sr)
+        audio = resample_array(said.audio, sr, device_sr)
+        f0 = _f0_100hz(engine, audio)
+        mask = active_frames(audio, device_sr)
+        n = min(len(f0), len(mask))
+        voiced_f0 = f0[:n][mask[:n] & (f0[:n] > 0)]
+        semis = 12 * np.log2(voiced_f0 / np.median(voiced_f0)) if voiced_f0.size else []
+        level = frame_rms_dbfs(audio, device_sr)[:len(mask)][mask]
+        metrics = _voice_metrics(engine, audio)
+        row = {"variant": name, "voice": voice, "polish": fields,
+               "f0_median_hz": float(np.median(voiced_f0)) if voiced_f0.size else 0.0,
+               "f0_sd_semitones": float(np.std(semis)) if len(semis) else 0.0,
+               "loudness_sd_db": float(np.std(level)), "seconds": len(said.audio) / sr,
+               "pitch": said.pitch, **metrics}
+        print(f"{name:<10} {row['f0_median_hz']:>7.1f} {row['f0_sd_semitones']:>8.2f} "
+              f"{row['loudness_sd_db']:>8.2f} {metrics.get('voiced_ratio', 0) * 100:>6.1f}% "
+              f"{metrics['hf_lf_p90_db']:>+6.1f} {row['seconds']:>5.2f}  {note}", flush=True)
+        _record("typed", {"model": args.model, "text": text, **row})
+    print(f"\nwavs: {out}\\typed_<variant>.wav")
+    return 0
 
 
 # --------------------------------------------------------------------------------- perf
@@ -461,8 +878,9 @@ def cmd_graph_probe(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="vox bench", description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("accept", "perf", "extra", "sola", "block", "decctx",
-                                            "envelope", "gate", "graph-probe"))
+    parser.add_argument("command", choices=("accept", "ab", "typed", "perf", "extra", "sola",
+                                            "block", "decctx", "envelope", "gate",
+                                            "graph-probe"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--audio", type=Path,
@@ -477,7 +895,28 @@ def main() -> int:
     parser.add_argument("--graphs", choices=("on", "off", "auto"), default="auto",
                         help="CUDA graphs mode for the engine under test")
     parser.add_argument("--gate", choices=("on", "off"), default="off",
-                        help="quality sweeps (extra, block, ...): run the silence gate too")
+                        help="run the silence gate: quality sweeps (extra, block, ...) and "
+                             "accept's live-path run")
+    parser.add_argument("--gate-threshold", type=float, default=None,
+                        help="gate energy threshold, dBFS (default: calibration.json)")
+    parser.add_argument("--crossfade-ms", type=float, default=None)
+    parser.add_argument("--conditioning", choices=("on", "off"), default=None,
+                        help="the live input chain (high-pass, auto level, limiter); default on")
+    parser.add_argument("--auto-level", choices=("on", "off"), default=None)
+    parser.add_argument("--index-rate", type=float, default=None)
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="override any ShapeParams / RuntimeParams / GateConfig field, or "
+                             "an input-conditioning one as cond_<field> (repeatable), e.g. "
+                             "--set f0_unvoiced=interp")
+    parser.add_argument("--tts-text", default=None,
+                        help="accept: also render this text through Kokoro + the model (the "
+                             "typed-path reference for voicing and HF/LF); typed: the text")
+    parser.add_argument("--save-as", default=None,
+                        help="accept: also save the live-path render as out/ab/NAME.wav")
+    parser.add_argument("--variants", default=None,
+                        help="ab: comma-separated subset of " + ", ".join(AB_VARIANTS))
+    parser.add_argument("--prefix", default="",
+                        help="ab: prefix for the out/ab/<prefix><variant>.wav files")
     parser.add_argument("--block-ms", type=float, default=20.0)
     parser.add_argument("--stage", choices=("f0", "embed", "synth", "sola", "hop"),
                         default="synth", help="graph-probe: which stage to capture")
@@ -486,7 +925,8 @@ def main() -> int:
     args = parser.parse_args()
     if not torch.cuda.is_available():
         print("warning: no CUDA device; timings describe the CPU fallback", file=sys.stderr)
-    handler = {"accept": cmd_accept, "perf": cmd_perf, "extra": cmd_extra, "sola": cmd_sola,
+    handler = {"accept": cmd_accept, "ab": cmd_ab, "typed": cmd_typed, "perf": cmd_perf,
+               "extra": cmd_extra, "sola": cmd_sola,
                "block": cmd_block, "decctx": cmd_decctx, "envelope": cmd_envelope,
                "gate": cmd_gate, "graph-probe": cmd_graph_probe}[args.command]
     return handler(args)

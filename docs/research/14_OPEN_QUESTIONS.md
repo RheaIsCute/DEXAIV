@@ -435,3 +435,32 @@ vs `out/accept_stream.wav`, and now `out/gate_on.wav` vs `out/gate_full.wav`.
 - **Decision:** per-stage graphs are the production path (`graphs: auto`, seven graphs:
   six stages plus SOLA). The whole-hop fusion would save at most six graph launches
   (~0.1-0.2 ms); not worth a driver investigation.
+
+---
+
+# Live-mic quality results (2026-10-14)
+
+Real target voice (Mom, 32 kHz, pitch +12) and the user's own raw microphone take, after
+the Step 1 fixes of docs/DEVIATIONS.md §7. Wavs for listening in `out/ab/` (not committed).
+
+## Q7 - reopened: 20 ms overlap at the 20 ms hop is not free
+
+Overlap 20 vs 30 at hop 20 was "about 1% on the log-mel metric". On Mom the seam-roughness
+ratio says otherwise: 1.39 at 20 ms (overlap == hop: every sample but the seams mixes two
+renders) against 1.00 for the 30 ms three-render blend, with R3 2.73x vs 2.65x. The 20 ms
+default saves 10 ms. **Decision by ear:** `out/ab/reference.wav` vs `out/ab/sola_blend3.wav`.
+
+## Q14 - measured on the target voice, still needs ears
+
+R3 for Mom: 2.52x the floor at 5fa21d2, 2.73x after the fixes (the input chain changes the
+stream's input but not the full-file reference's). The real defects heard in the session
+were gate cuts (860 ms of 13.2 s of speech; now 150 ms) and chatter, not streaming.
+
+## Q15 - interp is the strongest single change for the "raspy" complaint
+
+`f0_unvoiced = interp` on Mom: HF/LF p90 +12.6 -> +8.3 dB, voiced share 68.3% -> 76.8%,
+R3 unchanged. Not made the default: `out/ab/f0_interp.wav` vs `out/ab/reference.wav`.
+
+## Q17 - 80 ms decoder context: again no measurable effect
+
+R3, voicing and HF/LF within noise of the reference (`out/ab/decctx_80.wav`).

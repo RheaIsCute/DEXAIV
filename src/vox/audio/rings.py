@@ -15,6 +15,8 @@ an *overrun*. Nothing ever blocks and nothing allocates after construction.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 
@@ -32,6 +34,7 @@ class SPSCRing:
         self.overrun_samples = 0
         self.underruns = 0  # reader-owned
         self.underrun_samples = 0
+        self.last_underrun_at = 0.0  # perf_counter of the latest underrun (reader-owned)
         self._drop_request = 0  # writer -> reader, single slot (see ``request_drop``)
 
     # ------------------------------------------------------------------ either side
@@ -98,8 +101,9 @@ class SPSCRing:
             out[first:n] = self._buf[:n - first]
         if n < n_want:
             out[n:] = 0.0
-            self.underruns += 1
             self.underrun_samples += n_want - n
+            self.last_underrun_at = time.perf_counter()
+            self.underruns += 1  # last: a reader of the count sees the time and samples
         self.read_pos += n
         return n
 

@@ -45,6 +45,56 @@ class Counters:
         return {name: getattr(self, name) for name in self.__slots__}
 
 
+EVENT_KINDS = ("gate_open", "gate_close", "underrun")
+
+
+class EventLog:
+    """Timestamped audio events, kept apart so a cut can be attributed to its cause.
+
+    ``gate_close`` / ``gate_open``: the silence gate changed state (``value`` = the block's
+    gate level in dBFS). ``underrun``: the output ring ran dry (``value`` = samples the
+    device got as zeros). Each event carries the hop index and a time in seconds: stream
+    time (hop * hop duration) in the simulator, ``perf_counter`` since ``reset`` live.
+    Preallocated ring of ``capacity`` events; the counts never wrap.
+    """
+
+    def __init__(self, capacity: int = 4096) -> None:
+        self.capacity = capacity
+        self._t = np.zeros(capacity, dtype=np.float64)
+        self._hop = np.zeros(capacity, dtype=np.int64)
+        self._kind = np.zeros(capacity, dtype=np.int8)
+        self._value = np.zeros(capacity, dtype=np.float64)
+        self.total = 0  # events ever logged; the ring keeps the last ``capacity``
+        self.counts = dict.fromkeys(EVENT_KINDS, 0)
+        self.t0 = time.perf_counter()
+
+    def reset(self) -> None:
+        self.total = 0
+        self.counts = dict.fromkeys(EVENT_KINDS, 0)
+        self.t0 = time.perf_counter()
+
+    def now(self) -> float:
+        return time.perf_counter() - self.t0
+
+    def add(self, kind: str, hop: int, t: float, value: float = 0.0, count: int = 1) -> None:
+        """``count``: occurrences this one entry stands for (several underruns seen at once)."""
+        i = self.total % self.capacity
+        self._t[i], self._hop[i], self._value[i] = t, hop, value
+        self._kind[i] = EVENT_KINDS.index(kind)
+        self.total += 1
+        self.counts[kind] += count
+
+    def since(self, seq: int = 0) -> list[dict]:
+        """Events with sequence number >= ``seq`` still in the ring, oldest first."""
+        first = max(seq, self.total - self.capacity)
+        out = []
+        for n in range(first, self.total):
+            i = n % self.capacity
+            out.append({"seq": n, "kind": EVENT_KINDS[self._kind[i]], "hop": int(self._hop[i]),
+                        "t": float(self._t[i]), "value": float(self._value[i])})
+        return out
+
+
 class _Stage:
     """Reusable context manager for one stage, created once so ``with`` allocates nothing."""
 
@@ -95,6 +145,7 @@ class StageTimers:
         self.stages: tuple[str, ...] = (*stages, TOTAL)
         self.enabled = enabled
         self.counters = Counters()
+        self.events = EventLog()  # logged even when timing is disabled
         self._index = {name: i for i, name in enumerate(self.stages)}
         self._total = len(self.stages) - 1
         n = len(self.stages)
@@ -178,6 +229,7 @@ class StageTimers:
         self.host.reset()
         self.gpu.reset()
         self.counters.reset()
+        self.events.reset()
 
     def index(self, name: str) -> int:
         return self._index[name]

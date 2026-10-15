@@ -127,3 +127,108 @@ def test_silero_vad_tells_speech_like_from_silence():
     for _ in range(10):
         d = gate.decide(np.zeros(plan.block, np.float32))
     assert not d.speech and d.vad_prob < 0.2
+
+
+class ScriptedVad:
+    """Stands in for Silero: answers ``level`` for every chunk and counts the chunks."""
+
+    def __init__(self, level: float = 0.0) -> None:
+        self.level = level
+        self.chunks = 0
+        self.threshold = 0.5
+
+    def prob(self, chunk) -> float:
+        assert len(chunk) == 512
+        self.chunks += 1
+        return self.level
+
+    def reset(self) -> None:
+        pass
+
+
+def vad_gate(level=0.0, threshold_dbfs=-48.0, hangover_ms=200.0, **kw):
+    plan = chunker.plan(20, 20, 500, 10, SR, SR)
+    vad = ScriptedVad(level)
+    cfg = GateConfig(threshold_dbfs=threshold_dbfs, hangover_ms=hangover_ms, **kw)
+    return plan, SilenceGate(plan, cfg, vad), vad
+
+
+def at_dbfs(n, dbfs):
+    """A 200 Hz tone whose block RMS is ``dbfs``."""
+    return tone(n, amp=math.sqrt(2) * 10 ** (dbfs / 20))
+
+
+def test_vad_sees_every_block_including_quiet_ones():
+    """The decimator and Silero run on quiet blocks too (they used to be skipped), so their
+    state never jumps: 20 blocks of 320 samples at 16 kHz are 12 whole 512-chunks."""
+    plan, gate, vad = vad_gate()
+    for _ in range(20):
+        gate.decide(np.zeros(plan.block, np.float32))
+    assert vad.chunks == 20 * 320 // 512
+
+
+def test_strong_onset_opens_before_the_vad_and_lapses_without_it():
+    plan, gate, _ = vad_gate(level=0.0)  # the VAD never says speech
+    loud = at_dbfs(plan.block, -48.0 + 7.0)  # 7 dB over the threshold
+    d = gate.decide(loud)
+    assert d.speech and d.onset  # opened on energy, in the first hop
+    # on probation only: closes after ONSET_PROBATION_MS (5 hops at 20 ms), not 200 ms
+    states = [gate.decide(np.zeros(plan.block, np.float32)).speech for _ in range(8)]
+    assert states == [True] * (gate.probation_hops - 1) + [False] * (9 - gate.probation_hops)
+
+
+def open_with(gate, block, limit: int = 4):
+    """Decide ``block`` until the gate opens (the VAD answers once a 512-sample chunk is
+    complete: up to two 320-sample hops); return the opening decision."""
+    for _ in range(limit):
+        d = gate.decide(block)
+        if d.speech:
+            return d
+    raise AssertionError("the gate never opened")
+
+
+def test_steady_lifted_room_tone_does_not_trigger_the_onset_rule():
+    """After auto level a quiet mic's room tone can sit above threshold + margin on its own;
+    only a rise out of it counts as an onset."""
+    plan, gate, _ = vad_gate(level=0.0)
+    room = at_dbfs(plan.block, -48.0 + 8.0)
+    states = [gate.decide(room).speech for _ in range(30)]
+    assert states[0] and not any(states[gate.probation_hops + 1:])  # only the very first
+    rise = at_dbfs(plan.block, -48.0 + 8.0 + 13.0)
+    assert gate.decide(rise).onset  # 13 dB out of the room tone: a real onset
+
+
+def test_weak_onset_waits_for_the_vad():
+    plan, gate, vad = vad_gate(level=0.0)
+    soft = at_dbfs(plan.block, -48.0 + 3.0)  # over the threshold, under the onset margin
+    assert not any(gate.decide(soft).speech for _ in range(4))
+    vad.level = 0.9
+    d = open_with(gate, soft)
+    assert d.onset
+
+
+def test_level_hysteresis_holds_the_gate_through_a_soft_syllable():
+    plan, gate, _ = vad_gate(level=0.9, hangover_ms=20.0)  # hangover of one hop
+    open_with(gate, at_dbfs(plan.block, -45.0))
+    for _ in range(10):  # 5 dB under the open threshold: still inside the hysteresis
+        assert gate.decide(at_dbfs(plan.block, -53.0)).speech
+    gate.decide(at_dbfs(plan.block, -56.0))  # below threshold - 6: the hangover hop
+    assert not gate.decide(at_dbfs(plan.block, -56.0)).speech
+    assert not gate.decide(at_dbfs(plan.block, -53.0)).speech  # and -53 cannot reopen it
+
+
+def test_vad_hysteresis_holds_the_gate_while_the_probability_dips():
+    plan, gate, vad = vad_gate(level=0.9, hangover_ms=20.0)
+    block = at_dbfs(plan.block, -40.0)
+    open_with(gate, block)
+    vad.level = 0.4  # under the 0.5 to open, over 0.5 - 0.15 to stay open
+    assert all(gate.decide(block).speech for _ in range(10))
+    vad.level = 0.3
+    states = [gate.decide(block).speech for _ in range(6)]
+    assert states[-1] is False  # closes once the dip outlasts the one-hop hangover
+
+
+def test_default_hangover_is_350_ms():
+    assert GateConfig().hangover_ms == 350.0
+    _, gate, _ = vad_gate(hangover_ms=GateConfig().hangover_ms)
+    assert gate.hangover_hops == 18  # ceil(350 / 20)

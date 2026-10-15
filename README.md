@@ -35,10 +35,17 @@ vox models list
 vox convert in.wav out.wav --model MyVoice --pitch 7                 # the streaming engine
 vox convert in.wav out.wav --model MyVoice --pitch 7 --mode full     # canonical whole-file
 vox bench accept                             # Phase 2 acceptance + profiler report
+vox bench accept --model MyVoice --audio mic.wav --pitch 7 --gate on --gate-threshold -40 --tts-text "..."
+                                             # + the live path: gate closures, underruns, cuts, voicing, HF/LF
+vox bench ab --model MyVoice --audio mic.wav # one setting per variant -> out/ab/<variant>.wav
+vox bench typed --model MyVoice              # typed-speech prosody variants -> out/ab/typed_*.wav
 vox bench perf                               # block x extra x f0 sweep (--sweep perf_graphs.yaml: graphs vs eager)
 vox bench gate                               # silence-gate acceptance
 vox devices                                  # WASAPI devices with indices
 vox run --model MyVoice --pitch 7 --input 22 --output 20   # live; type 'help' for commands
+vox run ... --auto-level off --input-gain-db 6             # mic input chain: trim only, no AGC
+vox run ... --record-output out/tap.wav                    # what the device got + underrun mask
+python scripts/analyze_tap.py out/tap.wav --input mic.wav  # attribute every zero cut: gate / underrun
 python scripts/measure_rtt.py --cable "Virtual Audio Cable"   # loopback round-trip latency
 vox env                                      # environment fingerprint
 ```
@@ -54,7 +61,7 @@ The structure is the blueprint of
 |---|---|
 | `src/vox/engine/` | `chunker.py` (the chunking law), `pipeline.py` (the per-hop function as capturable stages), `graphs.py` (per-stage CUDA graphs), `gate.py` (silence gate), `worker.py` (inference thread), `sola.py`, `postchain.py`, `warmup.py` |
 | `src/vox/pitch/`, `features/`, `retrieval/`, `synthesis/` | stage packages: RMVPE / FCPE, ContentVec, GPU k-NN index, RVC synthesizer |
-| `src/vox/audio/` | `resample.py` (incremental 48 k -> 16 k and model -> device), `rings.py` (SPSC rings), `streams.py` (WASAPI in/out streams, file-backed input), `devices.py` |
+| `src/vox/audio/` | `resample.py` (incremental 48 k -> 16 k and model -> device), `conditioning.py` (live mic: high-pass, auto level, trim, soft limit), `rings.py` (SPSC rings), `streams.py` (WASAPI in/out streams, file-backed input, output tap), `devices.py` |
 | `src/vox/api/control.py` | `LiveSession`: engine + rings + worker + streams, hot and restart-class changes, stats snapshots |
 | `src/vox/profiling/` | stage timers (host + CUDA events read one hop late), statistics, reports |
 | `src/vox/models/`, `config/` | checkpoint detection, model registry, JSON profiles |

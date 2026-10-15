@@ -2,7 +2,7 @@
 
 Contract: docs/research/12 §3.6, 03 §10. The loop per hop:
 
-    wait hop_event -> read one hop from the input ring -> upload -> gate.decide
+    wait hop_event -> read one hop from the input ring -> condition -> upload -> gate.decide
       -> process_hop (graph replay) + sola.stitch | drain / zeros
       -> one device -> host copy -> write exactly one hop into the output ring
 
@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from vox.audio.conditioning import ConditioningConfig, InputConditioner
 from vox.audio.rings import SPSCRing
 from vox.config.schemas import RuntimeParams, ShapeParams
 from vox.engine import chunker, warmup
@@ -65,8 +66,9 @@ class WorkerStats:
     _sum_in: float = 0.0
     _sum_out: float = 0.0
     _n: int = 0
-    gate_rms_dbfs: float = -120.0
+    gate_rms_dbfs: float = -120.0  # of the conditioned block: what the gate measured
     gate_vad: float = 0.0
+    input_gain_db: float = 0.0  # input conditioning (auto level + trim) on the last block
     errors: list[str] = field(default_factory=list)
 
     def window(self) -> None:
@@ -83,11 +85,14 @@ class InferenceWorker(threading.Thread):
                  graphs: StageGraphs, timers: StageTimers, in_ring: SPSCRing,
                  out_ring: SPSCRing, hop_event: threading.Event, fill_target: int,
                  extractors: dict[str, PitchExtractor] | None = None,
-                 log=print) -> None:
+                 log=print, conditioner: InputConditioner | None = None) -> None:
         super().__init__(name="vox-inference", daemon=True)
         self.pipeline = pipeline
         self.sola = sola
         self.gate = gate
+        # The microphone's input chain (high-pass, auto level, trim, soft limit) runs on
+        # each block before the upload and the gate. None: raw blocks.
+        self.conditioner = conditioner
         self.graphs = graphs
         self.timers = timers
         self.in_ring = in_ring
@@ -100,9 +105,11 @@ class InferenceWorker(threading.Thread):
         self._stop = threading.Event()
         self._pending_params: RuntimeParams | None = None
         self._pending_gate: GateConfig | None = None
+        self._pending_conditioning: ConditioningConfig | None = None
         self._pending_shape: ShapeRequest | None = None
         self.params = pipeline.params
         self._seen_underruns = 0
+        self._seen_underrun_samples = 0
         self.ready = threading.Event()
         self.first_hop = threading.Event()  # set once the first hop is in the output ring
         self.override = ClipOverride(self.plan.block)  # typed clips over the live voice
@@ -133,6 +140,10 @@ class InferenceWorker(threading.Thread):
 
     def apply_gate(self, config: GateConfig) -> None:
         self._pending_gate = config
+
+    def apply_conditioning(self, config: ConditioningConfig) -> None:
+        """Input chain: auto level on/off, trim. Applied before the next hop."""
+        self._pending_conditioning = config
 
     def apply_shape(self, request: ShapeRequest) -> None:
         """Restart-class change: the worker rebuilds between hops (brief gated pause)."""
@@ -198,6 +209,10 @@ class InferenceWorker(threading.Thread):
         if gate is not None:
             self._pending_gate = None
             self.gate.set_config(gate)
+        conditioning = self._pending_conditioning
+        if conditioning is not None and self.conditioner is not None:
+            self._pending_conditioning = None
+            self.conditioner.set_config(conditioning)
 
     def _hop(self) -> None:
         plan, pipeline, sola, gate, timers = (self.plan, self.pipeline, self.sola, self.gate,
@@ -209,9 +224,17 @@ class InferenceWorker(threading.Thread):
         timers.begin_hop()
         with timers.stage("upload"):
             self.in_ring.read(self._host_block)
-            pipeline.upload(self._host_block)
+            block_in = self._host_block
+            if self.conditioner is not None:
+                block_in = self.conditioner.process(block_in)
+                s.input_gain_db = self.conditioner.gain_db
+            pipeline.upload(block_in)
         with timers.stage("gate"):
-            decision: GateDecision = gate.decide(self._host_block)
+            decision: GateDecision = gate.decide(block_in)
+        events = timers.events
+        if decision.onset or decision.drain:  # the gate's own decision, before any hold
+            events.add("gate_open" if decision.onset else "gate_close", s.hops, events.now(),
+                       decision.rms_dbfs)
         # Read the flag once: it is set from the control thread and must mean the same
         # thing to the gate decision above and to the cushion logic below.
         hold = self.hold
@@ -253,7 +276,12 @@ class InferenceWorker(threading.Thread):
         if self.out_ring.underruns > self._seen_underruns:
             # The callback ran dry: top the ring back up to the target so one late hop
             # does not become a run of underruns. Counted as a refill, audible as a gap.
-            self._seen_underruns = self.out_ring.underruns
+            ring = self.out_ring
+            missing = ring.underrun_samples - self._seen_underrun_samples
+            events.add("underrun", s.hops, ring.last_underrun_at - events.t0, missing,
+                       count=ring.underruns - self._seen_underruns)
+            self._seen_underruns = ring.underruns
+            self._seen_underrun_samples = ring.underrun_samples
             self._prefill(self.fill_target - fill_before)
             s.underrun_refills += 1
             fill_before = self.fill_target
@@ -329,12 +357,11 @@ class InferenceWorker(threading.Thread):
         model = pipeline.model
         f0_tail = 0
         if pipeline.extractor is not None:
-            block_16k = chunker.plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms,
-                                     shape.sola_search_ms, shape.device_sr, model.tgt_sr).block_16k
+            block_16k = chunker.from_shape(shape, model.tgt_sr).block_16k
             f0_tail = pipeline.extractor.tail_samples(block_16k)
-        plan = chunker.plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms,
-                            shape.sola_search_ms, shape.device_sr, model.tgt_sr, f0_tail,
-                            shape.decoder_context_ms)
+        plan = chunker.from_shape(shape, model.tgt_sr, f0_tail)
+        if plan.overlap_note:
+            self.log(f"worker: {plan.overlap_note}")
         # 3. replan everything that depends on the plan
         pipeline.set_plan(plan)
         pipeline.set_params(self.params)
@@ -342,6 +369,8 @@ class InferenceWorker(threading.Thread):
         self.sola = Sola(plan, pipeline.device, mode)
         self.graphs.sola = self.sola
         self.gate = SilenceGate(plan, self.gate.config, self.gate.vad)
+        if self.conditioner is not None:
+            self.conditioner.resize(plan.block)  # filter state and level carry over
         self._alloc()
         if plan.block != old_plan.block:
             self.fill_target = int(round(self.fill_target * plan.block / old_plan.block))

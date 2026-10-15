@@ -44,7 +44,19 @@ class PitchCache:
         self.pitch[-interior:].copy_(coarse[end - interior:end])
         self.pitchf[-interior:].copy_(pitchf[end - interior:end])
 
+    def advance_silent(self) -> None:
+        """A hop the gate kept closed: shift one hop left like ``roll_and_write`` and mark
+        only the new hop unvoiced, so the history stays aligned with the 16 kHz ring (which
+        advances every closed hop too). Wiping it instead left most of the window unvoiced
+        against voiced features after every reopen."""
+        self._tmp_pitch.copy_(self.pitch[self.shift:])
+        self.pitch[:-self.shift].copy_(self._tmp_pitch)
+        self.pitch[-self.shift:].fill_(1)
+        self._tmp_pitchf.copy_(self.pitchf[self.shift:])
+        self.pitchf[:-self.shift].copy_(self._tmp_pitchf)
+        self.pitchf[-self.shift:].zero_()
+
     def zero(self) -> None:
-        """Forget history (gate close): stale speech must never be replayed."""
+        """Forget history (start of a stream): every frame unvoiced."""
         self.pitch.fill_(1)
         self.pitchf.zero_()

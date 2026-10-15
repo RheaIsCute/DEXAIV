@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from vox.audio import devices as audio_devices
+from vox.audio.conditioning import ConditioningConfig
 from vox.audio.rings import SPSCRing
-from vox.audio.streams import DuplexAudio, FileInput, StreamConfig
+from vox.audio.streams import DuplexAudio, FileInput, OutputTap, StreamConfig
 from vox.config import defaults
 from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
 from vox.engine.gate import GateConfig
@@ -39,6 +40,8 @@ class LiveConfig:
     params: RuntimeParams = field(default_factory=RuntimeParams)
     precision: PrecisionParams = field(default_factory=lambda: defaults.DEFAULT_PRECISION)
     gate: GateConfig = field(default_factory=GateConfig)
+    # The microphone's input chain (high-pass, auto level, trim): audio/conditioning.py
+    conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
     input: str | int | None = None  # device index / name fragment / None = default
     output: str | int | None = None
     exclusive: bool = False  # WASAPI exclusive on the output stream
@@ -57,6 +60,7 @@ class LiveConfig:
     # defaults it OFF (TARGET.md: double denoising hurts). True/False = explicit.
     suppression: bool | None = None
     suppression_profile: bool = False  # calibration.json's rnnoise_enabled
+    record_output_s: float = 0.0  # > 0: tap what the device plays (streams.OutputTap)
 
 
 BROADCAST_MARKER = "nvidia broadcast"
@@ -88,6 +92,7 @@ class LiveSession:
         self.in_device = None
         self.out_device = None
         self.suppression = False
+        self._event_seq = 0  # first event the next snapshot reports
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -112,7 +117,8 @@ class LiveSession:
         cache: dict = cfg.cache if cfg.cache is not None else {}
         engine = load_engine(cfg.models_dir, cfg.model, cfg.shape, cfg.params, cfg.precision,
                              cfg.device, registry=cfg.registry, cache=cache, gate=cfg.gate,
-                             log=self.log, profile_dir=cfg.profile_dir)
+                             log=self.log, profile_dir=cfg.profile_dir,
+                             conditioning=cfg.conditioning)
         self.engine = engine
         extractors = {}
         if cfg.preload_extractors and engine.pipeline.extractor is not None:
@@ -134,19 +140,25 @@ class LiveSession:
         self.out_ring = SPSCRing(int(sr * OUTPUT_RING_S), guard=2 * block)
         self.worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
                                       engine.timers, self.in_ring, self.out_ring, self.hop_event,
-                                      fill_target, extractors, log=self.log)
+                                      fill_target, extractors, log=self.log,
+                                      conditioner=engine.conditioner)
         self.worker.start()
         self.worker.ready.wait(timeout=10.0)
 
         stream_cfg = StreamConfig(self.in_device, self.out_device, sr, cfg.callback_ms,
                                   cfg.exclusive, cfg.exclusive_input)
-        self.audio = DuplexAudio(stream_cfg, self.in_ring, self.out_ring, block, self.hop_event)
+        tap = OutputTap(sr, cfg.record_output_s) if cfg.record_output_s > 0 else None
+        self.audio = DuplexAudio(stream_cfg, self.in_ring, self.out_ring, block, self.hop_event,
+                                 tap)
         if cfg.input_file is not None:
             from vox.audio.resample import load_audio
 
             audio, _ = load_audio(cfg.input_file, sr)
             self.file_input = FileInput(audio, sr, callback_block, self.in_ring, block,
                                         self.hop_event, loop=cfg.loop_file)
+        # Event times (gate closures, underruns) count from the moment audio starts.
+        engine.timers.events.reset()
+        self._event_seq = 0
         # Input first; the output stream opens once the first hop (and the prefill under
         # it) is in the output ring, so the device never starts on an empty ring.
         self.audio.start_input()
@@ -198,6 +210,13 @@ class LiveSession:
         self.cfg.gate = config
         return config
 
+    def set_conditioning(self, **changes: Any) -> ConditioningConfig:
+        """Input chain, hot: ``auto_level``, ``trim_db`` (and the AGC's bounds)."""
+        config = dataclasses.replace(self.cfg.conditioning, **changes)
+        self.cfg.conditioning = config
+        self.worker.apply_conditioning(config)
+        return config
+
     def set_shape(self, f0_method: str | None = None, sola_mode: str | None = None,
                   **changes: Any) -> ShapeParams:
         """Restart-class: hop / extra / crossfade / F0 method. Brief gated pause."""
@@ -231,11 +250,15 @@ class LiveSession:
         if self.file_input is not None:
             device_ms = health.output_latency_ms
         estimate = w.latency_estimate_ms(device_ms, total["p50"])
+        events = timers.events
+        new_events = events.since(self._event_seq)
+        self._event_seq = events.total
         return {
             "t": time.perf_counter() - self.started_at,
             "hops": w.stats.hops, "gated_hops": w.stats.gated_hops,
             "gate_open": w.stats.gate_open, "gate_rms_dbfs": w.stats.gate_rms_dbfs,
             "gate_vad": w.stats.gate_vad, "gate_transitions": w.stats.gate_transitions,
+            "input_gain_db": w.stats.input_gain_db,
             "stages": stages, "total": total,
             "headroom": plan.block_ms / total["p99"] if total["p99"] else float("nan"),
             "in_fill_ms": 1000.0 * self.in_ring.fill() / plan.device_sr,
@@ -252,6 +275,9 @@ class LiveSession:
             "latency": estimate, "mode": e.mode,
             "input_peak": health.input_peak, "output_peak": health.output_peak,
             "input_rate_hz": a.input_rate_hz(),
+            # Timestamped since the previous snapshot (seconds from audio start), and the
+            # running totals: gate closures and underruns are logged apart (cut attribution).
+            "events": new_events, "event_counts": dict(events.counts),
             "errors": list(w.stats.errors) + list(health.errors),
         }
 
@@ -276,7 +302,8 @@ class LiveSession:
                 f"{s['out_fill_ms']:.0f}/{s['out_fill_target_ms']:.0f} ms | underruns "
                 f"{s['underruns']} (flags {s['status_output_underflow']}) refills "
                 f"{s['underrun_refills']} trims {s['drift_trims']} | gate {gate} "
-                f"{s['gate_rms_dbfs']:.0f} dB vad {s['gate_vad']:.2f} | est "
+                f"{s['gate_rms_dbfs']:.0f} dB vad {s['gate_vad']:.2f} closes "
+                f"{s['event_counts']['gate_close']} | in gain {s['input_gain_db']:+.0f} dB | est "
                 f"{lat['total']:.0f} ms (hop {lat['hop']:.0f} + in {lat['input_backlog']:.0f} + "
                 f"cmp {lat['compute']:.0f} + out {lat['output_ring']:.0f} + sola {lat['sola']:.0f}"
                 f" + dev {lat['devices']:.0f}) | peak in {s['input_peak']:.2f} out "

@@ -8,10 +8,12 @@ from __future__ import annotations
 from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
 
 # Sizes snap to 10 ms units at the device rate (the chunking law, engine/chunker.py), so the
-# research docs' "32 ms crossfade" is 30 ms here. See docs/DEVIATIONS.md.
+# research docs' "32 ms crossfade" is 30 ms here. The overlap may not exceed the hop, so at
+# the 20 ms hop it is 20 ms (R8: -10 ms of latency, ~1% on the Q7 metric). See
+# docs/DEVIATIONS.md.
 DEFAULT_SHAPE = ShapeParams(
     block_ms=20.0,
-    crossfade_ms=30.0,
+    crossfade_ms=20.0,
     sola_search_ms=10.0,
     extra_ms=1000.0,  # was 500: pauses were ~2.8 dB too loud (docs/DEVIATIONS.md R4)
     device_sr=48000,

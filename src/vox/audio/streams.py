@@ -53,16 +53,41 @@ class StreamHealth:
     errors: list[str] = field(default_factory=list)
 
 
+class OutputTap:
+    """What the output callback handed the device, sample for sample, plus a mask of the
+    samples that came out of the ring (0 = zero-filled on an underrun).
+
+    Preallocated for ``seconds``; once full it stops recording. A zero run in ``audio``
+    whose mask is 1 came from the worker (a gated hop); one whose mask is 0 is an underrun.
+    """
+
+    def __init__(self, sr: int, seconds: float) -> None:
+        self.sr = sr
+        self.audio = np.zeros(int(sr * seconds), dtype=np.float32)
+        self.from_ring = np.zeros(len(self.audio), dtype=np.uint8)
+        self.pos = 0
+
+    def write(self, block: np.ndarray, real: int) -> None:
+        n = min(len(block), len(self.audio) - self.pos)
+        if n <= 0:
+            return
+        self.audio[self.pos:self.pos + n] = block[:n]
+        self.from_ring[self.pos:self.pos + min(real, n)] = 1
+        self.pos += n
+
+
 class DuplexAudio:
     """Owns the two PortAudio streams; the rings and the hop event belong to the caller."""
 
     def __init__(self, cfg: StreamConfig, in_ring: SPSCRing, out_ring: SPSCRing,
-                 hop_samples: int, hop_event: threading.Event) -> None:
+                 hop_samples: int, hop_event: threading.Event,
+                 tap: OutputTap | None = None) -> None:
         self.cfg = cfg
         self.in_ring = in_ring
         self.out_ring = out_ring
         self.hop = hop_samples
         self.hop_event = hop_event
+        self.tap = tap
         self.health = StreamHealth()
         self._in_stream = None
         self._out_stream = None
@@ -99,8 +124,10 @@ class DuplexAudio:
             if status.output_underflow:
                 self.health.output_underflows += 1
         mono = self._mono_out[:frames]
-        self.out_ring.read(mono)
+        real = self.out_ring.read(mono)
         outdata[:] = mono[:, None]  # same signal on every channel
+        if self.tap is not None:
+            self.tap.write(mono, real)
         peak = float(np.abs(mono).max()) if frames else 0.0
         if peak > self.health.output_peak:
             self.health.output_peak = peak

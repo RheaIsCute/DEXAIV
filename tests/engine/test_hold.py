@@ -74,18 +74,23 @@ def test_hold_fades_the_live_voice_out_and_queues_silence_behind_it(engine, clip
             worker.hold = True
 
     worker, stream, fills = drive(engine, clip_48k, HOLD_AT + 40, hold)
-    live, first, second, third = (hop_of(stream, worker, HOLD_AT + k, block) for k in (-1, 0, 1, 2))
+    drain = -(-engine.plan.sola_buffer // block)  # hops the saved tail takes to fade out
+    live = hop_of(stream, worker, HOLD_AT - 1, block)
+    tail = [hop_of(stream, worker, HOLD_AT + k, block) for k in range(drain)]
+    after = hop_of(stream, worker, HOLD_AT + drain, block)
     assert np.abs(live).max() > 0.02  # speech was sounding
     assert not worker.stats.gate_open
     # continuous into the hold, then decaying to digital silence within the overlap
-    seam = np.abs(np.diff(np.concatenate([live[-64:], first[:64]]))).max()
+    seam = np.abs(np.diff(np.concatenate([live[-64:], tail[0][:64]]))).max()
     assert seam <= 1.5 * np.abs(np.diff(live)).max() + 0.01  # no bigger than the voice's own steps
-    assert 0.0 < np.abs(second).max() < np.abs(first).max()  # the tail's last 10 ms
-    assert np.abs(third).max() == 0.0
+    peaks = [np.abs(t).max() for t in tail]
+    assert all(p > 0.0 for p in peaks) and peaks == sorted(peaks, reverse=True)
+    assert np.abs(tail[-1][-32:]).max() < 0.1 * peaks[0]  # faded out by the overlap's end
+    assert np.abs(after).max() == 0.0
     # silence from there to the end of what was played: nothing audible behind the fade
-    assert np.abs(stream[worker.fill_target + (HOLD_AT + 2) * block:]).max() == 0.0
+    assert np.abs(stream[worker.fill_target + (HOLD_AT + drain) * block:]).max() == 0.0
     # the cushion went in once, after the fade was out
-    assert fills[HOLD_AT - 1:HOLD_AT + 2] == [worker.fill_target] * 3  # not before the tail
+    assert fills[HOLD_AT - 1:HOLD_AT + drain] == [worker.fill_target] * (drain + 1)
     assert max(fills) == worker.fill_target + cushion and fills[-1] == max(fills)
 
 

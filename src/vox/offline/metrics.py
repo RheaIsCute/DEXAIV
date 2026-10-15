@@ -144,3 +144,82 @@ def frame_rms_dbfs(audio: np.ndarray, sr: int, hop_ms: float = 10.0,
 
 def rms_dbfs(audio: np.ndarray) -> float:
     return float(20 * np.log10(np.sqrt(np.mean(np.square(audio, dtype=np.float64))) + 1e-12))
+
+
+# ------------------------------------------------------------- live-mic diagnostics
+# The measures of the external audio report (docs/DEVIATIONS.md §7): voicing, HF/LF tilt,
+# gate chatter and digital-zero cuts. Frames are 40 ms windows at a 10 ms hop throughout,
+# so a 100 Hz F0 track lines up with them frame for frame.
+
+
+def active_frames(audio: np.ndarray, sr: int, below_p95_db: float = 30.0,
+                  floor_dbfs: float = -60.0) -> np.ndarray:
+    """10 ms frames carrying signal: within ``below_p95_db`` of the clip's loud frames
+    and above ``floor_dbfs``. Digital silence is never active."""
+    level = frame_rms_dbfs(audio, sr)
+    return level >= max(floor_dbfs, float(np.percentile(level, 95)) - below_p95_db)
+
+
+def band_ratio_db(audio: np.ndarray, sr: int, high: tuple[float, float] = (3000.0, 12000.0),
+                  low: tuple[float, float] = (100.0, 1000.0)) -> np.ndarray:
+    """Per-frame energy in ``high`` over energy in ``low``, dB (hiss / breathiness tilt)."""
+    hop, win = sr // 100, sr // 25
+    n_fft = 1 << (win - 1).bit_length()
+    x = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+    spec = torch.stft(x, n_fft, hop_length=hop, win_length=win, window=torch.hann_window(win),
+                      center=True, return_complex=True).abs().pow(2).numpy()
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+
+    def band(lo: float, hi: float) -> np.ndarray:
+        return spec[(freqs >= lo) & (freqs < hi)].sum(axis=0)
+
+    return 10.0 * np.log10((band(*high) + 1e-12) / (band(*low) + 1e-12))
+
+
+def hf_lf_p90(audio: np.ndarray, sr: int, mask: np.ndarray | None = None) -> float:
+    """90th percentile of ``band_ratio_db`` over active frames (the report's HF/LF ratio)."""
+    ratio = band_ratio_db(audio, sr)
+    mask = active_frames(audio, sr) if mask is None else mask
+    n = min(len(ratio), len(mask))
+    picked = ratio[:n][mask[:n]]
+    return float(np.percentile(picked, 90)) if picked.size else float("nan")
+
+
+def voiced_ratio(f0_100hz: np.ndarray, mask: np.ndarray) -> float:
+    """Share of active 10 ms frames with a pitch (``f0 > 0``)."""
+    n = min(len(f0_100hz), len(mask))
+    active = mask[:n]
+    return float(np.mean(f0_100hz[:n][active] > 0)) if active.any() else float("nan")
+
+
+def phrases(audio: np.ndarray, sr: int, below_p95_db: float = 18.0, merge_ms: float = 250.0,
+            min_ms: float = 100.0) -> list[tuple[int, int]]:
+    """Sample spans where the *input* is speaking: frames within ``below_p95_db`` of the
+    loud frames, gaps shorter than ``merge_ms`` bridged, spans shorter than ``min_ms``
+    dropped. 18 dB keeps the talker's soft syllables and leaves out what a microphone hears
+    20 dB and more below them (room tone, other people, speakers bleeding in)."""
+    mask = active_frames(audio, sr, below_p95_db=below_p95_db, floor_dbfs=-80.0)
+    hop = sr // 100
+    spans, start = [], None
+    for i, on in enumerate(np.append(mask, False)):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            spans.append([start, i])
+            start = None
+    merged: list[list[int]] = []
+    for s, e in spans:
+        if merged and (s - merged[-1][1]) * 10 < merge_ms:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s * hop, e * hop) for s, e in merged if (e - s) * 10 >= min_ms]
+
+
+def zero_runs(audio: np.ndarray, min_samples: int) -> list[tuple[int, int]]:
+    """Spans of exact digital zero at least ``min_samples`` long (gated hops, underruns)."""
+    zero = np.append(np.append(False, audio == 0.0), False).astype(np.int8)
+    edges = np.flatnonzero(np.diff(zero))
+    starts, ends = edges[0::2], edges[1::2]
+    keep = ends - starts >= min_samples
+    return list(zip(starts[keep].tolist(), ends[keep].tolist()))

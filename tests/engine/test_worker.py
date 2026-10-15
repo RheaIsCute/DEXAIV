@@ -65,11 +65,14 @@ def run_live(engine, audio: np.ndarray, gate: bool, seed: int = 0, fill_ms: floa
     engine.sola.reset()
     engine.gate.reset()
     engine.gate.set_config(dataclasses.replace(engine.gate.config, enabled=gate))
+    engine.conditioner.reset()
     engine.timers.reset()
     torch.manual_seed(seed)
     fill = int(SR * fill_ms / 1000)
+    # The same input chain the simulator runs, as LiveSession wires it.
     worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
-                             engine.timers, in_ring, out_ring, hop_event, fill, log=lambda *_: None)
+                             engine.timers, in_ring, out_ring, hop_event, fill, log=lambda *_: None,
+                             conditioner=engine.conditioner)
     seconds = len(audio) / SR + 0.5
     feeder = FileInput(audio, SR, CALLBACK, in_ring, plan.block, hop_event)
     reader = OutputReader(out_ring, seconds)
@@ -139,7 +142,7 @@ def test_worker_rebuilds_shape_live_and_keeps_running(engine, clip_48k):
     engine.gate.reset()
     worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
                              engine.timers, in_ring, out_ring, hop_event, int(0.05 * SR),
-                             log=lambda *_: None)
+                             log=lambda *_: None, conditioner=engine.conditioner)
     feeder = FileInput(audio, SR, CALLBACK, in_ring, plan.block, hop_event)
     reader = OutputReader(out_ring, len(audio) / SR + 0.5)
     worker.start()
@@ -157,6 +160,7 @@ def test_worker_rebuilds_shape_live_and_keeps_running(engine, clip_48k):
         assert worker.stats.errors == []
         assert worker.stats.rebuilds == 1 and worker.plan.block_ms == 30.0
         assert engine.graphs.active and engine.graphs.sola is worker.sola
+        assert engine.conditioner.block == worker.plan.block  # input chain resized in place
         live = np.concatenate(reader.chunks)
         tail = live[-int(1.0 * SR):]
         assert np.sqrt(np.mean(tail ** 2)) > 0.005  # audio flowing after the rebuild

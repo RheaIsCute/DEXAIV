@@ -34,6 +34,7 @@ import numpy as np
 from vox.api.control import LiveConfig, LiveSession
 from vox.api.events import METERS, PERF, STATE, TOAST, EventBus
 from vox.audio import devices as audio_devices
+from vox.audio.conditioning import ConditioningConfig
 from vox.audio.resample import resample_array
 from vox.config.schemas import RuntimeParams, ShapeParams
 from vox.config.store import load_json, load_profile, resolve_runtime_params, save_json
@@ -59,6 +60,7 @@ STAGE_LABELS = {"f0": "F0", "embed": "ContentVec", "index": "Index kNN", "synth"
                 "sola": "SOLA"}
 HOT_PARAMS = {"pitch": "f0_up_key", "index_rate": "index_rate", "protect": "protect"}
 PARAM_RANGES = {"pitch": (-24.0, 24.0), "index_rate": (0.0, 1.0), "protect": (0.0, 0.5)}
+INPUT_GAIN_RANGE = (-12.0, 24.0)  # the input-gain trim slider, dB
 
 
 class ApiError(Exception):
@@ -179,7 +181,8 @@ class EngineController:
     def _load_store(self) -> dict[str, Any]:
         store: dict[str, Any] = {"model": None, "models": {}, "input": None, "output": None,
                                  "exclusive": False, "gate": {}, "shape": {},
-                                 "f0_method": None, "graphs": None, "tts": {}}
+                                 "f0_method": None, "graphs": None, "tts": {},
+                                 "input_level": {}}
         path = self.profile_dir / STATE_FILE
         if path.is_file():
             try:
@@ -235,6 +238,15 @@ class EngineController:
                           threshold_dbfs=user.get("threshold_dbfs", cal.silence_gate_dbfs),
                           vad_threshold=cal.vad.threshold, hangover_ms=cal.vad.release_ms,
                           use_vad=cal.vad.engine == "silero")
+
+    def _conditioning(self) -> ConditioningConfig:
+        """The mic input chain: auto level (on unless switched off here) and the input-gain
+        slider as a trim on top of calibration's input gain."""
+        cal = self.profile.calibration
+        user = self.store["input_level"]
+        return ConditioningConfig(auto_level=user.get("auto", True),
+                                  trim_db=cal.input_gain_db + user.get("gain_db", 0.0),
+                                  noise_floor_dbfs=cal.noise_floor_dbfs)
 
     # ------------------------------------------------------------------------ state
 
@@ -398,6 +410,9 @@ class EngineController:
                 },
                 "gate": {"enabled": gate.enabled, "threshold_dbfs": gate.threshold_dbfs,
                          "noise_floor_dbfs": self.profile.calibration.noise_floor_dbfs},
+                "input_level": {"auto": self.store["input_level"].get("auto", True),
+                                "gain_db": self.store["input_level"].get("gain_db", 0.0),
+                                "range_db": list(INPUT_GAIN_RANGE)},
                 # Not built in the engine yet: shown, not switchable (docs/DEVIATIONS.md).
                 "suppression": {"enabled": False, "available": False},
                 "monitor": {"enabled": False, "available": False},
@@ -480,6 +495,7 @@ class EngineController:
         cfg = LiveConfig(
             model=config.name, models_dir=self.models_dir, shape=self._shape(),
             params=start_params, precision=self._precision(), gate=self._gate(),
+            conditioning=self._conditioning(),
             input=self.store.get("input"), output=self.store.get("output"),
             exclusive=bool(self.store.get("exclusive")), input_file=self.input_file,
             loop_file=self.loop_file, device=self.device, registry=self.registry,
@@ -569,6 +585,24 @@ class EngineController:
             self._save_store()
         self.publish_state()
         return {"enabled": gate.enabled, "threshold_dbfs": gate.threshold_dbfs}
+
+    def set_input_level(self, auto: bool | None = None,
+                        gain_db: float | None = None) -> dict[str, Any]:
+        """Auto level on/off and the input-gain trim (dB): hot, applied between hops."""
+        with self._lock:
+            user = self.store["input_level"]
+            if auto is not None:
+                user["auto"] = bool(auto)
+            if gain_db is not None:
+                low, high = INPUT_GAIN_RANGE
+                user["gain_db"] = min(high, max(low, float(gain_db)))
+            config = self._conditioning()
+            if self.session is not None:
+                self.session.set_conditioning(auto_level=config.auto_level,
+                                              trim_db=config.trim_db)
+            self._save_store()
+        self.publish_state()
+        return {"auto": config.auto_level, "gain_db": user.get("gain_db", 0.0)}
 
     def set_suppression(self, enabled: bool) -> None:
         raise ApiError("Noise suppression (RNNoise) is not built into the engine yet")
@@ -1001,6 +1035,7 @@ class EngineController:
         out_peak, health.output_peak = health.output_peak, 0.0
         health.input_peak = 0.0
         return _clean({"running": True, "in_db": stats.gate_rms_dbfs, "out_db": _db(out_peak),
+                       "in_gain_db": stats.input_gain_db,
                        "gate_open": stats.gate_open, "vad": stats.gate_vad,
                        "speaking": session.worker.override.active})
 
@@ -1050,6 +1085,7 @@ class EngineController:
 COMMANDS = {
     "start": "start", "stop": "stop", "get_state": "get_state", "shutdown": "shutdown",
     "set_param": "set_param", "reset_pitch": "reset_pitch", "set_gate": "set_gate",
+    "set_input_level": "set_input_level",
     "set_suppression": "set_suppression", "set_monitor": "set_monitor",
     "set_auto_tune": "set_auto_tune", "set_shape": "set_shape", "set_graphs": "set_graphs",
     "set_exclusive": "set_exclusive", "set_device": "set_device",

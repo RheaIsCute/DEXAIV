@@ -59,8 +59,16 @@ class FullFileConverter:
         return cls(p.model, p.embedder, p.extractor, engine.device, p.index, **kwargs)
 
     @torch.inference_mode()
-    def convert(self, audio_16k: np.ndarray, params: RuntimeParams) -> np.ndarray:
-        """Mono 16 kHz in -> mono float32 at the model sample rate."""
+    def convert(self, audio_16k: np.ndarray, params: RuntimeParams,
+                rms_frame_ms: float | None = None, f0_contour_scale: float = 1.0) -> np.ndarray:
+        """Mono 16 kHz in -> mono float32 at the model sample rate.
+
+        Typed-speech options (docs/DEVIATIONS.md §7, Step 3; the defaults are upstream):
+        ``rms_frame_ms`` sets the loudness-envelope frames of the ``volume_envelope`` mix
+        (None: rvc-webui's 1 s frames at a 0.5 s hop; a value: that frame at a 10 ms hop).
+        ``f0_contour_scale`` widens (> 1) the voiced F0 contour around the utterance's
+        median in semitones before synthesis.
+        """
         from scipy import signal
 
         seg = self.seg
@@ -79,7 +87,10 @@ class FullFileConverter:
             p_len = len(padded) // WINDOW
             coarse, cont = postprocess_f0(
                 self.extractor.extract(wave), semitones_to_ratio(params.f0_up_key),
-                params.f0_min_hz, params.f0_max_hz, params.f0_unvoiced == "interp")
+                params.f0_min_hz, params.f0_max_hz, params.f0_unvoiced == "interp",
+                round(params.f0_bridge_ms / 10.0))
+            if f0_contour_scale != 1.0:
+                coarse, cont = scale_contour(cont, f0_contour_scale, t_pad // WINDOW)
             pitch, pitchf = coarse[:p_len].unsqueeze(0), cont[:p_len].unsqueeze(0)
 
         pieces: list[torch.Tensor] = []
@@ -94,7 +105,8 @@ class FullFileConverter:
         out = torch.cat([piece[t_pad_tgt:-t_pad_tgt] for piece in pieces]).cpu().numpy()
 
         if params.volume_envelope != 1:
-            out = _change_rms(audio, SR, out, self.model.tgt_sr, params.volume_envelope)
+            out = _change_rms(audio, SR, out, self.model.tgt_sr, params.volume_envelope,
+                              rms_frame_ms)
         peak = float(np.abs(out).max()) / 0.99
         return (out / peak if peak > 1 else out).astype(np.float32)
 
@@ -147,15 +159,44 @@ def _rms_frames(audio: np.ndarray, frame: int, hop: int) -> np.ndarray:
 
 
 def _change_rms(source: np.ndarray, sr_in: int, out: np.ndarray, sr_out: int,
-                rate: float) -> np.ndarray:
-    """Offline loudness-envelope mix: half-second RMS frames, ``rate`` = share of the output."""
+                rate: float, frame_ms: float | None = None) -> np.ndarray:
+    """Offline loudness-envelope mix, ``rate`` = share of the output's own envelope.
+
+    Frames: rvc-webui's 1 s at a 0.5 s hop by default (only the phrase-level loudness
+    follows the source); with ``frame_ms`` that frame at a 10 ms hop, fine enough to carry
+    syllable stress across (the typed-speech option)."""
     def envelope(x: np.ndarray, sr: int) -> np.ndarray:
-        rms = _rms_frames(x, sr // 2 * 2, sr // 2)
+        if frame_ms is None:
+            frame, hop = sr // 2 * 2, sr // 2
+        else:
+            frame, hop = max(2, round(sr * frame_ms / 1000.0)), max(1, sr // 100)
+        rms = _rms_frames(x, frame, hop)
         return np.interp(np.linspace(0, len(rms) - 1, len(out)), np.arange(len(rms)), rms)
 
     rms_in = envelope(source, sr_in)
-    rms_out = np.maximum(envelope(out, sr_out), 1e-6)
+    floor = 1e-6 if frame_ms is None else 1e-4  # short frames reach true silence
+    rms_out = np.maximum(envelope(out, sr_out), floor)
     return out * np.power(rms_in, 1 - rate) * np.power(rms_out, rate - 1)
+
+
+def scale_contour(pitchf: torch.Tensor, scale: float, edge: int = 0
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Widen (``scale`` > 1) or narrow the voiced F0 around its median in semitone space:
+    ``f -> median * (f / median) ** scale``. The median is taken over voiced frames away
+    from ``edge`` frames of padding at each end. Unvoiced frames stay 0. Returns
+    ``(coarse, pitchf)`` (control path: the median syncs with the host)."""
+    from vox.pitch.base import f0_to_coarse
+
+    voiced = pitchf > 0
+    core = voiced.clone()
+    if edge:
+        core[:edge] = False
+        core[-edge:] = False
+    if not bool(core.any()):
+        return f0_to_coarse(pitchf), pitchf
+    median = pitchf[core].median()
+    scaled = torch.where(voiced, median * (pitchf.clamp(min=1.0) / median) ** scale, pitchf)
+    return f0_to_coarse(scaled), scaled
 
 
 def render_full(engine: Engine, audio: np.ndarray, seed: int | None = 0,
@@ -179,11 +220,15 @@ def render_full(engine: Engine, audio: np.ndarray, seed: int | None = 0,
 def convert_file(src: Path, dst: Path, models_dir: Path, model_name: str, mode: str = "stream",
                  shape: ShapeParams | None = None, params: RuntimeParams | None = None,
                  precision: PrecisionParams | None = None, device: str | None = None,
-                 out_sr: int | None = None, gate=None, profile_dir: Path | None = None) -> dict:
-    """Convert one file. Returns a small summary dict (and the engine, for reporting)."""
+                 out_sr: int | None = None, gate=None, profile_dir: Path | None = None,
+                 conditioning=None) -> dict:
+    """Convert one file. Returns a small summary dict (and the engine, for reporting).
+
+    ``stream`` mode runs the live microphone path, input conditioning included
+    (``conditioning``; default on); ``full`` mode never conditions."""
     engine = load_engine(models_dir, model_name, shape, params, precision, device,
                          warmup_hops=5 if mode == "stream" else 0, gate=gate,
-                         profile_dir=profile_dir)
+                         profile_dir=profile_dir, conditioning=conditioning)
     summary: dict = {"mode": mode, "model": model_name, "engine": engine}
     if mode == "full":
         audio, _ = load_audio(src, SR)

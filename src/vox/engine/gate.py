@@ -1,22 +1,28 @@
-"""Silence gate: energy pre-gate + Silero VAD with hangover, and the four-buffer protocol.
+"""Silence gate: energy pre-gate + Silero VAD with hysteresis and hangover, and the
+four-buffer protocol.
 
 The decision runs on the host from the hop's device-rate block (docs/research/03 §5,
-12 §3.6): an RMS threshold first (free), Silero VAD on the hop's 16 kHz decimation only
-when the energy passes (CPU, ~0.3 ms per 32 ms chunk), then a hangover that keeps the gate
-open ``hangover_ms`` after the last speech. No GPU work and no device sync happens here.
+12 §3.6), after input conditioning (the level the IN meter shows). Silero VAD runs on the
+16 kHz decimation of *every* block (CPU, ~0.3 ms per 32 ms chunk), so the decimator and the
+VAD's recurrent state never skip audio. The gate opens on a block at least
+``threshold_dbfs`` loud that the VAD calls speech, or, before the VAD has caught up, on a
+block ``onset_margin_db`` above the threshold (held only ``ONSET_PROBATION_MS`` unless the
+VAD confirms it). Once open it stays open down to ``threshold_dbfs - hysteresis_db`` and a
+VAD probability of ``vad_threshold - vad_hysteresis`` (Silero's own neg_threshold rule),
+then for ``hangover_ms`` more. No GPU work and no device sync happens here.
 
 What the worker (or the stream simulator) does with a ``GateDecision``:
 
     speech        -> run the hop normally
     drain         -> gate just closed: ``sola.begin_drain()``, ``pipeline.forget_speech()``
-    closed        -> ``pipeline.advance_context()`` (16 kHz ring only), emit
+    closed        -> ``pipeline.advance_context()`` (16 kHz ring and pitch cache), emit
                      ``sola.drain_step()`` while ``sola.draining`` else zeros
     onset         -> gate just opened: nothing to do, the zero SOLA tail fades the first
                      hop in; the context ring is already current (advanced while closed)
 
 So the four coupled states stay coherent: the 16 kHz context ring is always the true recent
-input (never stale speech, never zeros at onset), the pitch cache and feature buffers are
-zeroed on close, the SOLA tail is faded out exactly once, and the output is silence until
+input (never stale speech, never zeros at onset), the pitch cache advances with it (closed
+hops unvoiced), the SOLA tail is faded out exactly once, and the output is silence until
 the next onset.
 """
 
@@ -32,15 +38,28 @@ import torch
 from vox.engine.chunker import ANALYSIS_SR, ChunkPlan
 
 VAD_CHUNK = 512  # Silero v5 takes exactly 512 samples at 16 kHz (32 ms)
+# An energy-only open (the VAD has not seen the onset yet) lasts this long unless the VAD
+# confirms speech: long enough for Silero to answer (a chunk or two), short enough that a
+# desk thump does not hold the gate open for a whole hangover.
+ONSET_PROBATION_MS = 100.0
+# ...and it needs a real onset: the block must also stand this far above the quietest
+# block of the last ONSET_BACKGROUND_MS. With auto level the room tone of a quiet mic is
+# lifted with the voice and can sit above threshold + margin on its own; without this rule
+# it reopened the gate on probation every ~120 ms through a pause.
+ONSET_RISE_DB = 12.0
+ONSET_BACKGROUND_MS = 200.0
 
 
 @dataclass(frozen=True)
 class GateConfig:
     enabled: bool = True
     threshold_dbfs: float = -48.0  # energy pre-gate (calibration.silence_gate_dbfs)
-    vad_threshold: float = 0.5  # Silero speech probability
-    hangover_ms: float = 200.0  # keep open this long after the last speech
+    vad_threshold: float = 0.5  # Silero speech probability to open
+    hangover_ms: float = 350.0  # keep open this long after the last speech (was 200)
     use_vad: bool = True  # False: energy gate only
+    hysteresis_db: float = 6.0  # once open, stay open down to threshold - this
+    vad_hysteresis: float = 0.15  # once open, stay open down to vad_threshold - this
+    onset_margin_db: float = 6.0  # this far above the threshold opens before the VAD agrees
 
 
 @dataclass(frozen=True)
@@ -127,7 +146,7 @@ def rms_dbfs(block: np.ndarray) -> float:
 
 
 class SilenceGate:
-    """The gate state machine. One ``decide`` per hop, on the host block."""
+    """The gate state machine. One ``decide`` per hop, on the (conditioned) host block."""
 
     def __init__(self, plan: ChunkPlan, config: GateConfig = GateConfig(),
                  vad: SileroVad | None = None) -> None:
@@ -137,17 +156,25 @@ class SilenceGate:
         if self.vad is not None:
             self.vad.threshold = config.vad_threshold
         self._decimate = _Decimator(plan.device_sr, plan.block)
-        self.hangover_hops = max(1, math.ceil(config.hangover_ms / plan.block_ms))
+        self._set_hops(config)
+        self._recent = np.full(max(1, math.ceil(ONSET_BACKGROUND_MS / plan.block_ms)), -120.0)
         self._acc = np.zeros(VAD_CHUNK + self._decimate.out_len, dtype=np.float32)
         self._acc_len = 0
         self.transitions = 0
         self.reset()
+
+    def _set_hops(self, config: GateConfig) -> None:
+        self.hangover_hops = max(1, math.ceil(config.hangover_ms / self.plan.block_ms))
+        self.probation_hops = min(self.hangover_hops,
+                                  max(1, math.ceil(ONSET_PROBATION_MS / self.plan.block_ms)))
 
     def reset(self) -> None:
         self.open = False
         self._remaining = 0  # hangover hops left
         self._vad_prob = 0.0
         self._acc_len = 0
+        self._recent[:] = -120.0  # block levels of the last ONSET_BACKGROUND_MS
+        self._recent_pos = 0
         self._decimate.reset()
         if self.vad is not None:
             self.vad.reset()
@@ -155,14 +182,16 @@ class SilenceGate:
     def set_config(self, config: GateConfig) -> None:
         """Hot update (threshold, hangover, enable). Disabling opens the gate at once."""
         self.config = config
-        self.hangover_hops = max(1, math.ceil(config.hangover_ms / self.plan.block_ms))
+        self._set_hops(config)
         if self.vad is not None:
             self.vad.threshold = config.vad_threshold
 
-    def _vad_speech(self, block: np.ndarray) -> bool:
-        """Run Silero on every completed 512-sample chunk of the 16 kHz decimation."""
+    def _vad_update(self, block: np.ndarray) -> None:
+        """Feed the block's 16 kHz decimation to Silero, one call per completed 512-sample
+        chunk. Runs on every block, quiet or not, so neither the FIR state nor the VAD's
+        recurrent state ever skips audio (the VAD also sees the way into silence)."""
         if self.vad is None:
-            return True
+            return
         chunk16 = self._decimate(block)
         n = len(chunk16)
         self._acc[self._acc_len:self._acc_len + n] = chunk16
@@ -171,20 +200,39 @@ class SilenceGate:
             self._vad_prob = self.vad.prob(self._acc[:VAD_CHUNK])
             self._acc[:self._acc_len - VAD_CHUNK] = self._acc[VAD_CHUNK:self._acc_len]
             self._acc_len -= VAD_CHUNK
-        return self._vad_prob >= self.config.vad_threshold
 
     def decide(self, block: np.ndarray) -> GateDecision:
         level = rms_dbfs(block)
-        if not self.config.enabled:
+        self._vad_update(block)
+        cfg = self.config
+        if not cfg.enabled:
             onset = not self.open
             self.open = True
             return GateDecision(True, onset=onset, rms_dbfs=level, vad_prob=self._vad_prob)
-        loud = level >= self.config.threshold_dbfs
-        # The VAD sees every block while it is loud enough to matter, so its recurrent
-        # state tracks the signal; quiet blocks only decay the hangover.
-        speech_now = loud and self._vad_speech(block)
-        if speech_now:
+        # Hysteresis: opening takes the full threshold and VAD probability, staying open
+        # only the lower ones, so a soft syllable inside a phrase does not close the gate.
+        if self.open:
+            loud = level >= cfg.threshold_dbfs - cfg.hysteresis_db
+            voiced = self._vad_prob >= cfg.vad_threshold - cfg.vad_hysteresis
+        else:
+            loud = level >= cfg.threshold_dbfs
+            voiced = self._vad_prob >= cfg.vad_threshold
+        if self.vad is None:
+            voiced = True
+        # The VAD lags the block by up to one chunk (32 ms): a clear onset opens at once
+        # rather than losing its first hop, on probation until the VAD has heard it.
+        background = float(self._recent.min())
+        self._recent[self._recent_pos] = level
+        self._recent_pos = (self._recent_pos + 1) % len(self._recent)
+        strong = (not self.open and level >= cfg.threshold_dbfs + cfg.onset_margin_db
+                  and level >= background + ONSET_RISE_DB)
+        if loud and voiced:
             self._remaining = self.hangover_hops
+            speech = True
+        elif strong:
+            self._remaining = self.probation_hops - 1
+            # this level is now the background: a second energy-only open needs a new rise
+            self._recent[:] = level
             speech = True
         elif self._remaining > 0:
             self._remaining -= 1  # this hop is inside the hangover: still open

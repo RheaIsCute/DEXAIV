@@ -8,7 +8,7 @@
   "vad": {
     "engine": "silero",
     "threshold": 0.5,
-    "release_ms": 200
+    "release_ms": 350
   },
   "silence_gate_dbfs": -48.0,
   "rnnoise_enabled": false,

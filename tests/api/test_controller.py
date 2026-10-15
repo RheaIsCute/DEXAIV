@@ -47,7 +47,8 @@ class FakeSession:
         self.worker = SimpleNamespace(
             params=cfg.params, plan=plan, hold=False, override=override,
             play_clip=override.submit,
-            stats=SimpleNamespace(gate_rms_dbfs=-20.0, gate_open=True, gate_vad=0.9))
+            stats=SimpleNamespace(gate_rms_dbfs=-20.0, gate_open=True, gate_vad=0.9,
+                                  input_gain_db=14.0))
         self.audio = SimpleNamespace(health=SimpleNamespace(input_peak=0.5, output_peak=0.5))
         self.out_ring = SimpleNamespace(underruns=0)
         self.errors: list[str] = []
@@ -67,6 +68,9 @@ class FakeSession:
 
     def set_gate(self, **changes):
         self.calls.append(("gate", changes))
+
+    def set_conditioning(self, **changes):
+        self.calls.append(("conditioning", changes))
 
     def set_shape(self, **changes):
         self.calls.append(("shape", changes))
@@ -271,6 +275,26 @@ def test_hot_parameters_reach_the_running_session(env):
         c.set_param("volume", 1)
 
 
+def test_input_level_defaults_on_is_hot_and_persists(env):
+    c = env.make(model="Alpha")
+    assert c.state()["input_level"]["auto"] is True and c.state()["input_level"]["gain_db"] == 0
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    cfg = session.cfg.conditioning
+    assert cfg.enabled and cfg.auto_level and cfg.trim_db == 0.0
+    session.calls.clear()
+    assert c.set_input_level(gain_db=40) == {"auto": True, "gain_db": 24.0}  # clamped
+    c.set_input_level(auto=False)
+    assert session.calls == [("conditioning", {"auto_level": True, "trim_db": 24.0}),
+                             ("conditioning", {"auto_level": False, "trim_db": 24.0})]
+    assert len(FakeSession.created) == 1  # hot: nothing restarted
+    c.shutdown()
+    again = env.make(model="Alpha")
+    assert again.state()["input_level"] == {"auto": False, "gain_db": 24.0,
+                                            "range_db": [-12.0, 24.0]}
+
+
 def test_shape_changes_recapture_in_place_and_are_rounded(env):
     c = env.make(model="Alpha")
     c.start()
@@ -389,6 +413,7 @@ def test_events_while_running(env):
     states = [d for k, d in seen if k == STATE]
     assert 10 <= len(meters) <= 25  # ~15 Hz
     assert meters[0]["in_db"] == -20.0 and meters[0]["gate_open"] is True
+    assert meters[0]["in_gain_db"] == 14.0
     assert math.isclose(meters[0]["out_db"], 20 * math.log10(0.5), abs_tol=1e-6)
     assert 1 <= len(perf) <= 4  # ~2 Hz
     p = perf[-1]
