@@ -273,8 +273,22 @@ class EngineController:
             except Exception as err:  # noqa: BLE001
                 self._device_cache, self._device_error = [], str(err)
 
+    def _rescan_devices(self) -> None:
+        """Re-initialise PortAudio so newly plugged devices appear.
+
+        Refused while audio is open: terminating PortAudio under a running stream would
+        kill it, so the user stops first (the GUI says so).
+        """
+        if self.session is not None or self.status in ("starting", "running", "stopping"):
+            raise ApiError("Stop the engine before refreshing devices")
+        if self._speaking():
+            raise ApiError("Wait for the clip to finish before refreshing devices")
+        with self._pa_lock:
+            audio_devices.reinitialize()
+        self._refresh_devices()
+
     def refresh_devices(self) -> dict[str, Any]:
-        return self._submit("Scanning devices", self._refresh_devices)
+        return self._submit("Scanning devices", self._rescan_devices)
 
     def _devices(self) -> dict[str, Any]:
         found = self._device_cache
@@ -288,17 +302,35 @@ class EngineController:
             return {"index": d.index, "name": d.name, "cable": d.is_cable,
                     "default": d.default_input or d.default_output}
 
+        def missing(kind: str, pool) -> dict[str, Any] | None:
+            """The saved device when it is absent from the fresh list, else None."""
+            wanted = self.store.get(kind)
+            if wanted is None or any(d.name == wanted or str(d.index) == str(wanted)
+                                     for d in pool):
+                return None
+            return {"index": None, "name": str(wanted), "cable": False, "default": False,
+                    "missing": True}
+
         def current(kind: str, pool) -> dict[str, Any] | None:
             wanted = self.store.get(kind)
             for d in pool:
                 if wanted is not None and (d.name == wanted or str(d.index) == str(wanted)):
                     return entry(d)
+            gone = missing(kind, pool)
+            if gone is not None:
+                return gone  # never silently substitute another device
             for d in pool:
                 if d.default_input if kind == "input" else d.default_output:
                     return entry(d)
             return entry(pool[0]) if pool else None
 
-        return {"inputs": [entry(d) for d in ins], "outputs": [entry(d) for d in outs],
+        inputs = [entry(d) for d in ins]
+        outputs = [entry(d) for d in outs]
+        for kind, listed in (("input", inputs), ("output", outputs)):
+            gone = missing(kind, ins if kind == "input" else outs)
+            if gone is not None and not (kind == "input" and self.input_file):
+                listed.insert(0, gone)
+        return {"inputs": inputs, "outputs": outputs,
                 "input": current("input", ins), "output": current("output", outs),
                 "input_file": self.input_file.name if self.input_file else None}
 

@@ -169,6 +169,28 @@ def test_initial_state_document(env):
     json.dumps(state)  # the whole document must be JSON
 
 
+def test_refresh_reinitialises_portaudio_only_while_stopped(env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ctl.audio_devices, "reinitialize", lambda: calls.append(1))
+    c = env.make()
+    c.refresh_devices()
+    settle(c)
+    assert calls == [1]
+    c.start()
+    settle(c)
+    c.refresh_devices()
+    settle(c)
+    assert calls == [1] and c.status == "running"  # refused, stream untouched
+
+
+def test_saved_device_missing_from_fresh_list_is_shown_not_replaced(env):
+    c = env.make(input="Gone Mic")
+    devices = c.state()["devices"]
+    assert devices["input"]["name"] == "Gone Mic" and devices["input"]["missing"] is True
+    assert devices["inputs"][0]["missing"] is True
+    assert devices["output"]["name"] == "Speakers"
+
+
 def test_model_argument_wins_and_unknown_falls_back(env):
     assert env.make(model="Alpha").model == "Alpha"
     assert env.make(model="Nope").model == "Beta"

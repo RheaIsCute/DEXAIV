@@ -63,6 +63,18 @@ def list_devices(hostapi: str | None = WASAPI) -> list[DeviceInfo]:
     return out
 
 
+def reinitialize() -> None:
+    """Make PortAudio re-enumerate: it only sees devices present at initialisation.
+
+    Never call while any stream is open (live session, clip playback).
+    """
+    import sounddevice as sd
+
+    sd.stop()
+    sd._terminate()
+    sd._initialize()
+
+
 def resolve_device(spec: str | int | None, kind: str, hostapi: str | None = WASAPI
                    ) -> DeviceInfo:
     """``spec``: PortAudio index, name fragment, or None for the default.
