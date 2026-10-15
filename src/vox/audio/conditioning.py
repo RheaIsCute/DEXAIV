@@ -1,12 +1,16 @@
 """Live microphone conditioning, on the host, before the hop's upload (and before the gate).
 
-    raw block -> 2nd-order high-pass (stateful) -> gain (auto level + trim) -> soft limit
+    raw block -> 2nd-order high-pass (stateful) -> [suppression] -> gain (auto level + trim)
+              -> soft limit
 
 The full-file converter high-passes and normalises its input; the live engine used to take
 the raw microphone, which on a quiet mic means ContentVec and RMVPE see speech 15-20 dB
 below what they were trained on, plus any desk thump below 70 Hz. Here:
 
 * **High-pass**: 2nd-order Butterworth at ``highpass_hz``, state carried across blocks.
+* **Suppression**: RNNoise (``audio/suppression.py``) when ``suppression`` is on, mixed at
+  ``suppression_mix``; switching crossfades over 20 ms. Adds 20 ms of delay while on. At
+  48 kHz only; elsewhere (or without the library) the stage is absent and the flag ignored.
 * **Auto level**: an AGC toward ``target_dbfs`` of *active* speech RMS. The speech level is
   a moving average of block power over the blocks above the calibrated noise floor
   (+ ``freeze_margin_db``); below it level and gain are both held, so pauses are not pumped
@@ -48,6 +52,8 @@ class ConditioningConfig:
     noise_floor_dbfs: float = -60.0  # calibration.noise_floor_dbfs
     freeze_margin_db: float = 6.0  # gain held on blocks below floor + this
     limit_dbfs: float = -3.0  # soft-limiter ceiling
+    suppression: bool = False  # RNNoise after the high-pass (LiveSession resolves it)
+    suppression_mix: float = 1.0  # 1 = fully denoised; lower keeps some dry (sung notes)
 
 
 def _alpha(block_ms: float, tau_ms: float) -> float:
@@ -58,11 +64,18 @@ class InputConditioner:
     """One ``process`` per hop on the worker thread (or the simulator); numpy only."""
 
     def __init__(self, sr: int, block: int, config: ConditioningConfig | None = None) -> None:
+        from vox.audio import suppression
+
         self.sr = sr
         self.config = config or ConditioningConfig()
         self._sos = None
         self._zi = None
         self._design()
+        # Built whenever RNNoise can run here, so suppression can be switched on live.
+        self.suppressor = None
+        if suppression.unavailable_reason(sr) is None and block % suppression.FRAME == 0:
+            self.suppressor = suppression.Suppressor(block, self.config.suppression,
+                                                     self.config.suppression_mix)
         self.resize(block)
         self.reset()
 
@@ -83,14 +96,18 @@ class InputConditioner:
         self._a_gain_up, self._a_gain_down = _alpha(ms, GAIN_RISE_MS), _alpha(ms, GAIN_FALL_MS)
         self._ramp = (np.arange(1, block + 1, dtype=np.float64) / block)
         self._out = np.zeros(block, dtype=np.float32)
+        if self.suppressor is not None:
+            self.suppressor.resize(block)
 
     def set_config(self, config: ConditioningConfig) -> None:
-        """Hot update between hops (toggle, trim). A new corner frequency redesigns the
-        filter (its state restarts: one block of settling)."""
+        """Hot update between hops (toggle, trim, suppression). A new corner frequency
+        redesigns the filter (its state restarts: one block of settling)."""
         redesign = config.highpass_hz != self.config.highpass_hz
         self.config = config
         if redesign:
             self._design()
+        if self.suppressor is not None:
+            self.suppressor.set(config.suppression, config.suppression_mix)
 
     def reset(self) -> None:
         if self._zi is not None:
@@ -98,6 +115,15 @@ class InputConditioner:
         self._power: float | None = None  # mean power of active speech, unknown until speech
         self.agc_db = 0.0  # the AGC's own gain
         self._applied_db = self._total_db()
+        if self.suppressor is not None:
+            self.suppressor.reset()
+
+    @property
+    def delay_ms(self) -> float:
+        """Delay the chain adds to the input right now (RNNoise's 20 ms while it runs)."""
+        if self.suppressor is None or not self.config.enabled:
+            return 0.0
+        return 1000.0 * self.suppressor.delay_samples / self.sr
 
     def _total_db(self) -> float:
         cfg = self.config
@@ -125,6 +151,8 @@ class InputConditioner:
             from scipy.signal import sosfilt
 
             x, self._zi = sosfilt(self._sos, x, zi=self._zi)
+        if self.suppressor is not None:
+            x = self.suppressor.process(x)
         power = float(np.mean(x * x))
         if 10.0 * math.log10(power + 1e-12) >= cfg.noise_floor_dbfs + cfg.freeze_margin_db:
             # Speech (or at least signal): track its level and steer the gain. In pauses

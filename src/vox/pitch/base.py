@@ -95,16 +95,38 @@ def bridge_gaps(f0: Tensor, max_frames: int, max_semitones: float = 4.0) -> Tens
     return torch.where(fill, interpolated, f0)
 
 
+CEILING_KNEE_ST = 4.0  # the soft ceiling starts compressing this far below the ceiling
+
+
+def soft_ceiling(pitchf: Tensor, ceiling: Tensor | float) -> Tensor:
+    """Soft-knee F0 limit in semitone space: unchanged up to ``ceiling`` - 4 st, then
+    ``knee * 2 ** (4 tanh(st / 4) / 12)`` (slope 1 at the knee, asymptotic to ``ceiling``).
+
+    For singing through a speech-trained model: belted notes that the transposition pushes
+    past what the model saw are bent down instead of cracking. It is a safety, not a fix:
+    a note 2.5 st over the knee comes out ~0.3 st flat, 6 st over ~2.3 st flat (off-key).
+    ``ceiling = inf`` is an exact no-op with the same op sequence (graph-safe); unvoiced
+    frames (0 Hz) are never touched.
+    """
+    knee = ceiling * 2.0 ** (-CEILING_KNEE_ST / 12.0)
+    over = 12.0 * torch.log2(pitchf.clamp(min=1e-3) / knee)
+    bent = knee * torch.exp2(CEILING_KNEE_ST * torch.tanh(over.clamp(min=0.0) / CEILING_KNEE_ST)
+                             / 12.0)
+    return torch.where(pitchf > knee, bent, pitchf)
+
+
 def postprocess_f0(f0: Tensor, ratio: Tensor | float, f0_min: Tensor | float = COARSE_F0_MIN,
                    f0_max: Tensor | float = COARSE_F0_MAX, interp: bool = False,
-                   bridge_frames: int = 0) -> tuple[Tensor, Tensor]:
+                   bridge_frames: int = 0, ceiling: Tensor | float = 0.0
+                   ) -> tuple[Tensor, Tensor]:
     """Raw extractor output -> ``(coarse int64, continuous Hz)`` after transposition.
 
     ``ratio`` is ``2 ** (f0_up_key / 12)``; pass a 0-dim device tensor on the hot path so
     changing the key never changes the op sequence. The same goes for the voicing bounds:
     as tensors they are always applied (use 0 / inf to disable), as floats only when
     tighter than the coarse-pitch contract. ``bridge_frames`` > 0 fills short dropouts
-    first (``bridge_gaps``).
+    first (``bridge_gaps``). ``ceiling`` (Hz) bends transposed pitch above it softly
+    (``soft_ceiling``); as a tensor it is always applied (inf = off), as a float only > 0.
     """
     tensors = isinstance(f0_min, Tensor) or isinstance(f0_max, Tensor)
     if tensors or f0_min > COARSE_F0_MIN or f0_max < COARSE_F0_MAX:
@@ -114,6 +136,8 @@ def postprocess_f0(f0: Tensor, ratio: Tensor | float, f0_min: Tensor | float = C
     if interp:
         f0 = interp_unvoiced(f0)
     pitchf = f0 * ratio
+    if isinstance(ceiling, Tensor) or ceiling > 0:
+        pitchf = soft_ceiling(pitchf, ceiling)
     return f0_to_coarse(pitchf), pitchf
 
 

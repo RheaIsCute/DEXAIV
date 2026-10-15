@@ -77,6 +77,37 @@ def test_runtime_profile_maps_to_shape_and_precision():
     assert runtime.precision().hubert_fp16
 
 
+def test_profiles_store_only_what_was_chosen_and_new_defaults_fall_through(tmp_path,
+                                                                           monkeypatch):
+    """runtime.json / voice_profile.json never hold copies of engine defaults: an engine
+    field added or retuned later is not shadowed by a stale 0.0 / false from the file."""
+    save_profile(Profile(), tmp_path)
+    runtime_file = json.loads((tmp_path / "runtime.json").read_text())
+    assert not {"block_ms", "decoder_context_ms", "tf32", "graphs"} & set(runtime_file)
+    f0_file = json.loads((tmp_path / "voice_profile.json").read_text())["f0_extractor"]
+    assert not {"method", "f0_min_hz", "f0_max_hz"} & set(f0_file)
+
+    import dataclasses
+
+    monkeypatch.setattr(defaults, "DEFAULT_SHAPE", dataclasses.replace(
+        defaults.DEFAULT_SHAPE, decoder_context_ms=80.0, embed_pad_ms=20.0))
+    monkeypatch.setattr(defaults, "DEFAULT_RUNTIME", dataclasses.replace(
+        defaults.DEFAULT_RUNTIME, volume_envelope=0.4, f0_max_hz=900.0))
+    monkeypatch.setattr(defaults, "DEFAULT_PRECISION", dataclasses.replace(
+        defaults.DEFAULT_PRECISION, graphs="on"))
+    profile = load_profile(tmp_path)
+    shape = profile.runtime.shape()
+    assert (shape.decoder_context_ms, shape.embed_pad_ms) == (80.0, 20.0)
+    assert profile.runtime.precision().graphs == "on"
+    params = resolve_runtime_params(profile, ModelConfig(name="m"))
+    assert (params.volume_envelope, params.f0_max_hz) == (0.4, 900.0)
+    # a value somebody did choose still wins over the default
+    profile.runtime.decoder_context_ms = 0.0
+    assert profile.runtime.shape().decoder_context_ms == 0.0
+    save_profile(profile, tmp_path)
+    assert json.loads((tmp_path / "runtime.json").read_text())["decoder_context_ms"] == 0.0
+
+
 def test_model_config_roundtrip(tmp_path):
     config = ModelConfig(name="m", sr=40000)
     config.index.file = "model.index"

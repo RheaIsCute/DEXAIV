@@ -17,8 +17,10 @@ What the worker (or the stream simulator) does with a ``GateDecision``:
     drain         -> gate just closed: ``sola.begin_drain()``, ``pipeline.forget_speech()``
     closed        -> ``pipeline.advance_context()`` (16 kHz ring and pitch cache), emit
                      ``sola.drain_step()`` while ``sola.draining`` else zeros
-    onset         -> gate just opened: nothing to do, the zero SOLA tail fades the first
-                     hop in; the context ring is already current (advanced while closed)
+    onset         -> gate just opened: ``sola.mark_onset()`` (a short fade-in from the
+                     silent tail keeps the decoded pre-onset audio) and
+                     ``pipeline.on_onset()``; the context ring is already current
+                     (advanced while closed)
 
 So the four coupled states stay coherent: the 16 kHz context ring is always the true recent
 input (never stale speech, never zeros at onset), the pitch cache advances with it (closed
@@ -60,6 +62,10 @@ class GateConfig:
     hysteresis_db: float = 6.0  # once open, stay open down to threshold - this
     vad_hysteresis: float = 0.15  # once open, stay open down to vad_threshold - this
     onset_margin_db: float = 6.0  # this far above the threshold opens before the VAD agrees
+    # A hop of 40 ms or more completes several 512-sample VAD chunks: "max" decides on the
+    # most speech-like of them (an onset late in the hop's first chunk still counts),
+    # "last" on the newest only (the pre-fix behaviour, docs/DEVIATIONS.md §8).
+    vad_reduce: str = "max"
 
 
 @dataclass(frozen=True)
@@ -196,10 +202,14 @@ class SilenceGate:
         n = len(chunk16)
         self._acc[self._acc_len:self._acc_len + n] = chunk16
         self._acc_len += n
+        peak = -1.0  # no chunk completed this block: the previous probability stands
         while self._acc_len >= VAD_CHUNK:
-            self._vad_prob = self.vad.prob(self._acc[:VAD_CHUNK])
+            prob = self.vad.prob(self._acc[:VAD_CHUNK])
+            peak = max(peak, prob) if self.config.vad_reduce == "max" else prob
             self._acc[:self._acc_len - VAD_CHUNK] = self._acc[VAD_CHUNK:self._acc_len]
             self._acc_len -= VAD_CHUNK
+        if peak >= 0.0:
+            self._vad_prob = peak
 
     def decide(self, block: np.ndarray) -> GateDecision:
         level = rms_dbfs(block)

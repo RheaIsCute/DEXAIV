@@ -178,6 +178,52 @@ def test_first_hop_fades_in_from_silence_and_state_resets():
     assert sola.buffer.abs().sum() == 0 and sola.offset_hist.sum() == 0
 
 
+def onset_sola(onset_ramp_ms: float):
+    plan = chunker.plan(20, 20, 500, 10, SR, SR, onset_ramp_ms=onset_ramp_ms)
+    return plan, Sola(plan, "cpu")
+
+
+def test_gate_onset_keeps_the_decoded_head_with_a_short_ramp():
+    """On an onset the tail is silent and the head of the hop is decoded pre-onset audio
+    (the consonant the gate opened on): it fades in over 5 ms, not the whole overlap."""
+    plan, sola = onset_sola(5.0)
+    ramp = plan.onset_ramp
+    assert ramp == 240
+    sola.mark_onset()
+    first = sola.stitch(torch.ones(plan.out_device)).clone()
+    assert first[0] == 0 and first[ramp - 1] == pytest.approx(1.0)
+    assert torch.all(torch.diff(first[:ramp]) >= 0) and torch.all(first[ramp:] == 1.0)
+    # one hop only: the next stitch is the ordinary crossfade against the saved tail
+    assert sola._onset.item() == 0.0
+    second = sola.stitch(torch.ones(plan.out_device))
+    assert torch.allclose(second, torch.ones_like(second))
+    # without the mark (or with the ramp off) the silent tail fades in over the overlap
+    for plan, sola in (onset_sola(5.0), onset_sola(0.0)):
+        if plan.onset_ramp:
+            sola.reset()
+        else:
+            sola.mark_onset()
+        plain = sola.stitch(torch.ones(plan.out_device)).clone()
+        assert torch.allclose(plain[:sola.overlap], sola.fade_in)
+        assert plain[ramp] < 0.2  # 5 ms into a 20 ms sin^2 fade
+
+
+def test_onset_ramp_keeps_more_of_a_consonant_burst():
+    """A noise burst at the head of the onset hop (a /p/ or /t/ decoded just before the
+    gate opened): the short ramp passes most of its energy, the plain fade very little."""
+    gen = torch.Generator().manual_seed(1)
+    plan, short = onset_sola(5.0)
+    _, plain = onset_sola(0.0)
+    chunk = torch.zeros(plan.out_device)
+    chunk[:plan.block // 2] = 0.3 * torch.randn(plan.block // 2, generator=gen)  # 10 ms
+    short.mark_onset()
+    kept_short = short.stitch(chunk).pow(2).sum() / chunk.pow(2).sum()
+    plain.mark_onset()
+    kept_plain = plain.stitch(chunk).pow(2).sum() / chunk.pow(2).sum()
+    # sin^2 ramps pass 3/8 of the energy under them: 5 of the burst's 10 ms vs all of it
+    assert kept_short > 0.65 and kept_plain < 0.15
+
+
 def test_silence_is_stable():
     plan, sola = make()
     for _ in range(3):

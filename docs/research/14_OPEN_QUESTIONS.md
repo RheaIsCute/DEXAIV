@@ -464,3 +464,31 @@ R3 unchanged. Not made the default: `out/ab/f0_interp.wav` vs `out/ab/reference.
 ## Q17 - 80 ms decoder context: again no measurable effect
 
 R3, voicing and HF/LF within noise of the reference (`out/ab/decctx_80.wav`).
+
+---
+
+# Singing results (2026-10-15)
+
+Sung takes through the NVIDIA Broadcast mic (GoatMommy, Mom; pitch +6); docs/DEVIATIONS.md
+section 8. Wavs in `out/ab/` (not committed).
+
+## Q7 - the SOLA offsets on held notes are not a sine-phase problem
+
+Hypothesis (external report): the NSF sine restarting at phase 0 every hop makes SOLA hunt
+for alignment, so carrying the phase across hops should collapse the offsets toward 0.
+Measured on 13.5 s of sung take at hop 20: offsets sit at 0 on 1-2% of hops in every
+variant. Phase carry alone trims the mean offset jump 15% and roughens the seams (click
+ratio +0.13). With the latent noise rolled with the window and 80 ms of decoder left
+context as well, 19% of hops keep the previous offset (mean jump 2.96 -> 1.15 ms) but the
+click ratio is still worse than the reference. What decorrelates consecutive renders is the
+per-hop latent noise and the decoder's zero-padded left edge, not the sine phase; jumps by
+whole F0 periods on a held note are benign. `sine_phase_carry` stays off and the 5 ms search
+was not tried. **By ear:** `out/ab/sing_phasecarry_off.wav` vs `sing_phasecarry_on.wav` and
+`sing_phasecarry_noiseroll_decctx80.wav`.
+
+## Q15 - unchanged: interp stays an A/B
+
+The singing work kept `f0_unvoiced = zero` (protect keys on `pitchf < 1`). The pitch-related
+change that did ship is the RMVPE right-edge guard (`f0_trim_tail = 2`): the pitch step at
+the seams of held notes halves (p95 21 -> 10 cents), at the price of F0 10 ms later against
+the features.

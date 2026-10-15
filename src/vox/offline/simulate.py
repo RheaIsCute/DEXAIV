@@ -295,6 +295,9 @@ class StreamSimulator:
                 torch.cuda.set_sync_debug_mode("error")
             try:
                 if decision.speech:
+                    if decision.onset and not sola.draining:  # as the live worker does
+                        sola.mark_onset()
+                        pipeline.on_onset()
                     infer = pipeline.process_hop()
                     with timers.stage("sola"):
                         stitched = sola.stitch(infer)

@@ -26,7 +26,9 @@ DEVICES = [
     DeviceInfo(4, "Mic B", "Windows WASAPI", 1, 0, 48000.0, 0.003, 0.0),
     DeviceInfo(7, "Speakers", "Windows WASAPI", 0, 2, 48000.0, 0.0, 0.003, default_output=True),
     DeviceInfo(8, "CABLE Input", "Windows WASAPI", 0, 2, 48000.0, 0.0, 0.001),
+    DeviceInfo(9, "Microphone (NVIDIA Broadcast)", "Windows WASAPI", 1, 0, 48000.0, 0.003, 0.0),
 ]
+BROADCAST = "Microphone (NVIDIA Broadcast)"
 
 
 class FakeSession:
@@ -52,6 +54,9 @@ class FakeSession:
         self.audio = SimpleNamespace(health=SimpleNamespace(input_peak=0.5, output_peak=0.5))
         self.out_ring = SimpleNamespace(underruns=0)
         self.errors: list[str] = []
+        self.in_device = None
+        self.suppression = bool(cfg.suppression)
+        self.suppression_why = "explicit" if cfg.suppression is not None else "profile"
         FakeSession.created.append(self)
 
     def start(self):
@@ -178,8 +183,10 @@ def test_initial_state_document(env):
     assert state["devices"]["output"]["name"] == "Speakers"
     assert [d["name"] for d in state["devices"]["outputs"]] == ["Speakers", "CABLE Input"]
     assert state["devices"]["outputs"][1]["cable"] is True
-    for stub in ("suppression", "monitor", "auto_tune"):
+    for stub in ("monitor", "auto_tune"):
         assert state[stub] == {"enabled": False, "available": False}
+    assert state["suppression"]["enabled"] is False and state["suppression"]["mix"] == 1.0
+    assert state["params"]["preset"] == "speak" and state["params"]["ceiling_hz"] == 0.0
     json.dumps(state)  # the whole document must be JSON
 
 
@@ -349,6 +356,7 @@ def test_input_level_defaults_on_is_hot_and_persists(env):
     c.shutdown()
     again = env.make(model="Alpha")
     assert again.state()["input_level"] == {"auto": False, "gain_db": 24.0,
+                                            "trim_locked": False, "max_gain_db": 18.0,
                                             "range_db": [-12.0, 24.0]}
 
 
@@ -357,10 +365,10 @@ def test_shape_changes_recapture_in_place_and_are_rounded(env):
     c.start()
     settle(c)
     session = FakeSession.created[-1]
-    assert c.set_shape(block_ms=34)["block_ms"] == 30.0  # the chunker's 10 ms units
-    assert c.state()["shape"]["block_ms"] == 30.0 and c.state()["engine"]["recapturing"]
+    assert c.set_shape(block_ms=34)["block_ms"] == 40.0  # whole 20 ms HuBERT frames
+    assert c.state()["shape"]["block_ms"] == 40.0 and c.state()["engine"]["recapturing"]
     c.set_shape(f0_method="fcpe", extra_ms=500)
-    assert session.calls[-2:] == [("shape", {"f0_method": None, "block_ms": 30.0}),
+    assert session.calls[-2:] == [("shape", {"f0_method": None, "block_ms": 40.0}),
                                   ("shape", {"f0_method": "fcpe", "extra_ms": 500.0})]
     assert len(FakeSession.created) == 1
     with pytest.raises(ApiError, match="unknown pitch tracker"):
@@ -419,9 +427,11 @@ def test_command_dispatch_and_errors(env):
         c.command("format_disk")
     with pytest.raises(ApiError, match="bad arguments"):
         c.command("set_param", {"nome": "pitch"})
-    for name in ("set_suppression", "set_monitor", "set_auto_tune"):
+    for name in ("set_monitor", "set_auto_tune"):
         with pytest.raises(ApiError, match="not built"):
             c.command(name, {"enabled": True})
+    with pytest.raises(ApiError, match="unknown preset"):
+        c.command("set_preset", {"preset": "shout"})
     with pytest.raises(ApiError, match="Phase 5"):
         c.command("calibrate")
     with pytest.raises(ApiError, match="type something"):
@@ -513,3 +523,132 @@ def test_speaking_state_follows_the_override(env):
 def test_clean_replaces_non_finite_numbers():
     assert ctl._clean({"a": float("nan"), "b": [1.0, float("inf")], "c": "x"}) == \
         {"a": None, "b": [1.0, None], "c": "x"}
+
+
+# --------------------------------------------------------- presets, persistence, suppression
+
+
+def test_speak_and_sing_presets_keep_their_own_values_per_model(env):
+    c = env.make(model="Alpha")  # calibrated pitch +7 (model_overrides.json)
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    c.set_param("pitch", 11)
+    session.calls.clear()
+    assert c.set_preset("sing")["pitch"] == 6.0  # Sing starts at the Speak pitch - 5
+    p = c.state()["params"]
+    assert (p["preset"], p["pitch"], p["index_rate"], p["protect"], p["ceiling_hz"]) == \
+        ("sing", 6.0, 0.3, 0.35, 360.0)
+    assert p["pitch_is_calibrated"] is True and p["calibrated_pitch"] == 6.0
+    assert c.state()["input_level"]["trim_locked"] is True
+    # hot: the four values and the singing input chain, nothing restarted
+    assert session.calls == [
+        ("params", {"f0_up_key": 6.0, "index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0}),
+        ("conditioning", {"auto_level": True, "trim_db": 0.0, "max_gain_db": 10.0})]
+    assert len(FakeSession.created) == 1
+    c.set_param("pitch", 4)
+    c.set_param("ceiling", 330)
+    c.set_preset("speak")
+    p = c.state()["params"]
+    assert (p["preset"], p["pitch"], p["protect"], p["ceiling_hz"]) == ("speak", 11.0, 0.33, 0.0)
+    saved = json.loads((env.profile / ctl.STATE_FILE).read_text())
+    assert saved["models"]["Alpha"] == {"pitch": 11.0, "sing": {"pitch": 4.0, "ceiling": 330.0}}
+    c.set_preset("sing")
+    c.shutdown()
+    again = env.make()
+    p = again.state()["params"]
+    assert (p["preset"], p["pitch"], p["ceiling_hz"]) == ("sing", 4.0, 330.0)
+    again.reset_pitch()  # in Sing: back to the Speak pitch - 5
+    assert again.state()["params"]["pitch"] == 6.0
+    assert again.state()["params"]["ceiling_hz"] == 330.0
+    again.start()
+    settle(again)
+    cfg = FakeSession.created[-1].cfg
+    assert (cfg.params.f0_up_key, cfg.params.f0_ceiling_hz) == (6.0, 330.0)
+    assert (cfg.conditioning.max_gain_db, cfg.conditioning.trim_db) == (10.0, 0.0)
+    # the other model is untouched by Alpha's preset
+    assert again._params("Beta").f0_ceiling_hz == 0.0
+
+
+def test_gui_state_keeps_only_user_choices_so_new_defaults_reach_the_engine(env, monkeypatch):
+    c = env.make(model="Alpha")
+    c.set_gate(threshold_dbfs=-40)
+    c.set_exclusive(True)
+    settle(c)
+    saved = json.loads((env.profile / ctl.STATE_FILE).read_text())
+    assert saved == {"gate": {"threshold_dbfs": -40.0}, "exclusive": True}
+    c.shutdown()
+
+    from vox.config import defaults
+
+    monkeypatch.setattr(defaults, "DEFAULT_RUNTIME", dataclasses.replace(
+        defaults.DEFAULT_RUNTIME, volume_envelope=0.4))
+    monkeypatch.setattr(defaults, "DEFAULT_SHAPE", dataclasses.replace(
+        defaults.DEFAULT_SHAPE, decoder_context_ms=60.0, embed_pad_ms=20.0))
+    again = env.make(model="Alpha")
+    again.start()
+    settle(again)
+    cfg = FakeSession.created[-1].cfg
+    assert cfg.params.volume_envelope == 0.4
+    assert (cfg.shape.decoder_context_ms, cfg.shape.embed_pad_ms) == (60.0, 20.0)
+    assert cfg.gate.threshold_dbfs == -40.0 and cfg.exclusive is True
+
+
+def test_hop_snaps_to_whole_hubert_frames_even_when_saved_before(env):
+    (env.profile / ctl.STATE_FILE).write_text(json.dumps({"shape": {"block_ms": 30.0}}))
+    c = env.make(model="Alpha")
+    assert c.state()["shape"]["block_ms"] == 40.0  # an old saved 30 ms hop
+    assert c.set_shape(block_ms=50)["block_ms"] == 60.0
+    assert c.set_shape(block_ms=10)["block_ms"] == 20.0
+    c.start()
+    settle(c)
+    assert FakeSession.created[-1].cfg.shape.block_ms == 20.0
+
+
+def test_suppression_switches_live_and_is_remembered_per_microphone(env):
+    c = env.make(model="Alpha")
+    if not c.state()["suppression"]["available"]:
+        pytest.skip(c.state()["suppression"]["reason"])
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    assert c.state()["suppression"]["enabled"] is False
+    session.calls.clear()
+    assert c.set_suppression(enabled=True)["enabled"] is True
+    c.set_suppression(mix=0.5)
+    assert session.calls == [("conditioning", {"suppression_mix": 1.0, "suppression": True}),
+                             ("conditioning", {"suppression_mix": 0.5})]
+    assert c.state()["suppression"] == {"enabled": True, "available": True,
+                                        "reason": "switched here", "mix": 0.5}
+    assert len(FakeSession.created) == 1  # hot
+    c.stop()
+    settle(c)
+    c.start()
+    settle(c)
+    cfg = FakeSession.created[-1].cfg
+    assert cfg.suppression is True and cfg.conditioning.suppression_mix == 0.5  # Mic A
+    c.set_device("input", "Mic B")
+    settle(c)
+    assert FakeSession.created[-1].cfg.suppression is None  # never switched: default rule
+
+
+def test_broadcast_mic_defaults_suppression_off_and_warns_once_when_singing(env):
+    (env.profile / "calibration.json").write_text(json.dumps({"rnnoise_enabled": True}))
+    c = env.make(model="Alpha")
+    if not c.state()["suppression"]["available"]:
+        pytest.skip(c.state()["suppression"]["reason"])
+    assert c.state()["suppression"]["enabled"] is True  # the profile's default, plain mic
+    toasts = c.bus.subscribe()
+    c.set_device("input", BROADCAST)
+    settle(c)
+    suppression = c.state()["suppression"]
+    assert suppression["enabled"] is False and "NVIDIA Broadcast" in suppression["reason"]
+    assert not [t for t in drain(toasts, TOAST) if "sustained notes" in t["message"]]
+    c.set_preset("sing")
+    c.set_preset("speak")
+    c.set_preset("sing")
+    c.start()
+    settle(c)
+    warned = [t for t in drain(toasts, TOAST) if "sustained notes" in t["message"]]
+    assert len(warned) == 1 and warned[0]["kind"] == "warn"
+    assert warned[0]["message"] == ctl.BROADCAST_SING_WARNING

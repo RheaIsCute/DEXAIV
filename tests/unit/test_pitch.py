@@ -12,6 +12,7 @@ from vox.pitch.base import (
     interp_unvoiced,
     postprocess_f0,
     semitones_to_ratio,
+    soft_ceiling,
 )
 from vox.pitch.pitch_cache import PitchCache
 from vox.pitch.rmvpe import RmvpeExtractor
@@ -181,3 +182,45 @@ def test_pitch_cache_tail_longer_than_cache_keeps_the_newest_frames():
     fresh = torch.arange(32, dtype=torch.float32)
     cache.roll_and_write(fresh.long(), fresh)
     np.testing.assert_array_equal(cache.pitchf.numpy(), np.arange(20, 31))  # ends at fresh[-2]
+
+
+def test_pitch_cache_trim_tail_guard_drops_one_more_edge_frame():
+    """``f0_trim_tail = 2``: the newest RMVPE frame is never used either; what is written
+    still ends flush with the cache (as upstream does with one)."""
+    cache = PitchCache(convert_frames=10, shift_frames=1, p_len=10, device="cpu", trim_tail=2)
+    fresh = torch.arange(32, dtype=torch.float32)
+    cache.roll_and_write(fresh.long(), fresh)
+    np.testing.assert_array_equal(cache.pitchf.numpy(), np.arange(19, 30))  # ends at fresh[-3]
+    cache.trim_tail = 1  # a live switch (the pipeline recaptures the f0 graph after it)
+    cache.roll_and_write(fresh.long(), fresh)
+    assert cache.pitchf[-1] == 30.0
+
+
+def semitones(a, b) -> np.ndarray:
+    return 12 * np.log2(np.asarray(a, dtype=np.float64) / np.asarray(b, dtype=np.float64))
+
+
+def test_soft_ceiling_is_exact_below_the_knee_and_bends_toward_the_ceiling():
+    f = torch.tensor([0.0, 100.0, 250.0, 280.0, 300.0, 330.0, 400.0, 600.0, 1000.0])
+    out = soft_ceiling(f, 360.0)
+    knee = 360.0 * 2 ** (-4 / 12)  # 285.7 Hz
+    below = f <= knee
+    assert torch.equal(out[below], f[below])  # unvoiced and normal notes untouched
+    assert torch.all(torch.diff(out) > 0) and torch.all(out < 360.0)
+    flat = semitones(f[~below].numpy(), out[~below].numpy())
+    assert flat[0] < 0.05  # 300 Hz, just past the knee: practically untouched
+    assert flat[1] == pytest.approx(0.28, abs=0.05)  # 330 Hz: a slight bend
+    assert flat[2] == pytest.approx(2.24, abs=0.1)  # 400 Hz: off-key, a safety only
+    # inf is the "off" value on the hot path: an exact no-op
+    assert torch.equal(soft_ceiling(f, torch.tensor(float("inf"))), f)
+
+
+def test_ceiling_applies_after_the_transposition():
+    f0 = torch.tensor([0.0, 150.0, 200.0])
+    _, plain = postprocess_f0(f0, 2.0)  # an octave up: 300 and 400 Hz
+    coarse, bent = postprocess_f0(f0, 2.0, ceiling=360.0)
+    assert plain.tolist() == [0.0, 300.0, 400.0]
+    assert bent[0] == 0 and 285 < bent[1] < 300 and bent[2] < 360
+    assert coarse[0] == 1 and torch.equal(coarse, f0_to_coarse(bent))
+    _, off = postprocess_f0(f0, 2.0, ceiling=torch.tensor(float("inf")))
+    assert torch.equal(off, plain)

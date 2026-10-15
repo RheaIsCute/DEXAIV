@@ -134,9 +134,13 @@ function setToggle(id, rowId, info) {
   el.disabled = !info.available;
   if (rowId) {
     $(rowId).classList.toggle("off", !info.available);
-    $(rowId).title = info.available ? "" : "Not built into the engine yet";
+    $(rowId).title = info.available ? info.reason || "" : info.reason || "Not built into the engine yet";
   }
 }
+
+// The ceiling slider's left end (190) means "off"; the engine takes 0 for off.
+const CEILING_OFF = 190;
+const ceilingText = (hz) => (hz > 0 ? Math.round(hz) + " Hz" : "off");
 
 function render() {
   if (!state) return;
@@ -170,17 +174,21 @@ function render() {
 
   // pitch
   const calibrated = !!state.profile.calibrated;
+  const sing = !!params && params.preset === "sing";
   if (params) {
     setValue($("pitch"), params.pitch);
     if (document.activeElement !== $("pitch")) $("pitch-value").textContent = signed(params.pitch);
     const badge = $("pitch-badge");
     badge.hidden = !params.pitch_is_calibrated;
-    badge.textContent = calibrated ? "auto · calibrated" : "profile default";
+    badge.textContent = sing ? "sing default" : calibrated ? "auto · calibrated" : "profile default";
     badge.disabled = true;
+    document.querySelectorAll("#preset [data-preset]").forEach((b) => b.classList.toggle("on", b.dataset.preset === params.preset));
     setValue($("index-rate"), Math.round(params.index_rate * 100));
     $("index-rate-value").textContent = fixed(params.index_rate, 2);
     setValue($("protect"), Math.round(params.protect * 100));
     $("protect-value").textContent = fixed(params.protect, 2);
+    setValue($("ceiling"), params.ceiling_hz > 0 ? params.ceiling_hz : CEILING_OFF);
+    if (document.activeElement !== $("ceiling")) $("ceiling-value").textContent = ceilingText(params.ceiling_hz);
     setValue($("tracker"), params.f0_method);
     const lo = Math.round(params.f0_min_hz), hi = Math.round(params.f0_max_hz);
     $("clamp-note").textContent = calibrated
@@ -188,7 +196,9 @@ function render() {
       : "No calibration yet: the full " + lo + "–" + hi + " Hz range is tracked.";
   }
   $("pitch").disabled = !params;
-  $("conversion-badge").hidden = !calibrated;
+  document.querySelectorAll("#preset [data-preset]").forEach((b) => { b.disabled = !params; });
+  $("conversion-badge").hidden = !calibrated || sing;
+  $("preset-badge").hidden = !sing;
 
   // gate
   setValue($("gate-threshold"), gate.threshold_dbfs);
@@ -199,6 +209,10 @@ function render() {
   $("gate-on-2").checked = gate.enabled;
   const level = state.input_level || { auto: true, gain_db: 0 };
   setValue($("input-gain"), level.gain_db);
+  $("input-gain").disabled = !!level.trim_locked;
+  $("input-gain").closest("label").title = level.trim_locked
+    ? "Sing preset: trim 0 dB and auto level at most +" + Math.round(level.max_gain_db) + " dB, so held notes do not hit the limiter"
+    : "Trim on top of auto level (or the whole input gain with auto level off)";
   $("auto-level").checked = level.auto;
   renderInputGain();
   renderRecord();
@@ -206,6 +220,10 @@ function render() {
     ? "Threshold set from your calibration noise floor (" + Math.round(gate.noise_floor_dbfs) + " dB)"
     : "Not calibrated yet: the threshold is the profile default";
   setToggle("suppression", "suppression-row", state.suppression);
+  const sup = state.suppression;
+  $("suppression-mix-row").hidden = !(sup.available && sup.enabled);
+  setValue($("suppression-mix"), Math.round((sup.mix ?? 1) * 100));
+  if (document.activeElement !== $("suppression-mix")) $("suppression-mix-value").textContent = Math.round((sup.mix ?? 1) * 100) + " %";
   setToggle("monitor", "monitor-row", state.monitor);
   setToggle("autotune", "autotune-row", state.auto_tune);
 
@@ -302,7 +320,8 @@ function renderRecord() {
 // The trim the slider sets, plus (live, with auto level on) the total gain being applied.
 function renderInputGain() {
   const trim = +$("input-gain").value;
-  const text = signed(trim) + " dB";
+  const locked = !!(state && state.input_level && state.input_level.trim_locked);
+  const text = signed(trim) + " dB" + (locked ? " · Sing" : "");
   const live = meters.running && $("auto-level").checked && meters.in_gain_db != null;
   $("input-gain-value").textContent = live ? text + " · now " + signed(Math.round(meters.in_gain_db)) : text;
 }
@@ -497,6 +516,19 @@ function wire() {
   $("index-rate").addEventListener("input", (e) => { $("index-rate-value").textContent = (e.target.value / 100).toFixed(2); sendIndex(e.target.value / 100); });
   const sendProtect = throttled((v) => cmd("set_param", { name: "protect", value: v }));
   $("protect").addEventListener("input", (e) => { $("protect-value").textContent = (e.target.value / 100).toFixed(2); sendProtect(e.target.value / 100); });
+  const sendCeiling = throttled((v) => cmd("set_param", { name: "ceiling", value: v }));
+  $("ceiling").addEventListener("input", (e) => {
+    const hz = +e.target.value <= CEILING_OFF ? 0 : +e.target.value;
+    $("ceiling-value").textContent = ceilingText(hz);
+    sendCeiling(hz);
+  });
+  $("preset").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-preset]");
+    if (b && !b.classList.contains("on")) cmd("set_preset", { preset: b.dataset.preset });
+  });
+  $("suppression").addEventListener("change", (e) => cmd("set_suppression", { enabled: e.target.checked }));
+  const sendMix = throttled((v) => cmd("set_suppression", { mix: v }));
+  $("suppression-mix").addEventListener("input", (e) => { $("suppression-mix-value").textContent = e.target.value + " %"; sendMix(e.target.value / 100); });
 
   // Restart-class controls send once, when the user lets go.
   $("hop").addEventListener("input", (e) => { $("hop-value").textContent = e.target.value + " ms"; });

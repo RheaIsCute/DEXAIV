@@ -92,13 +92,16 @@ class Synthesizer(nn.Module):
     def infer(self, phone: Tensor, lengths: Tensor, pitch: Tensor | None,
               pitchf: Tensor | None, sid: Tensor, skip_head: int = 0,
               return_length: int | None = None, dec_context: int = 0,
-              noise: Tensor | None = None, source_noise: Tensor | None = None) -> Tensor:
+              noise: Tensor | None = None, source_noise: Tensor | None = None,
+              phase: Tensor | None = None, phase_frames: int = 0) -> Tensor:
         """Returns audio ``[b, 1, return_length * upp]`` at the model sample rate.
 
         ``dec_context`` frames ahead of the tail are decoded too and their samples dropped.
         The receptive field of the decoder is roughly +-90 ms; without left context a short
         tail (a 20 ms hop decodes ~60 ms) is rendered entirely against zero padding. This
         costs compute, not latency. ``dec_context=0`` is the upstream behaviour.
+        ``phase`` / ``phase_frames``: the NSF sine's carried phase (``SineGen``), counted
+        from the first decoded frame.
         """
         dec_context = min(dec_context, skip_head) if return_length is not None else 0
         z, g = self.infer_latent(phone, lengths, pitch, sid, skip_head, return_length,
@@ -108,7 +111,8 @@ class Synthesizer(nn.Module):
         else:
             if return_length is not None:
                 pitchf = pitchf[:, skip_head - dec_context:skip_head + return_length]
-            audio = self.dec(z, pitchf, g=g, source_noise=source_noise)
+            audio = self.dec(z, pitchf, g=g, source_noise=source_noise, phase=phase,
+                             phase_frames=phase_frames)
         return audio[:, :, dec_context * self.upp:]
 
 

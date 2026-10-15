@@ -88,7 +88,7 @@ class FullFileConverter:
             coarse, cont = postprocess_f0(
                 self.extractor.extract(wave), semitones_to_ratio(params.f0_up_key),
                 params.f0_min_hz, params.f0_max_hz, params.f0_unvoiced == "interp",
-                round(params.f0_bridge_ms / 10.0))
+                round(params.f0_bridge_ms / 10.0), params.f0_ceiling_hz)
             if f0_contour_scale != 1.0:
                 coarse, cont = scale_contour(cont, f0_contour_scale, t_pad // WINDOW)
             pitch, pitchf = coarse[:p_len].unsqueeze(0), cont[:p_len].unsqueeze(0)

@@ -31,9 +31,10 @@ from typing import Any
 
 import numpy as np
 
-from vox.api.control import LiveConfig, LiveSession
+from vox.api.control import BROADCAST_MARKER, LiveConfig, LiveSession, resolve_suppression
 from vox.api.events import METERS, PERF, STATE, TOAST, EventBus
 from vox.audio import devices as audio_devices
+from vox.audio import suppression as rnnoise
 from vox.audio.conditioning import ConditioningConfig
 from vox.audio.resample import resample_array
 from vox.config.schemas import RuntimeParams, ShapeParams
@@ -58,9 +59,23 @@ INDEX_PRIME = 1e-6  # see _start: keeps the index loaded so its rate stays a hot
 PREVIEW_TEXT = "Hi, this is a quick preview of this voice."
 STAGE_LABELS = {"f0": "F0", "embed": "ContentVec", "index": "Index kNN", "synth": "Synth",
                 "sola": "SOLA"}
-HOT_PARAMS = {"pitch": "f0_up_key", "index_rate": "index_rate", "protect": "protect"}
-PARAM_RANGES = {"pitch": (-24.0, 24.0), "index_rate": (0.0, 1.0), "protect": (0.0, 0.5)}
+HOT_PARAMS = {"pitch": "f0_up_key", "index_rate": "index_rate", "protect": "protect",
+              "ceiling": "f0_ceiling_hz"}
+PARAM_RANGES = {"pitch": (-24.0, 24.0), "index_rate": (0.0, 1.0), "protect": (0.0, 0.5),
+                "ceiling": (0.0, 1100.0)}  # ceiling 0 = off
 INPUT_GAIN_RANGE = (-12.0, 24.0)  # the input-gain trim slider, dB
+# Speak / Sing presets, per model (docs/DEVIATIONS.md §8). Each keeps its own pitch, index
+# rate, protect and F0 ceiling; Speak is what the model entry always held. Sing starts from
+# these until the user moves a slider in Sing: the Speak pitch shifted down (a sung line
+# sits 5-9 semitones above the speaking voice), less index (speech vectors smear sung
+# vowels), more protect, and the soft F0 ceiling on. Sung notes also get a gentler input
+# chain: auto level boosts at most +10 dB and the trim slider is out (0 dB).
+PRESETS = ("speak", "sing")
+SING_PITCH_OFFSET = -5.0  # semitones from the Speak pitch; ``sing_pitch_offset`` overrides
+SING_DEFAULTS = {"index_rate": 0.3, "protect": 0.35, "ceiling": 360.0}
+SING_MAX_GAIN_DB = 10.0
+BROADCAST_SING_WARNING = ("Broadcast's noise removal can cut sustained notes — use your mic "
+                          "directly or turn its noise removal off for singing.")
 
 
 class ApiError(Exception):
@@ -158,6 +173,7 @@ class EngineController:
         self.perf_history: deque[dict[str, Any]] = deque(maxlen=PERF_HISTORY)
         self._rebuilds_seen = 0
         self._recapturing = False
+        self._warned_broadcast_sing = False  # the toast is shown once per app run
 
         self._tts = None
         self._tts_speaking_until = 0.0
@@ -193,10 +209,12 @@ class EngineController:
     # ------------------------------------------------------------------ persistence
 
     def _load_store(self) -> dict[str, Any]:
+        """What the user changed in the window. ``None`` / absent = not changed: the value
+        then comes from the profile and the engine defaults, never from a saved copy."""
         store: dict[str, Any] = {"model": None, "models": {}, "input": None, "output": None,
-                                 "exclusive": False, "gate": {}, "shape": {},
+                                 "exclusive": None, "gate": {}, "shape": {},
                                  "f0_method": None, "graphs": None, "tts": {},
-                                 "input_level": {}}
+                                 "input_level": {}, "suppression": {}}
         path = self.profile_dir / STATE_FILE
         if path.is_file():
             try:
@@ -206,8 +224,16 @@ class EngineController:
         return store
 
     def _save_store(self) -> None:
+        """Only the user's choices are written: unset (None) keys and empty groups are left
+        out, so a new engine default is never shadowed by a stale saved value."""
+        def compact(value: Any) -> Any:
+            if isinstance(value, dict):
+                kept = {k: compact(v) for k, v in value.items()}
+                return {k: v for k, v in kept.items() if v is not None and v != {}}
+            return value
+
         try:
-            save_json(self.profile_dir / STATE_FILE, self.store)
+            save_json(self.profile_dir / STATE_FILE, compact(self.store))
         except OSError as err:
             self._log(f"could not save {STATE_FILE}: {err}")
 
@@ -225,18 +251,55 @@ class EngineController:
         except MetadataError as err:
             raise ApiError(str(err)) from err
 
+    def _preset(self, name: str | None = None) -> str:
+        name = name or self.model
+        entry = self.store["models"].get(name, {}) if name else {}
+        return "sing" if entry.get("preset") == "sing" else "speak"
+
+    def _preset_store(self, name: str) -> dict[str, Any]:
+        """Where the active preset's slider values live: the model entry itself for Speak
+        (as before presets existed), its ``sing`` sub-entry for Sing."""
+        entry = self._model_store(name)
+        return entry.setdefault("sing", {}) if self._preset(name) == "sing" else entry
+
+    def _sing_pitch(self, speak_pitch: float) -> float:
+        offset = self.store.get("sing_pitch_offset")
+        offset = SING_PITCH_OFFSET if offset is None else float(offset)
+        low, high = PARAM_RANGES["pitch"]
+        return min(high, max(low, speak_pitch + offset))
+
     def _params(self, name: str | None = None, calibrated: bool = False) -> RuntimeParams:
-        """Profile + model config, then what the user changed here (unless ``calibrated``)."""
+        """Profile + model config, then what the user changed here (unless ``calibrated``),
+        then the Sing preset when it is the model's active one."""
         config = self._config(name)
         overrides: dict[str, Any] = {"f0_method": self.store.get("f0_method")}
+        entry = self.store["models"].get(config.name, {})
         if not calibrated:
-            user = self.store["models"].get(config.name, {})
-            overrides.update({field: user.get(key) for key, field in HOT_PARAMS.items()})
-        return resolve_runtime_params(self.profile, config, overrides)
+            overrides.update({field: entry.get(key) for key, field in HOT_PARAMS.items()})
+        params = resolve_runtime_params(self.profile, config, overrides)
+        if calibrated or self._preset(config.name) != "sing":
+            return params
+        sing = {**SING_DEFAULTS, "pitch": self._sing_pitch(params.f0_up_key),
+                **entry.get("sing", {})}
+        return dataclasses.replace(params, **{field: float(sing[key])
+                                              for key, field in HOT_PARAMS.items()})
+
+    def _pitch_default(self, params: RuntimeParams) -> float:
+        """What "back to default" sets the pitch to: the calibrated value in Speak, the
+        Speak pitch shifted by the Sing offset in Sing."""
+        if self._preset() == "sing":
+            entry = self.store["models"].get(self._config().name, {})
+            speak = entry.get("pitch")
+            if speak is None:
+                speak = self._params(calibrated=True).f0_up_key
+            return self._sing_pitch(speak)
+        return self._params(calibrated=True).f0_up_key
 
     def _shape(self) -> ShapeParams:
         shape = self.profile.runtime.shape()
         user = {k: v for k, v in self.store["shape"].items() if k in ("block_ms", "extra_ms")}
+        if "block_ms" in user:  # saved before hops snapped to 20 ms (docs/DEVIATIONS.md §8)
+            user["block_ms"] = chunker.snap_block_ms(user["block_ms"])
         return dataclasses.replace(shape, **user)
 
     def _precision(self):
@@ -255,12 +318,61 @@ class EngineController:
 
     def _conditioning(self) -> ConditioningConfig:
         """The mic input chain: auto level (on unless switched off here) and the input-gain
-        slider as a trim on top of calibration's input gain."""
+        slider as a trim on top of calibration's input gain. The Sing preset caps the auto
+        level's boost and leaves the trim out, so held notes do not ride the limiter."""
         cal = self.profile.calibration
         user = self.store["input_level"]
-        return ConditioningConfig(auto_level=user.get("auto", True),
-                                  trim_db=cal.input_gain_db + user.get("gain_db", 0.0),
-                                  noise_floor_dbfs=cal.noise_floor_dbfs)
+        sing = self.model is not None and self._preset() == "sing"
+        config = ConditioningConfig(auto_level=user.get("auto", True),
+                                    trim_db=cal.input_gain_db + (
+                                        0.0 if sing else user.get("gain_db", 0.0)),
+                                    noise_floor_dbfs=cal.noise_floor_dbfs,
+                                    suppression_mix=self._suppression_mix())
+        if sing:
+            config = dataclasses.replace(config, max_gain_db=SING_MAX_GAIN_DB)
+        return config
+
+    # suppression (RNNoise) -----------------------------------------------------------
+
+    def _input_name(self) -> str | None:
+        """The microphone in use (or about to be): the session's, else the selected one."""
+        session = self.session
+        if session is not None and getattr(session, "in_device", None) is not None:
+            return session.in_device.name
+        current = self._devices().get("input")
+        return current["name"] if current else self.store.get("input")
+
+    def _suppression_mix(self) -> float:
+        mix = self.store["suppression"].get("mix")
+        return 1.0 if mix is None else float(mix)
+
+    def _suppression_choice(self, input_name: str | None) -> bool | None:
+        """The user's explicit on/off for this microphone, None if never switched. Kept per
+        input so the NVIDIA Broadcast mic keeps its own default (off, TARGET.md)."""
+        return self.store["suppression"].get("by_input", {}).get(input_name or "")
+
+    def _suppression_state(self) -> dict[str, Any]:
+        reason = rnnoise.unavailable_reason(self._shape().device_sr)
+        session = self.session
+        name = self._input_name()
+        if session is not None and self.status == "running":
+            enabled, why = session.suppression, getattr(session, "suppression_why", "")
+        else:
+            enabled, why = resolve_suppression(self._suppression_choice(name),
+                                               self.profile.calibration.rnnoise_enabled, name)
+        why = {"explicit": "your choice for this microphone",
+               "profile": "the profile's default"}.get(why, why)
+        return {"enabled": bool(enabled) and reason is None, "available": reason is None,
+                "reason": reason or why, "mix": self._suppression_mix()}
+
+    def _warn_broadcast_sing(self, input_name: str | None = None) -> None:
+        """Once per run: Broadcast's own noise removal and sustained notes do not mix."""
+        if self._warned_broadcast_sing or self.model is None or self._preset() != "sing":
+            return
+        name = input_name or self._input_name() or ""
+        if BROADCAST_MARKER in name.lower():
+            self._warned_broadcast_sing = True
+            self.toast(BROADCAST_SING_WARNING, "warn")
 
     # ------------------------------------------------------------------------ state
 
@@ -427,14 +539,16 @@ class EngineController:
         with self._lock:
             models = self._models()
             active = next((m for m in models if m["active"]), None)
-            params = calibrated = None
+            params = None
             if active is not None:
                 params = self._params()
-                calibrated = self._params(calibrated=True)
+                default_pitch = self._pitch_default(params)
+                preset = self._preset()
             shape, gate, precision = self._shape(), self._gate(), self._precision()
             session = self.session
             running = self.status == "running" and session is not None
-            f0_profile = self.profile.voice_profile.f0_extractor
+            calibrated_f0 = self.profile.voice_profile.f0_extractor.f0_min_hz is not None
+            sing = params is not None and preset == "sing"
             import torch
 
             cuda = torch.cuda.is_available()
@@ -450,17 +564,23 @@ class EngineController:
                 "params": None if params is None else {
                     "pitch": params.f0_up_key, "index_rate": params.index_rate,
                     "protect": params.protect, "f0_method": params.f0_method,
-                    "calibrated_pitch": calibrated.f0_up_key,
-                    "pitch_is_calibrated": params.f0_up_key == calibrated.f0_up_key,
-                    "f0_min_hz": f0_profile.f0_min_hz, "f0_max_hz": f0_profile.f0_max_hz,
+                    "ceiling_hz": params.f0_ceiling_hz,
+                    "preset": preset, "presets": list(PRESETS),
+                    "calibrated_pitch": default_pitch,
+                    "pitch_is_calibrated": params.f0_up_key == default_pitch,
+                    "f0_min_hz": params.f0_min_hz, "f0_max_hz": params.f0_max_hz,
+                    "f0_calibrated": calibrated_f0,
                 },
                 "gate": {"enabled": gate.enabled, "threshold_dbfs": gate.threshold_dbfs,
                          "noise_floor_dbfs": self.profile.calibration.noise_floor_dbfs},
                 "input_level": {"auto": self.store["input_level"].get("auto", True),
-                                "gain_db": self.store["input_level"].get("gain_db", 0.0),
+                                "gain_db": 0.0 if sing
+                                else self.store["input_level"].get("gain_db", 0.0),
+                                "trim_locked": sing,
+                                "max_gain_db": self._conditioning().max_gain_db,
                                 "range_db": list(INPUT_GAIN_RANGE)},
+                "suppression": self._suppression_state(),
                 # Not built in the engine yet: shown, not switchable (docs/DEVIATIONS.md).
-                "suppression": {"enabled": False, "available": False},
                 "monitor": {"enabled": False, "available": False},
                 "auto_tune": {"enabled": False, "available": False},
                 "shape": {"block_ms": shape.block_ms, "extra_ms": shape.extra_ms,
@@ -549,6 +669,7 @@ class EngineController:
             exclusive=bool(self.store.get("exclusive")), input_file=self.input_file,
             loop_file=self.loop_file, device=self.device, registry=self.registry,
             cache=self.cache, profile_dir=self.profile_dir,
+            suppression=self._suppression_choice(self._input_name()),
             suppression_profile=self.profile.calibration.rnnoise_enabled)
         self.status, self.error = "starting", None
         self.perf, self._rebuilds_seen, self._recapturing = None, 0, False
@@ -572,6 +693,7 @@ class EngineController:
         self.status = "running"
         self.store["model"] = config.name
         self._save_store()
+        self._warn_broadcast_sing()
 
     def _stop(self) -> None:
         session, self.session = self.session, None
@@ -632,8 +754,7 @@ class EngineController:
         low, high = PARAM_RANGES[name]
         value = min(high, max(low, float(value)))
         with self._lock:
-            self._config()
-            self._model_store(self.model)[name] = value
+            self._preset_store(self._config().name)[name] = value  # the active preset's
             session = self.session
             if session is not None:
                 session.set_params(**{HOT_PARAMS[name]: value})
@@ -642,15 +763,40 @@ class EngineController:
         return {name: value}
 
     def reset_pitch(self) -> dict[str, Any]:
-        """Back to the calibrated transposition."""
+        """Back to the calibrated transposition (Speak) or the Speak pitch plus the Sing
+        offset (Sing)."""
         with self._lock:
-            self._model_store(self._config().name).pop("pitch", None)
+            self._preset_store(self._config().name).pop("pitch", None)
             value = self._params().f0_up_key
             if self.session is not None:
                 self.session.set_params(f0_up_key=value)
             self._save_store()
         self.publish_state()
         return {"pitch": value}
+
+    def set_preset(self, preset: str) -> dict[str, Any]:
+        """Speak / Sing for the current model: its own pitch, index rate, protect and F0
+        ceiling, and the input chain's singing limits. Hot: nothing is recaptured."""
+        if preset not in PRESETS:
+            raise ApiError(f"unknown preset {preset!r}")
+        with self._lock:
+            entry = self._model_store(self._config().name)
+            if preset == "sing":
+                entry["preset"] = "sing"
+            else:
+                entry.pop("preset", None)
+            params = self._params()
+            session = self.session
+            if session is not None:
+                session.set_params(**{field: getattr(params, field)
+                                      for field in HOT_PARAMS.values()})
+                config = self._conditioning()
+                session.set_conditioning(auto_level=config.auto_level, trim_db=config.trim_db,
+                                         max_gain_db=config.max_gain_db)
+            self._save_store()
+        self._warn_broadcast_sing()
+        self.publish_state()
+        return {"preset": preset, "pitch": params.f0_up_key}
 
     def set_gate(self, enabled: bool | None = None,
                  threshold_dbfs: float | None = None) -> dict[str, Any]:
@@ -684,8 +830,32 @@ class EngineController:
         self.publish_state()
         return {"auto": config.auto_level, "gain_db": user.get("gain_db", 0.0)}
 
-    def set_suppression(self, enabled: bool) -> None:
-        raise ApiError("Noise suppression (RNNoise) is not built into the engine yet")
+    def set_suppression(self, enabled: bool | None = None,
+                        mix: float | None = None) -> dict[str, Any]:
+        """RNNoise on the mic (after the high-pass, before auto level and the gate): on/off
+        for the current microphone, and the wet/dry ``mix``. Hot, crossfaded (~20 ms)."""
+        reason = rnnoise.unavailable_reason(self._shape().device_sr)
+        if enabled and reason is not None:
+            raise ApiError(f"Noise suppression is unavailable: {reason}")
+        with self._lock:
+            user = self.store["suppression"]
+            if enabled is not None:
+                user.setdefault("by_input", {})[self._input_name() or ""] = bool(enabled)
+            if mix is not None:
+                user["mix"] = min(1.0, max(0.0, float(mix)))
+            session = self.session
+            if session is not None:
+                changes: dict[str, Any] = {"suppression_mix": self._suppression_mix()}
+                if enabled is not None:
+                    changes["suppression"] = bool(enabled)
+                session.set_conditioning(**changes)
+                if enabled is not None:
+                    session.suppression = bool(enabled)
+                    session.suppression_why = "switched here"
+            self._save_store()
+            result = self._suppression_state()
+        self.publish_state()
+        return result
 
     def set_monitor(self, enabled: bool) -> None:
         raise ApiError("Headphone monitoring is not built into the engine yet")
@@ -704,6 +874,8 @@ class EngineController:
             shape = self._shape()
             changes = {k: float(v) for k, v in (("block_ms", block_ms), ("extra_ms", extra_ms))
                        if v is not None}
+            if "block_ms" in changes:  # whole 20 ms HuBERT frames: hubert_phase_stable
+                changes["block_ms"] = chunker.snap_block_ms(changes["block_ms"])
             shape = dataclasses.replace(shape, **changes)
             if self.model is not None:
                 try:  # reject a plan the chunker would refuse before the worker sees it
@@ -745,6 +917,8 @@ class EngineController:
             raise ApiError(f"unknown device kind {kind!r}")
         self.store[kind] = name or None
         self._save_store()
+        if kind == "input" and name:
+            self._warn_broadcast_sing(name)
         self.publish_state()
         return self._submit("Reopening audio", self._restart)
 
@@ -1168,7 +1342,8 @@ COMMANDS = {
     "start": "start", "stop": "stop", "get_state": "get_state", "shutdown": "shutdown",
     "set_param": "set_param", "reset_pitch": "reset_pitch", "set_gate": "set_gate",
     "set_input_level": "set_input_level", "record": "record",
-    "set_suppression": "set_suppression", "set_monitor": "set_monitor",
+    "set_suppression": "set_suppression", "set_preset": "set_preset",
+    "set_monitor": "set_monitor",
     "set_auto_tune": "set_auto_tune", "set_shape": "set_shape", "set_graphs": "set_graphs",
     "set_exclusive": "set_exclusive", "set_device": "set_device",
     "select_model": "select_model", "set_index": "set_index", "import_model": "import_model",

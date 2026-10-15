@@ -26,6 +26,9 @@ DEFAULT_RUNTIME = RuntimeParams(
     protect=0.33,
     volume_envelope=1.0,
     f0_method="rmvpe",
+    # RMVPE right-edge guard (docs/DEVIATIONS.md §8.4): the seam pitch step on held notes
+    # halves (p95 21 -> 10 cents); F0 lands 10 ms later against the features.
+    f0_trim_tail=2,
 )
 
 # Blackwell defaults (TARGET.md rule 2): TF32 on; HuBERT autocast "auto" tries FP16 then

@@ -73,7 +73,13 @@
 
       <section class="panel flex1 col" style="gap:10px">
         <div class="row between center">
-          <div class="label">Pitch</div>
+          <div class="row center" style="gap:10px">
+            <div class="label">Pitch</div>
+            <div class="seg" id="preset" role="group" aria-label="Speak or sing">
+              <button data-preset="speak" class="on" title="Speaking: your usual pitch and settings">Speak</button>
+              <button data-preset="sing" title="Singing: lower pitch, less index, a soft pitch ceiling and a gentler input level — all kept separately for this voice">Sing</button>
+            </div>
+          </div>
           <button class="badge good" id="pitch-badge" title="Back to this value">auto · calibrated</button>
         </div>
         <div class="row baseline" style="gap:8px">
@@ -118,6 +124,10 @@
         <label class="toggle"><span>Noise gate</span><input type="checkbox" id="gate-on"></label>
         <label class="toggle" title="Brings your microphone to a steady speaking level before conversion"><span>Auto level</span><input type="checkbox" id="auto-level"></label>
         <label class="toggle" id="suppression-row"><span>Suppression</span><input type="checkbox" id="suppression"></label>
+        <label class="col" style="gap:5px" id="suppression-mix-row" hidden title="How much of the denoised signal is used: lower keeps more of your own voice (sustained sung notes)">
+          <span class="row between sub">Amount <span class="num strong" id="suppression-mix-value">100 %</span></span>
+          <input type="range" id="suppression-mix" min="0" max="100" step="5" value="100">
+        </label>
         <div class="hint" id="noise-floor"></div>
       </div>
     </section>
@@ -266,6 +276,7 @@
       <section class="panel flex1 col" style="gap:14px">
         <div class="row between center">
           <div class="label">Conversion</div>
+          <span class="badge" id="preset-badge" hidden>Sing preset</span>
           <span class="badge good" id="conversion-badge">from calibration</span>
         </div>
         <label class="col" style="gap:6px">
@@ -275,6 +286,10 @@
         <label class="col" style="gap:6px">
           <span class="row between sub">Protect consonants <span class="num strong" id="protect-value">0.33</span></span>
           <input type="range" id="protect" min="0" max="50" value="33">
+        </label>
+        <label class="col" style="gap:6px" title="Bends very high notes down softly so the voice does not crack. A safety, not a fix: notes far above it come out flat (off-key).">
+          <span class="row between sub">Pitch ceiling <span class="num strong" id="ceiling-value">off</span></span>
+          <input type="range" id="ceiling" min="190" max="600" step="10" value="190">
         </label>
         <label class="col" style="gap:6px">
           <span class="sub">Pitch tracker</span>
@@ -293,7 +308,7 @@
         </div>
         <label class="col" style="gap:6px">
           <span class="row between sub">Hop size <span class="num strong" id="hop-value">20 ms</span></span>
-          <input type="range" id="hop" min="10" max="100" value="20" step="10">
+          <input type="range" id="hop" min="20" max="100" value="20" step="20">
         </label>
         <label class="col" style="gap:6px">
           <span class="row between sub">Context history <span class="num strong" id="context-value">1000 ms</span></span>

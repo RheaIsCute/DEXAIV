@@ -66,8 +66,16 @@ def load_as(cls: type[T], path: Path) -> T:
     return from_dict(cls, data)
 
 
+def _drop_unset(data: Any) -> Any:
+    """Remove ``None`` values from (nested) dicts: an unset field is not written, so it
+    keeps falling through to the engine default when the file is read back."""
+    if isinstance(data, dict):
+        return {k: _drop_unset(v) for k, v in data.items() if v is not None}
+    return data
+
+
 def save_as(obj: Any, path: Path) -> None:
-    save_json(path, to_dict(obj))
+    save_json(path, _drop_unset(to_dict(obj)))
 
 
 @dataclass
@@ -136,9 +144,9 @@ def resolve_runtime_params(
         layers.append({**model_config.defaults, "sid": model_config.sid})
     if profile is not None:
         f0 = profile.voice_profile.f0_extractor
-        layers.append(
-            {"f0_method": f0.method, "f0_min_hz": f0.f0_min_hz, "f0_max_hz": f0.f0_max_hz}
-        )
+        calibrated = {"f0_method": f0.method, "f0_min_hz": f0.f0_min_hz,
+                      "f0_max_hz": f0.f0_max_hz}
+        layers.append({k: v for k, v in calibrated.items() if v is not None})
         if model_config is not None:
             layers.append(profile.model_overrides.models.get(model_config.name, {}))
     if cli_overrides:

@@ -83,11 +83,13 @@ def test_seeded_full_file_render_is_reproducible(engine, clip_48k, full):
 # seam metric (seam vs mid-hop roughness) reads that as 1.3-1.4x. The pre-fix geometry
 # (30 ms overlap at the 20 ms hop, a three-render blend, ``overlap_beyond_hop``) reads ~1.0x
 # and passes. Which one ships is a listening decision (out/ab/reference.wav vs
-# sola_blend3.wav); until it is made these record the regression. Strict: once the default
-# changes back they pass, and the marker has to go.
+# sola_blend3.wav); until it is made these record the regression. Not strict: the ratio
+# moves with the decoder-noise seed alone (8 s clip, seeds 0-2: 1.20-1.34 on the 48 kHz test
+# voice, 1.18-1.45 on the 40 kHz one, docs/DEVIATIONS.md §8), so one seed can land under the
+# 1.25 guard without anything having changed.
 OVERLAP_EQUALS_HOP = pytest.mark.xfail(
-    strict=True, reason="20 ms overlap == 20 ms hop: seam roughness 1.3-1.4x, see "
-                        "docs/DEVIATIONS.md §7 (pending the listening A/B)")
+    strict=False, reason="20 ms overlap == 20 ms hop: seam roughness ~1.2-1.45x, see "
+                         "docs/DEVIATIONS.md §7 (pending the listening A/B)")
 
 
 @OVERLAP_EQUALS_HOP
@@ -146,12 +148,17 @@ def test_profiler_report_covers_every_stage(engine, streamed):
 
 
 def test_pitch_cache_matches_full_window_f0(engine, clip_48k):
-    """Tail-only F0 spliced through the rolling cache agrees with full-file extraction."""
+    """Tail-only F0 spliced through the rolling cache agrees with full-file extraction.
+
+    Each cached frame is compared at the frame it was estimated for. With
+    ``f0_trim_tail`` = t the cache ends t frames before the window does (t = 1 upstream;
+    the default t = 2 puts F0 10 ms later against the features: docs/DEVIATIONS.md §8)."""
     from vox.audio.resample import resample_array
 
     plan, pipeline = engine.plan, engine.pipeline
     pipeline.reset()
-    interior = plan.f0_tail_16k // 160 + 1 - 4  # frames each hop rewrites
+    trim = pipeline.pitch_cache.trim_tail
+    interior = plan.f0_tail_16k // 160 + 1 - 3 - trim  # frames each hop rewrites
     settled = []
     hops = len(clip_48k) // plan.block
     for n in range(hops):
@@ -161,9 +168,9 @@ def test_pitch_cache_matches_full_window_f0(engine, clip_48k):
         cache = pipeline.pitch_cache.pitchf
         settled.append(cache[-interior:-interior + plan.shift_frames].clone())
     stream_f0 = torch.cat(settled).cpu().numpy()
-    # After hop n the window ends at frame (n+1)*shift and cache[-1] is the frame before
-    # it, so the first settled frame of hop 0 is frame ``shift - interior``.
-    first = plan.shift_frames - interior
+    # After hop n the window ends at frame (n+1)*shift and cache[-1] is the frame ``trim``
+    # before it, so the first settled frame of hop 0 is frame ``shift - interior + 1 - trim``.
+    first = plan.shift_frames - interior + 1 - trim
     audio_16k = torch.from_numpy(resample_array(clip_48k, SR, 16000)).to(engine.device)
     full_f0 = pipeline.extractor.extract(audio_16k).cpu().numpy()
     frames = np.arange(first, first + len(stream_f0))

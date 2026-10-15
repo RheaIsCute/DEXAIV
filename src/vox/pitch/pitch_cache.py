@@ -14,14 +14,19 @@ import torch
 from torch import Tensor
 
 TRIM_HEAD = 3
-TRIM_TAIL = 1
+TRIM_TAIL = 1  # upstream; ``RuntimeParams.f0_trim_tail`` = 2 is the A/B right-edge guard
 
 
 class PitchCache:
     def __init__(self, convert_frames: int, shift_frames: int, p_len: int,
-                 device: torch.device | str) -> None:
+                 device: torch.device | str, trim_tail: int = TRIM_TAIL) -> None:
         self.length = convert_frames + 1  # +1: extractors emit one more frame than n // 160
         self.shift = shift_frames
+        # Fresh frames dropped at the right edge, where the tracker (RMVPE's BiGRU) has the
+        # least right context. Like upstream, the rest is written flush with the end of the
+        # cache, so each extra frame trimmed also delays the pitch by 10 ms against the
+        # features. Part of the f0 stage's op sequence: changing it means a recapture.
+        self.trim_tail = trim_tail
         if not 0 < shift_frames < self.length:
             raise ValueError("hop must be shorter than the conversion window")
         self.pitch = torch.ones(self.length, dtype=torch.long, device=device)
@@ -39,8 +44,8 @@ class PitchCache:
         self.pitch[:-self.shift].copy_(self._tmp_pitch)
         self._tmp_pitchf.copy_(self.pitchf[self.shift:])
         self.pitchf[:-self.shift].copy_(self._tmp_pitchf)
-        interior = min(coarse.shape[0] - TRIM_HEAD - TRIM_TAIL, self.length)
-        end = coarse.shape[0] - TRIM_TAIL
+        interior = min(coarse.shape[0] - TRIM_HEAD - self.trim_tail, self.length)
+        end = coarse.shape[0] - self.trim_tail
         self.pitch[-interior:].copy_(coarse[end - interior:end])
         self.pitchf[-interior:].copy_(pitchf[end - interior:end])
 

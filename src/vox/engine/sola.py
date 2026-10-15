@@ -14,8 +14,9 @@ so the hop has no ``.item()`` sync and the stage is CUDA-graph capturable. ``sti
 
 Gate protocol hooks (docs/research/03 §5, Applio): ``begin_drain`` / ``drain_step`` fade
 the saved tail out over exactly one overlap when the gate closes; ``zero`` forgets it. A
-zero tail makes the next hop fade in from silence through the ordinary crossfade, which is
-the onset fade.
+zero tail makes the next hop fade in from silence through the ordinary crossfade; on a
+gate onset (``mark_onset``) that fade is shortened to ``plan.onset_ramp`` samples, because
+the head of that hop is decoded audio from just before the onset (docs/DEVIATIONS.md §8).
 
 The overlap does not exceed the hop (the chunker clamps it unless ``overlap_beyond_hop``
 asks otherwise, an A/B setting): every emitted sample is then a sin^2 / cos^2 mix of at
@@ -49,6 +50,20 @@ class Sola:
         ramp = torch.linspace(0.0, 1.0, n, device=device)
         self.fade_in = torch.sin(0.5 * math.pi * ramp) ** 2
         self.fade_out = 1.0 - self.fade_in
+        # Gate onset (``mark_onset``): the tail is silent, so the plain crossfade would fade
+        # the hop in over the whole overlap, and that head is decoded pre-onset audio (the
+        # consonant the gate opened on). A short sin^2 ramp keeps it. A 0-dim weight picks
+        # the fade inside the captured graph, so an onset never changes the op sequence.
+        r = plan.onset_ramp
+        if 0 < r < n:
+            short = torch.ones(n, device=device)
+            short[:r] = torch.sin(0.5 * math.pi * torch.linspace(0.0, 1.0, r, device=device)) ** 2
+        else:
+            short = self.fade_in.clone()
+        self._fade_onset = short
+        self._onset = torch.zeros((), device=device)
+        self._onset_marked = False
+        self._fade_w = torch.zeros(n, device=device)
         self.buffer = torch.zeros(n, device=device)  # previous hop's tail
         self._ones = torch.ones(1, 1, n, device=device)
         self._base = torch.arange(self.block + n, device=device)
@@ -75,7 +90,18 @@ class Sola:
     @torch.inference_mode()
     def stitch(self, infer: Tensor) -> Tensor:
         """``[block + overlap + search]`` -> ``[block]`` (a view valid until the next call)."""
-        return self._impl(infer)
+        out = self._impl(infer)
+        if self._onset_marked:  # one hop only; queued after the stitch on the stream
+            self._onset.fill_(0.0)
+            self._onset_marked = False
+        return out
+
+    def mark_onset(self) -> None:
+        """The next ``stitch`` is a gate onset: fade in over ``plan.onset_ramp`` samples
+        instead of the overlap. Call only with a silent tail (after a finished drain or a
+        reset); ``plain`` mode only."""
+        self._onset.fill_(1.0)
+        self._onset_marked = True
 
     def _stitch_eager(self, infer: Tensor) -> Tensor:
         offset = self.find_offset(infer)
@@ -85,7 +111,8 @@ class Sola:
         if self.mode == "pv":
             head.copy_(self._phase_vocoder(self.buffer, head))
         else:
-            head.mul_(self.fade_in).addcmul_(self.buffer, self.fade_out)
+            torch.lerp(self.fade_in, self._fade_onset, self._onset, out=self._fade_w)
+            head.mul_(self._fade_w).addcmul_(self.buffer, self.fade_out)
         # The tail is saved *after* the crossfade. With overlap <= block (always, unless
         # ``overlap_beyond_hop``) the two ranges are disjoint and the order is immaterial.
         # With overlap > block it is what keeps the seam continuous: the saved tail starts
@@ -166,3 +193,5 @@ class Sola:
         self.buffer.zero_()
         self.offset_hist.zero_()
         self._drain_pos = self.overlap
+        self._onset.zero_()
+        self._onset_marked = False

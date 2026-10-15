@@ -9,7 +9,7 @@ import torch
 from vox.api.control import resolve_suppression
 from vox.audio import devices
 from vox.audio.devices import DeviceInfo
-from vox.config import target
+from vox.config import defaults, target
 from vox.config.schemas import PrecisionParams, RuntimeProfile
 from vox.config.store import load_as, load_tuned, save_tuned
 from vox.config.target import TargetError
@@ -160,6 +160,8 @@ def test_tuned_record_roundtrips_through_runtime_json(tmp_path):
     save_tuned(None, key, record)  # no profile: nothing written, no error
     assert load_tuned(tmp_path, key) == record
     runtime = load_as(RuntimeProfile, tmp_path / "runtime.json")
-    assert runtime.block_ms == 20.0 and runtime.tuned == {key: record}  # defaults kept
+    assert runtime.tuned == {key: record}
+    # nothing but the record is written: shape and precision still come from the defaults
+    assert runtime.block_ms is None and runtime.shape() == defaults.DEFAULT_SHAPE
     save_tuned(tmp_path, "other", {"cudnn_autotune": True})
     assert set(load_as(RuntimeProfile, tmp_path / "runtime.json").tuned) == {key, "other"}

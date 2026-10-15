@@ -6,6 +6,14 @@ the stream simulator; there is no separate batch path.
                                       path (paced, gated): gate closures, underruns, cuts
     vox bench ab [--variants a,b]     one setting per variant -> out/ab/<name>.wav + metrics
     vox bench typed                   typed-speech prosody variants -> out/ab/typed_*.wav
+    vox bench sing                    singing A/Bs (phase carry, trim tail, ceiling): SOLA
+                                      offsets, seam pitch steps -> out/ab/sing_*.wav
+    vox bench onset                   phrase entrances through the gate, before/after the
+                                      onset fixes, per hop -> out/ab/onset_*.wav
+    vox bench suppress                RNNoise: delay, CPU per hop, attenuation, sung-vowel
+                                      band loss, toggle (no GPU)
+    vox bench underrun                paced runs over hop x extra: compute vs budget and
+                                      underruns (optionally with NVIDIA Broadcast running)
     vox bench perf  [--sweep FILE]    perf sweep: block x extra x f0 method   (open question Q1)
     vox bench extra                   quality vs EXTRA context                (Q3)
     vox bench sola                    overlap x {plain, pv} stitching         (Q7)
@@ -38,7 +46,8 @@ def _setup(args):
     from vox.models.registry import ModelRegistry
 
     audio, _ = load_audio(args.audio, 48000)
-    audio = audio[: int(args.seconds * 48000)]
+    start = int(getattr(args, "start", 0.0) * 48000)
+    audio = audio[start:start + int(args.seconds * 48000)]
     return audio, ModelRegistry(args.models_dir), {}
 
 
@@ -104,7 +113,7 @@ def _gate_config(args):
     return dataclasses.replace(base, **_overrides(args)["gate"])
 
 
-def _engine(args, registry, cache, shape_kw=None, cond_kw=None, **param_kw):
+def _engine(args, registry, cache, shape_kw=None, cond_kw=None, gate_kw=None, **param_kw):
     from vox.config import defaults
     from vox.config.schemas import PrecisionParams, RuntimeParams
     from vox.offline.simulate import load_engine
@@ -115,9 +124,10 @@ def _engine(args, registry, cache, shape_kw=None, cond_kw=None, **param_kw):
     precision = PrecisionParams(hubert_fp16=args.hubert_fp16, graphs=args.graphs,
                                 hubert_autocast=args.hubert_autocast)
     conditioning = dataclasses.replace(_conditioning_config(args), **(cond_kw or {}))
+    gate = dataclasses.replace(_gate_config(args), **(gate_kw or {}))
     return load_engine(args.models_dir, args.model, shape, params, precision,
                        registry=registry, cache=cache, profile_dir=args.profile,
-                       gate=_gate_config(args), conditioning=conditioning)
+                       gate=gate, conditioning=conditioning)
 
 
 def _record(name: str, record: dict) -> None:
@@ -440,6 +450,10 @@ AB_VARIANTS: dict[str, tuple[dict, dict, dict, str]] = {
     "f0_bridge": ({}, {"f0_bridge_ms": 60.0}, {}, "F0 dropouts <= 60 ms within 4 st filled"),
     "decctx_80": ({"decoder_context_ms": 80.0}, {}, {}, "80 ms decoder left context (Q17)"),
     "noise_roll": ({}, {"noise_roll": True}, {}, "decoder noise moves with the window"),
+    # section 8
+    "trimtail_2": ({}, {"f0_trim_tail": 2}, {}, "RMVPE right-edge guard: 2 frames dropped"),
+    "trimtail_1": ({}, {"f0_trim_tail": 1}, {}, "RMVPE right edge as upstream: 1 frame"),
+    "phase_carry": ({}, {"sine_phase_carry": True}, {}, "NSF sine phase carried across hops"),
 }
 
 
@@ -576,6 +590,438 @@ def cmd_typed(args) -> int:
         _record("typed", {"model": args.model, "text": text, **row})
     print(f"\nwavs: {out}\\typed_<variant>.wav")
     return 0
+
+
+# --------------------------------------------------------------------------------- sing
+
+# Singing A/Bs (docs/DEVIATIONS.md §8), one change per variant against the GUI's Sing
+# preset for this model: index 0.3, protect 0.35, F0 ceiling 360 Hz, auto level capped at
+# +10 dB with no trim. Run on a sustained-note recording (--audio, --start, --seconds).
+SING_PRESET = {"index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0}
+SING_CONDITIONING = {"max_gain_db": 10.0, "trim_db": 0.0}
+SING_VARIANTS: dict[str, tuple[dict, dict, str]] = {
+    "phasecarry_off": ({}, {}, "Sing preset; the NSF sine restarts at phase 0 every hop"),
+    "phasecarry_on": ({}, {"sine_phase_carry": True}, "sine phase carried across hops"),
+    # Coherent renders need the same decoder noise for the same frames too (noise_roll),
+    # and a head that is not decoded against zero padding (decoder context).
+    "noiseroll": ({}, {"noise_roll": True}, "decoder noise moves with the window"),
+    "phasecarry_noiseroll": ({}, {"sine_phase_carry": True, "noise_roll": True},
+                             "phase carry + noise roll"),
+    "phasecarry_noiseroll_decctx80": ({"decoder_context_ms": 80.0},
+                                      {"sine_phase_carry": True, "noise_roll": True},
+                                      "phase carry + noise roll + 80 ms decoder context"),
+    "trimtail_1": ({}, {"f0_trim_tail": 1}, "RMVPE right edge as upstream (1 frame; the "
+                   "default before section 8)"),
+    "ceiling_off": ({}, {"f0_ceiling_hz": 0.0}, "Sing preset without the F0 ceiling"),
+}
+
+
+def _sing_trace(engine, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Open stream (every hop through the model, conditioned like live) with two per-hop
+    probes: the SOLA offset the hop chose, and the pitch step at its seam, i.e. the cents
+    between the F0 the previous hop rendered its saved tail with and the F0 this hop
+    renders the same 10 ms frames with (voiced frames only)."""
+    plan, pipe, sola, cond = engine.plan, engine.pipeline, engine.sola, engine.conditioner
+    pipe.reset()
+    sola.reset()
+    cond.reset()
+    torch.manual_seed(0)
+    block, hops = plan.block, len(audio) // plan.block
+    out = np.zeros(hops * block, dtype=np.float32)
+    offsets, steps = np.zeros(hops, dtype=np.int64), []
+    head, shift, fade = plan.skip_head, plan.shift_frames, plan.sola_buffer // plan.zc
+    hist, prev = sola.offset_hist.clone(), None
+    for n in range(hops):
+        pipe.upload(cond.process(audio[n * block:(n + 1) * block]))
+        stitched = sola.stitch(pipe.process_hop())
+        out[n * block:(n + 1) * block] = stitched.cpu().numpy()
+        now = sola.offset_hist.clone()
+        offsets[n] = int(torch.argmax(now - hist))
+        hist = now
+        pitch = pipe.pitch_cache.pitchf_view[0].cpu().numpy().copy()
+        if prev is not None:
+            a, b = prev[head + shift:head + shift + fade], pitch[head:head + fade]
+            voiced = (a > 0) & (b > 0)
+            steps.append(np.abs(1200 * np.log2(a[voiced] / b[voiced])))
+        prev = pitch
+    return out, offsets, np.concatenate(steps) if steps else np.zeros(0)
+
+
+def cmd_sing(args) -> int:
+    from vox.audio.resample import save_audio
+    from vox.offline.metrics import boundary_click_ratio
+
+    audio, registry, cache = _setup(args)
+    names = list(SING_VARIANTS) if not args.variants else args.variants.split(",")
+    out_dir = ROOT / "out" / "ab"
+    rows = []
+    for name in names:
+        shape_kw, param_kw, note = SING_VARIANTS[name]
+        engine = _engine(args, registry, cache, shape_kw, SING_CONDITIONING,
+                         **{**SING_PRESET, **param_kw})
+        plan, sr = engine.plan, engine.plan.device_sr
+        stream, offsets, steps = _sing_trace(engine, audio)
+        settle = int(np.ceil(_settle_s(plan) * 1000 / plan.block_ms))
+        offsets_ms = offsets[settle:] * 1000.0 / sr
+        jumps = np.abs(np.diff(offsets_ms))
+        aligned = stream[plan.stream_delay:][:len(audio)]
+        f0 = _f0_100hz(engine, aligned)
+        voiced = f0[f0 > 0]
+        row = {"name": name, "note": note, "hop_ms": plan.block_ms,
+               "latency_ms": plan.algorithmic_latency_ms,
+               "offset_p50_ms": float(np.median(offsets_ms)),
+               "offset_mode_share": float(np.mean(offsets_ms == np.median(offsets_ms))),
+               "offset_zero_share": float(np.mean(offsets_ms == 0)),
+               # hops that kept the previous offset: coherent renders line up where the
+               # last one did (a jump by whole F0 periods is benign on a held note)
+               "offset_held_share": float(np.mean(jumps == 0)),
+               "offset_jump_mean_ms": float(jumps.mean()),
+               "offset_jump_p95_ms": float(np.percentile(jumps, 95)),
+               "seam_cents_p50": float(np.median(steps)) if steps.size else float("nan"),
+               "seam_cents_p95": float(np.percentile(steps, 95)) if steps.size else float("nan"),
+               "click": boundary_click_ratio(stream, plan.block),
+               "f0_p95_hz": float(np.percentile(voiced, 95)) if voiced.size else float("nan"),
+               "f0_max_hz": float(voiced.max()) if voiced.size else float("nan"),
+               "histogram_ms": {f"{k * 1000.0 / sr:g}": int(v) for k, v in
+                                zip(*np.unique(offsets[settle:], return_counts=True))}}
+        rows.append(row)
+        save_audio(out_dir / f"{args.prefix}sing_{name}.wav", aligned, sr)
+        _record("sing", {"model": args.model, "audio": str(args.audio), "start": args.start,
+                         "pitch": args.pitch, "variant": name, "shape": shape_kw,
+                         "params": {**SING_PRESET, **param_kw}, "row": row})
+        print(f"[{name}] {note}: offsets p50 {row['offset_p50_ms']:.2f} ms, at 0 "
+              f"{100 * row['offset_zero_share']:.0f}%, held "
+              f"{100 * row['offset_held_share']:.0f}%, jump mean {row['offset_jump_mean_ms']:.2f}"
+              f" p95 {row['offset_jump_p95_ms']:.2f} ms; seam step p50 "
+              f"{row['seam_cents_p50']:.1f} p95 {row['seam_cents_p95']:.1f} cents; click "
+              f"{row['click']:.2f}; F0 p95 {row['f0_p95_hz']:.0f} max {row['f0_max_hz']:.0f} Hz",
+              flush=True)
+        engine.graphs.release()
+        del engine
+    print(f"\n{'variant':<30} {'lat':>4} {'off p50':>7} {'@0':>4} {'held':>4} {'jump':>5} "
+          f"{'jump95':>6} {'seam50':>6} {'seam95':>6} {'click':>5} {'f0p95':>5}")
+    for r in rows:
+        print(f"{r['name']:<30} {r['latency_ms']:>4.0f} {r['offset_p50_ms']:>7.2f} "
+              f"{100 * r['offset_zero_share']:>3.0f}% {100 * r['offset_held_share']:>3.0f}% "
+              f"{r['offset_jump_mean_ms']:>5.2f} "
+              f"{r['offset_jump_p95_ms']:>6.2f} {r['seam_cents_p50']:>6.1f} "
+              f"{r['seam_cents_p95']:>6.1f} {r['click']:>5.2f} {r['f0_p95_hz']:>5.0f}")
+    print(f"\nwavs: {out_dir}\\{args.prefix}sing_<variant>.wav")
+    return 0
+
+
+# -------------------------------------------------------------------------------- onset
+
+# Phrase entrances through the gate (docs/DEVIATIONS.md §8): the pre-fix gate (VAD on the
+# newest 512-sample chunk only, onset hop faded in over the whole overlap) against the fix.
+ONSET_VARIANTS: dict[str, tuple[dict, dict, str]] = {
+    "before": ({"onset_ramp_ms": 0.0}, {"vad_reduce": "last"},
+               "pre-fix: VAD = newest chunk, onset hop fades in over the overlap"),
+    "vad_max": ({"onset_ramp_ms": 0.0}, {}, "VAD max over the hop's chunks only"),
+    "after": ({}, {}, "VAD max + 5 ms onset ramp (the defaults)"),
+    "margin_3db": ({}, {"onset_margin_db": 3.0},
+                   "A/B: the defaults + energy onset 3 dB over the threshold (not 6)"),
+}
+
+
+def _onset_times(audio: np.ndarray, sr: int, below_db: float = 30.0) -> list[float]:
+    """Where each phrase of ``audio`` starts: the first 10 ms frame within ``below_db`` of
+    the clip's loud frames, after at least 250 ms below it (seconds)."""
+    from vox.offline.metrics import frame_rms_dbfs
+
+    level = frame_rms_dbfs(audio, sr, win_ms=10.0)
+    loud = level >= np.percentile(level, 95) - below_db
+    starts, quiet = [], 25
+    for i, on in enumerate(loud):
+        if on and quiet >= 25:
+            starts.append(i / 100.0)
+        quiet = 0 if on else quiet + 1
+    return starts
+
+
+def cmd_onset(args) -> int:
+    from vox.audio.resample import save_audio
+    from vox.offline.metrics import frame_rms_dbfs
+    from vox.offline.simulate import StreamSimulator
+
+    audio, registry, cache = _setup(args)
+    hops = [float(h) for h in args.hops.split(",")]
+    out_dir = ROOT / "out" / "ab"
+    sr = 48000
+    entrances = _onset_times(audio, sr)
+    print(f"input phrase entrances (s from --start): {', '.join(f'{t:.2f}' for t in entrances)}")
+    rows = []
+    for hop in hops:
+        for name, (shape_kw, gate_kw, note) in ONSET_VARIANTS.items():
+            engine = _engine(args, registry, cache, {**shape_kw, "block_ms": hop}, None,
+                             gate_kw)
+            result = StreamSimulator(engine).run(audio, gate=True, seed=0)
+            out = result.aligned[:len(audio)]
+            level_in = frame_rms_dbfs(audio, sr, win_ms=10.0)
+            level_out = frame_rms_dbfs(out, sr, win_ms=10.0)
+            thr_out = np.percentile(level_out, 95) - 30.0
+            opens = [e["t"] for e in result.events if e["kind"] == "gate_open"]
+            lags, kept = [], []
+            for t in entrances:
+                i = round(t * 100)
+                # first output frame (from 100 ms before the entrance) that carries the voice
+                window = level_out[max(0, i - 10):i + 60]
+                on = np.flatnonzero(window >= thr_out)
+                lag = (on[0] + max(0, i - 10) - i) * 10.0 if on.size else float("nan")
+                lags.append(lag)
+                # share of the entrance's first 150 ms of input energy the output carries
+                seg = slice(i, i + 15)
+                e_in = np.sum(10 ** (level_in[seg] / 10))
+                e_out = np.sum(10 ** (level_out[seg] / 10))
+                e_in_ref = np.sum(10 ** (level_in[i + 15:i + 60] / 10))
+                e_out_ref = np.sum(10 ** (level_out[i + 15:i + 60] / 10))
+                kept.append(float((e_out / e_out_ref) / (e_in / e_in_ref + 1e-12))
+                            if e_out_ref > 0 else float("nan"))
+            gate_lag = [min((o - t for o in opens if o >= t - 0.1), default=float("nan")) * 1000
+                        for t in entrances]
+            row = {"hop": hop, "name": name, "note": note, "lags_ms": lags, "kept": kept,
+                   "gate_lag_ms": gate_lag}
+            rows.append(row)
+            stereo = np.stack([audio[:len(out)], out], axis=1)  # L: mic, R: converted
+            save_audio(out_dir / f"{args.prefix}onset_{name}_hop{hop:g}.wav", stereo, sr)
+            _record("onset", {"model": args.model, "audio": str(args.audio),
+                              "start": args.start, **row})
+            print(f"[hop {hop:g} {name}] {note}\n    output lag after entrance (ms): "
+                  f"{', '.join(f'{x:.0f}' for x in lags)}\n    gate open after entrance (ms):"
+                  f" {', '.join(f'{x:.0f}' for x in gate_lag)}\n    first-150-ms energy kept "
+                  f"(1 = as loud as the rest of the phrase): "
+                  f"{', '.join(f'{x:.2f}' for x in kept)}", flush=True)
+            engine.graphs.release()
+            del engine
+    print(f"\nwavs (L mic, R output): {out_dir}\\{args.prefix}onset_<variant>_hop<ms>.wav")
+    return 0
+
+
+# ----------------------------------------------------------------------------- underrun
+
+_BROADCAST_LOAD = """
+import sys, time
+import sounddevice as sd
+dev = next(d["index"] for d in sd.query_devices()
+           if "nvidia broadcast" in d["name"].lower() and d["max_input_channels"] > 0
+           and sd.query_hostapis(d["hostapi"])["name"] == "Windows WASAPI")
+with sd.InputStream(device=dev, channels=1, samplerate=48000, callback=lambda *a: None):
+    time.sleep(float(sys.argv[1]))
+"""
+
+
+def cmd_underrun(args) -> int:
+    """Paced runs (hop N available at N x hop, the output ring modelled as live) over hop x
+    extra for one model: hop compute p50 / p99, the share of hops over budget and the
+    underruns with their times. ``--broadcast-load`` holds the NVIDIA Broadcast virtual mic
+    open in a side process meanwhile (its denoiser then runs on the same GPU, as when it is
+    the input); the audio is discarded."""
+    import subprocess
+
+    from vox.offline.simulate import StreamSimulator
+    from vox.profiling.report import stage_table
+
+    audio, registry, cache = _setup(args)
+    hops = [float(h) for h in args.hops.split(",")]
+    extras = [float(e) for e in args.extras.split(",")]
+    side = None
+    if args.broadcast_load:
+        side = subprocess.Popen([sys.executable, "-c", _BROADCAST_LOAD, "3600"])
+        time.sleep(3.0)  # let Broadcast start its effect
+    rows = []
+    try:
+        for extra in extras:
+            for hop in hops:
+                engine = _engine(args, registry, cache, {"block_ms": hop, "extra_ms": extra})
+                result = StreamSimulator(engine).run(audio, realtime=True, seed=0)
+                table = stage_table(engine.timers, SKIP)
+                host = table["total"]["host"]
+                gpu = {k: v.get("gpu", {}).get("p50") for k, v in table.items()
+                       if k in ("f0", "embed", "synth")}
+                times = [e["t"] for e in result.events if e["kind"] == "underrun"]
+                row = {"model": args.model, "hop": hop, "extra": extra, "p50": host["p50"],
+                       "p99": host["p99"], "max": host["max"],
+                       "underruns": result.underruns, "underrun_t": times[:20],
+                       "deadline_misses": result.deadline_misses, "gpu_p50": gpu,
+                       "broadcast_load": bool(args.broadcast_load)}
+                rows.append(row)
+                _record("underrun", row)
+                print(f"[{args.model} hop {hop:g} extra {extra:g}"
+                      f"{' +Broadcast' if side else ''}] p50 {host['p50']:.1f} p99 "
+                      f"{host['p99']:.1f} ms (budget {hop:g}); underruns {result.underruns}"
+                      f"{' at ' + ', '.join(f'{t:.1f}s' for t in times[:8]) if times else ''};"
+                      f" GPU p50 f0/embed/synth "
+                      + "/".join(f"{v:.1f}" if v else "-" for v in gpu.values()), flush=True)
+                engine.graphs.release()
+                del engine
+                torch.cuda.empty_cache()
+    finally:
+        if side is not None:
+            side.terminate()
+    return 0
+
+
+# ----------------------------------------------------------------------------- suppress
+
+
+def cmd_suppress(args) -> int:
+    """RNNoise on the mic path, measured without the GPU: delay, CPU per hop, attenuation
+    of a raw mic's pauses and speech (--audio), band loss on sustained sung vowels
+    (--vowel), and the live toggle (step size around the switch)."""
+    import time as _time
+
+    from vox.audio import suppression
+    from vox.audio.resample import load_audio, save_audio
+    from vox.offline.metrics import frame_rms_dbfs
+
+    reason = suppression.unavailable_reason()
+    if reason:
+        print(f"suppression unavailable: {reason}")
+        return 1
+    sr = suppression.SR
+    raw, _ = load_audio(args.audio, sr)
+    start = int(args.start * sr)
+    raw = raw[start:start + int(args.seconds * sr)].astype(np.float64)
+
+    def render(x: np.ndarray, block: int, mix: float) -> tuple[np.ndarray, list[float]]:
+        sup = suppression.Suppressor(block, enabled=True, mix=mix)
+        out, times = np.zeros(len(x) // block * block), []
+        for i in range(0, len(out), block):
+            t = _time.perf_counter()
+            out[i:i + block] = sup.process(x[i:i + block])
+            times.append((_time.perf_counter() - t) * 1000.0)
+        return out, times
+
+    # delay: cross-correlation of the fully wet output against the input
+    wet, times20 = render(raw, 960, 1.0)
+    _, times60 = render(raw, 2880, 1.0)
+    lags = np.arange(0, 2 * suppression.DELAY)
+    corr = [np.dot(raw[:len(wet) - lag], wet[lag:]) for lag in lags]
+    delay = int(lags[int(np.argmax(corr))])
+    print(f"delay: {delay} samples = {1000 * delay / sr:.1f} ms (RNNoise frame alignment)")
+    for label, t in (("20 ms hop", times20), ("60 ms hop", times60)):
+        t = np.asarray(t[10:])
+        print(f"CPU per hop, {label}: p50 {np.percentile(t, 50):.2f} ms, p99 "
+              f"{np.percentile(t, 99):.2f} ms, max {t.max():.2f} ms")
+
+    # attenuation on the raw mic: pauses (room tone, fan, keys, bleed) vs speech frames
+    level = frame_rms_dbfs(raw, sr)
+    loud = np.percentile(level, 95)
+    pause = level < loud - 30.0
+    speech = level >= loud - 18.0
+    print(f"raw mic: speech frames {speech.mean() * 100:.0f}%, pause frames "
+          f"{pause.mean() * 100:.0f}% (input p95 {loud:.1f} dBFS)")
+    rows = {}
+    for mix in (1.0, 0.5):
+        out, _ = render(raw, 960, mix)
+        aligned = out[delay:]
+        lvl = frame_rms_dbfs(aligned, sr)
+        n = min(len(lvl), len(level))
+        lvl, ref_level = lvl[:n], level[:n]
+        p, s = pause[:n], speech[:n]
+        # transients in the pauses: the loudest 2% of pause frames (clicks, keys, thumps)
+        tr = p & (ref_level >= np.percentile(ref_level[p], 98))
+        rows[mix] = {"pause_db": _mean_db(lvl, p) - _mean_db(ref_level, p),
+                     "transient_db": _mean_db(lvl, tr) - _mean_db(ref_level, tr),
+                     "speech_db": _mean_db(lvl, s) - _mean_db(ref_level, s)}
+        save_audio(ROOT / "out" / "ab" / f"{args.prefix}suppress_mic_mix{mix:g}.wav",
+                   aligned.astype(np.float32), sr)
+        print(f"mix {mix:g}: pauses {rows[mix]['pause_db']:+.1f} dB, pause transients "
+              f"{rows[mix]['transient_db']:+.1f} dB, speech {rows[mix]['speech_db']:+.1f} dB")
+
+    if args.vowel is not None:
+        sung, _ = load_audio(args.vowel, sr)
+        sung = sung.astype(np.float64)
+        f0 = _f0_track(sung, sr)
+        steady = _sustained_frames(f0)
+        print(f"sung vowels: {steady.sum() / 100:.1f} s of sustained notes (pitch within "
+              f"+-50 cents over 300 ms) in {args.vowel.name}")
+        for mix in (1.0, 0.5):
+            out, _ = render(sung, 960, mix)
+            aligned = out[delay:]
+            loss = _band_loss_db(sung, aligned, sr, steady, (1500.0, 4000.0))
+            low = _band_loss_db(sung, aligned, sr, steady, (100.0, 1000.0))
+            print(f"mix {mix:g}: sustained-note band loss 1.5-4 kHz {loss:+.1f} dB "
+                  f"(0.1-1 kHz {low:+.1f} dB)")
+            save_audio(ROOT / "out" / "ab" / f"{args.prefix}suppress_sung_mix{mix:g}.wav",
+                       aligned.astype(np.float32), sr)
+
+    # the live toggle, switched inside speech: on in the longest phrase (the crossfade
+    # starts after the warm-up), off in the second longest, 20 ms hops
+    from vox.offline.metrics import phrases
+
+    spans = sorted(phrases(raw.astype(np.float32), sr), key=lambda s: s[0] - s[1])[:2]
+    warm = int(sr * suppression.WARMUP_MS / 1000)
+    on_at = (spans[0][0] + spans[0][1]) // 2 // 960 * 960
+    off_at = (spans[1][0] + spans[1][1]) // 2 // 960 * 960
+    sup = suppression.Suppressor(960)
+    out = np.zeros(len(raw) // 960 * 960)
+    for i in range(0, len(out), 960):
+        if i == on_at:
+            sup.set(enabled=True)
+        if i == off_at:
+            sup.set(enabled=False)
+        out[i:i + 960] = sup.process(raw[i:i + 960])
+    steps = np.abs(np.diff(out))
+    ref = np.percentile(np.abs(np.diff(raw[:len(out)])), 99.9)
+    for label, at in (("on", on_at + warm), ("off", off_at)):
+        near = steps[at - 480:at + 2 * 960]
+        local = np.percentile(np.abs(np.diff(raw[at - 4800:at + 4800])), 99.9)
+        print(f"toggle {label} at {at / sr:.2f} s (inside speech): largest step in the 20 ms "
+              f"fade {near.max():.4f} vs the input's own p99.9 step there {local:.4f} "
+              f"({near.max() / local:.2f}x; whole-file p99.9 {ref:.4f})")
+    _record("suppress", {"audio": str(args.audio), "delay": delay, "rows": rows,
+                         "cpu_p50_20": float(np.percentile(times20[10:], 50)),
+                         "cpu_p99_20": float(np.percentile(times20[10:], 99))})
+    return 0
+
+
+def _mean_db(level_db: np.ndarray, mask: np.ndarray) -> float:
+    """Mean power of the masked frames, in dB."""
+    return float(10 * np.log10(np.mean(10 ** (level_db[mask] / 10)) + 1e-12))
+
+
+def _f0_track(x: np.ndarray, sr: int) -> np.ndarray:
+    """RMVPE over a whole device-rate signal (no engine needed), 100 Hz."""
+    from vox.audio.resample import resample_array
+    from vox.pitch import make_extractor
+
+    extractor = make_extractor("rmvpe")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    extractor.load(device, ROOT / "models")
+    y = resample_array(x.astype(np.float32), sr, 16000)
+    with torch.inference_mode():
+        return extractor.extract(torch.from_numpy(y).to(device)).float().cpu().numpy()
+
+
+def _sustained_frames(f0: np.ndarray, span: int = 30, cents: float = 50.0) -> np.ndarray:
+    """10 ms frames inside a voiced run whose pitch stays within +-``cents`` of its median
+    for ``span`` frames: held notes."""
+    out = np.zeros(len(f0), dtype=bool)
+    for i in range(len(f0) - span):
+        seg = f0[i:i + span]
+        if np.all(seg > 0):
+            dev = 1200 * np.log2(seg / np.median(seg))
+            if np.abs(dev).max() <= cents:
+                out[i:i + span] = True
+    return out
+
+
+def _band_loss_db(ref: np.ndarray, test: np.ndarray, sr: int, mask: np.ndarray,
+                  band: tuple[float, float]) -> float:
+    """Energy change in ``band`` over the masked 10 ms frames (40 ms Hann windows)."""
+    hop, win = sr // 100, sr // 25
+    window = np.hanning(win)
+    freqs = np.fft.rfftfreq(win, 1 / sr)
+    sel = (freqs >= band[0]) & (freqs < band[1])
+    e_ref = e_test = 0.0
+    for i in np.flatnonzero(mask):
+        a = i * hop
+        if a + win > min(len(ref), len(test)):
+            break
+        e_ref += np.sum(np.abs(np.fft.rfft(ref[a:a + win] * window))[sel] ** 2)
+        e_test += np.sum(np.abs(np.fft.rfft(test[a:a + win] * window))[sel] ** 2)
+    return float(10 * np.log10((e_test + 1e-12) / (e_ref + 1e-12)))
 
 
 # --------------------------------------------------------------------------------- perf
@@ -880,12 +1326,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="vox bench", description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("accept", "ab", "typed", "perf", "extra", "sola",
                                             "block", "decctx", "envelope", "gate",
-                                            "graph-probe"))
+                                            "graph-probe", "sing", "onset", "suppress",
+                                            "underrun"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--audio", type=Path,
                         default=ROOT / "benchmarks" / "corpus" / "libri_1272.wav")
     parser.add_argument("--seconds", type=float, default=20.0)
+    parser.add_argument("--start", type=float, default=0.0,
+                        help="seconds into --audio where the excerpt starts")
     parser.add_argument("--pitch", type=float, default=0.0)
     parser.add_argument("--hubert-fp16", action="store_true")
     parser.add_argument("--hubert-autocast", choices=("auto", "fp16", "bf16", "off"),
@@ -918,6 +1367,15 @@ def main() -> int:
     parser.add_argument("--prefix", default="",
                         help="ab: prefix for the out/ab/<prefix><variant>.wav files")
     parser.add_argument("--block-ms", type=float, default=20.0)
+    parser.add_argument("--hops", default="60,20",
+                        help="onset / underrun: comma-separated hop sizes (ms) to compare")
+    parser.add_argument("--extras", default="1000,2200",
+                        help="underrun: comma-separated context (extra) sizes in ms")
+    parser.add_argument("--broadcast-load", action="store_true",
+                        help="underrun: hold the NVIDIA Broadcast mic open meanwhile")
+    parser.add_argument("--vowel", type=Path, default=None,
+                        help="suppress: a sung recording; band loss is measured on its held "
+                             "notes")
     parser.add_argument("--stage", choices=("f0", "embed", "synth", "sola", "hop"),
                         default="synth", help="graph-probe: which stage to capture")
     parser.add_argument("--sweep", type=Path,
@@ -928,7 +1386,9 @@ def main() -> int:
     handler = {"accept": cmd_accept, "ab": cmd_ab, "typed": cmd_typed, "perf": cmd_perf,
                "extra": cmd_extra, "sola": cmd_sola,
                "block": cmd_block, "decctx": cmd_decctx, "envelope": cmd_envelope,
-               "gate": cmd_gate, "graph-probe": cmd_graph_probe}[args.command]
+               "gate": cmd_gate, "graph-probe": cmd_graph_probe, "sing": cmd_sing,
+               "onset": cmd_onset, "suppress": cmd_suppress,
+               "underrun": cmd_underrun}[args.command]
     return handler(args)
 
 

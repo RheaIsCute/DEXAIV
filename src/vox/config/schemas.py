@@ -51,6 +51,10 @@ class ShapeParams:
     # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
     overlap_beyond_hop: bool = False  # pre-fix SOLA geometry: the crossfade may exceed the hop
     embed_pad_ms: float = 0.0  # replicate-pad the window's right edge before ContentVec
+    # Gate onset (docs/DEVIATIONS.md §8): the first hop after the gate opens fades in over
+    # this many ms instead of the whole overlap, so the decoded pre-onset consonant is kept.
+    # 0 = the pre-fix fade (the full overlap from a silent SOLA tail).
+    onset_ramp_ms: float = 5.0
 
 
 @dataclass
@@ -70,6 +74,12 @@ class RuntimeParams:
     # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
     f0_bridge_ms: float = 0.0  # fill F0 = 0 runs this short between voiced runs (0 = off)
     noise_roll: bool = False  # decoder noise follows the window: draw only the new hop's
+    # Singing (docs/DEVIATIONS.md §8):
+    f0_ceiling_hz: float = 0.0  # soft-knee F0 ceiling after transposition (0 = off); hot
+    # Fresh RMVPE frames dropped at the right edge: 2 (default) halves the pitch step at
+    # hop seams on held notes; 1 = upstream (docs/DEVIATIONS.md §8.4)
+    f0_trim_tail: int = 2
+    sine_phase_carry: bool = False  # experimental: NSF sine phase continuous across hops
 
 
 @dataclass(frozen=True)
@@ -108,9 +118,10 @@ class SourceVoice:
 
 @dataclass
 class F0ExtractorProfile:
-    method: str = "rmvpe"
-    f0_min_hz: float = 50.0
-    f0_max_hz: float = 1100.0
+    # None = not calibrated: the engine default (RuntimeParams) applies.
+    method: str | None = None
+    f0_min_hz: float | None = None
+    f0_max_hz: float | None = None
     median_filter_frames: int = 0
     octave_flip_rate: dict[str, float] = field(default_factory=dict)
 
@@ -164,20 +175,26 @@ class AudioDeviceProfile:
 
 @dataclass
 class RuntimeProfile:
-    """Per-GPU scheduling choices, written by the benchmark (docs/research/10)."""
+    """Per-GPU scheduling choices, written by the benchmark (docs/research/10).
+
+    Every shape and precision field is an override: None means "the engine default"
+    (``config/defaults.py``) and is never written to disk. A file therefore holds only what
+    someone chose, and a later change of an engine default is not shadowed by a stale copy
+    of the old one (docs/DEVIATIONS.md §8).
+    """
 
     schema: int = SCHEMA_VERSION
     gpu: str = ""
-    block_ms: float = 20.0
-    crossfade_ms: float = 20.0
-    context_extra_ms: float = 1000.0
-    sola_search_ms: float = 10.0
-    decoder_context_ms: float = 0.0
-    tf32: bool = True
-    hubert_fp16: bool = False
-    decoder_fp16: bool = False
-    graphs: str = "auto"
-    hubert_autocast: str = "auto"
+    block_ms: float | None = None
+    crossfade_ms: float | None = None
+    context_extra_ms: float | None = None
+    sola_search_ms: float | None = None
+    decoder_context_ms: float | None = None
+    tf32: bool | None = None
+    hubert_fp16: bool | None = None
+    decoder_fp16: bool | None = None
+    graphs: str | None = None
+    hubert_autocast: str | None = None
     benchmark_ref: str = ""
     # Persisted warmup decisions keyed by the fixed shape (TARGET.md rule 4): the HuBERT
     # autocast that passed the eager-match and whether cuDNN autotune beat its heuristics,
@@ -185,23 +202,22 @@ class RuntimeProfile:
     tuned: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def shape(self, device_sr: int = 48000) -> ShapeParams:
-        return ShapeParams(
-            block_ms=self.block_ms,
-            crossfade_ms=self.crossfade_ms,
-            sola_search_ms=self.sola_search_ms,
-            extra_ms=self.context_extra_ms,
-            device_sr=device_sr,
-            decoder_context_ms=self.decoder_context_ms,
-        )
+        from vox.config.defaults import DEFAULT_SHAPE
+
+        chosen = {"block_ms": self.block_ms, "crossfade_ms": self.crossfade_ms,
+                  "sola_search_ms": self.sola_search_ms, "extra_ms": self.context_extra_ms,
+                  "decoder_context_ms": self.decoder_context_ms}
+        return dataclasses.replace(DEFAULT_SHAPE, device_sr=device_sr,
+                                   **{k: v for k, v in chosen.items() if v is not None})
 
     def precision(self) -> PrecisionParams:
-        return PrecisionParams(
-            tf32=self.tf32,
-            hubert_fp16=self.hubert_fp16,
-            decoder_fp16=self.decoder_fp16,
-            graphs=self.graphs,
-            hubert_autocast=self.hubert_autocast,
-        )
+        from vox.config.defaults import DEFAULT_PRECISION
+
+        chosen = {"tf32": self.tf32, "hubert_fp16": self.hubert_fp16,
+                  "decoder_fp16": self.decoder_fp16, "graphs": self.graphs,
+                  "hubert_autocast": self.hubert_autocast}
+        return dataclasses.replace(DEFAULT_PRECISION,
+                                   **{k: v for k, v in chosen.items() if v is not None})
 
 
 @dataclass

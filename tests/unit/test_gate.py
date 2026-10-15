@@ -232,3 +232,42 @@ def test_default_hangover_is_350_ms():
     assert GateConfig().hangover_ms == 350.0
     _, gate, _ = vad_gate(hangover_ms=GateConfig().hangover_ms)
     assert gate.hangover_hops == 18  # ceil(350 / 20)
+
+
+class SequenceVad(ScriptedVad):
+    """Answers ``probs`` chunk by chunk (the last one repeats)."""
+
+    def __init__(self, probs) -> None:
+        super().__init__()
+        self.probs = list(probs)
+
+    def prob(self, chunk) -> float:
+        p = self.probs[min(self.chunks, len(self.probs) - 1)]
+        super().prob(chunk)
+        return p
+
+
+@pytest.mark.parametrize("reduce, opens", [("max", True), ("last", False)])
+def test_a_long_hop_decides_on_the_most_speechlike_vad_chunk(reduce, opens):
+    """A 60 ms hop is 960 samples at 16 kHz: the second hop completes two 512-sample chunks.
+    Speech in the first of them (an onset late in the chunk before) must count; with
+    ``vad_reduce="last"`` (the pre-fix behaviour) only the newest chunk did."""
+    plan = chunker.plan(60, 20, 500, 10, SR, SR)
+    vad = SequenceVad([0.0, 0.9, 0.1])
+    gate = SilenceGate(plan, GateConfig(threshold_dbfs=-48.0, vad_reduce=reduce), vad)
+    soft = at_dbfs(plan.block, -45.0)  # over the threshold, under the energy-onset margin
+    assert not gate.decide(soft).speech and vad.chunks == 1
+    d = gate.decide(soft)
+    assert vad.chunks == 3 and d.speech is opens and d.onset is opens
+    assert d.vad_prob == pytest.approx(0.9 if opens else 0.1)
+
+
+def test_a_hop_with_no_finished_vad_chunk_keeps_the_last_probability():
+    plan, gate, vad = vad_gate(level=0.9)  # 320 samples per hop at 16 kHz
+    gate.decide(at_dbfs(plan.block, -40.0))  # 320 < 512: no chunk yet
+    assert vad.chunks == 0 and gate._vad_prob == 0.0
+    gate.decide(at_dbfs(plan.block, -40.0))
+    assert vad.chunks == 1 and gate._vad_prob == pytest.approx(0.9)
+    vad.level = 0.2
+    gate.decide(at_dbfs(plan.block, -40.0))  # 128 + 320 < 512: still the 0.9
+    assert vad.chunks == 1 and gate._vad_prob == pytest.approx(0.9)

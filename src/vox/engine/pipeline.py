@@ -96,6 +96,8 @@ class HopPipeline:
         self.params = params
         self._interp = params.f0_unvoiced == "interp"
         self._bridge = round(params.f0_bridge_ms / 10.0)  # F0 frames (10 ms each)
+        self._trim_tail = params.f0_trim_tail
+        self._phase_carry = params.sine_phase_carry
         self.set_plan(plan)
         self.set_params(params)
 
@@ -129,7 +131,8 @@ class HopPipeline:
         self._window_padded = (torch.zeros(1, p.convert_16k + p.embed_pad_16k, device=dev)
                                if p.embed_pad_16k else None)
         self.f0_tail = self.ring_16k[-p.f0_tail_16k:] if self.extractor else None
-        self.pitch_cache = PitchCache(p.convert_frames, p.shift_frames, p.p_len, dev)
+        self.pitch_cache = PitchCache(p.convert_frames, p.shift_frames, p.p_len, dev,
+                                      self._trim_tail)
         self.feats50 = torch.zeros(1, p.hubert_frames, self.model.emb_dim, device=dev)
         self.feats = torch.zeros(1, p.p_len, self.model.emb_dim, device=dev)
         self.feats0 = torch.zeros_like(self.feats)
@@ -140,6 +143,10 @@ class HopPipeline:
         self.protect_t = torch.ones((), device=dev)
         self.f0_min_t = torch.zeros((), device=dev)
         self.f0_max_t = torch.full((), math.inf, device=dev)
+        self.f0_ceiling_t = torch.full((), math.inf, device=dev)  # inf = no soft ceiling
+        # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
+        # hop's decoded slice starts; written by the synth stage, zeroed at gate onsets.
+        self.sine_phase = torch.zeros(1, 1, 1, device=dev)
         latent, source = self.model.noise_shapes(p.p_len, p.skip_head, p.return_length,
                                                  p.dec_context)
         self.noise_z = torch.zeros(latent, device=dev)
@@ -174,8 +181,8 @@ class HopPipeline:
         """Apply hot parameters between hops. Scalars go into existing device tensors.
 
         Returns True when the change alters a stage's op sequence (``f0_unvoiced``,
-        ``f0_bridge_ms``), which means any captured graph of that stage is stale and must
-        be recaptured.
+        ``f0_bridge_ms``, ``f0_trim_tail``, ``sine_phase_carry``), which means any captured
+        graph of that stage is stale and must be recaptured.
         """
         self.params = params
         self.ratio_t.fill_(semitones_to_ratio(params.f0_up_key))
@@ -185,12 +192,19 @@ class HopPipeline:
         # Voicing bounds only act when tighter than the coarse-pitch contract (D9 / doc 08).
         self.f0_min_t.fill_(params.f0_min_hz if params.f0_min_hz > COARSE_F0_MIN else 0.0)
         self.f0_max_t.fill_(params.f0_max_hz if params.f0_max_hz < COARSE_F0_MAX else math.inf)
+        self.f0_ceiling_t.fill_(params.f0_ceiling_hz if params.f0_ceiling_hz > 0 else math.inf)
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
         interp = params.f0_unvoiced == "interp"
         bridge = round(params.f0_bridge_ms / 10.0)
-        changed = interp != self._interp or bridge != self._bridge
+        trim, carry = params.f0_trim_tail, params.sine_phase_carry
+        changed = (interp != self._interp or bridge != self._bridge or trim != self._trim_tail
+                   or carry != self._phase_carry)
         self._interp, self._bridge = interp, bridge
+        self._trim_tail = self.pitch_cache.trim_tail = trim
+        if carry != self._phase_carry:
+            self.sine_phase.zero_()
+        self._phase_carry = carry
         return changed
 
     def set_index(self, index: GpuIndex | None) -> None:
@@ -207,6 +221,12 @@ class HopPipeline:
         self.pitch_cache.zero()
         self.out.zero_()
         self.audio_model.zero_()
+        self.sine_phase.zero_()
+
+    def on_onset(self) -> None:
+        """Gate onset (or new graphs): the carried sine phase restarts at zero, as on the
+        first hop of a stream. A no-op without ``sine_phase_carry``."""
+        self.sine_phase.zero_()
 
     def buffers(self) -> dict[str, Tensor]:
         """Persistent buffers, for pointer-stability checks and graph cache keys."""
@@ -226,6 +246,7 @@ class HopPipeline:
         if self.noise_src is not None:
             tensors.append(self.noise_src)
         tensors.append(self.noise_z)
+        tensors.append(self.sine_phase)
         return tensors
 
     def static_key(self) -> tuple:
@@ -233,7 +254,8 @@ class HopPipeline:
         return (
             tuple(sorted((k, v.data_ptr()) for k, v in self.buffers().items())),
             self.plan, id(self.model), id(self.embedder), id(self.extractor),
-            id(self.index), self._interp, self._bridge, self.model.decoder_fp16,
+            id(self.index), self._interp, self._bridge, self._trim_tail, self._phase_carry,
+            self.model.decoder_fp16,
             getattr(self.embedder, "autocast", None), self.post.rms_mix.graph_safe,
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
             torch.backends.cudnn.benchmark,
@@ -300,7 +322,7 @@ class HopPipeline:
     def _stage_f0(self) -> None:
         f0 = self.extractor.extract(self.f0_tail)
         coarse, cont = postprocess_f0(f0, self.ratio_t, self.f0_min_t, self.f0_max_t,
-                                      self._interp, self._bridge)
+                                      self._interp, self._bridge, self.f0_ceiling_t)
         self.pitch_cache.roll_and_write(coarse, cont)
 
     def _stage_embed(self) -> None:
@@ -328,9 +350,10 @@ class HopPipeline:
         pitch = pitchf = None
         if self.extractor is not None:
             pitch, pitchf = self.pitch_cache.pitch_view, self.pitch_cache.pitchf_view
+        phase = self.sine_phase if self._phase_carry and pitch is not None else None
         audio = self.model.infer(self.feats, self.p_len_t, pitch, pitchf, self.sid_t,
                                  p.skip_head, p.return_length, p.dec_context,
-                                 self.noise_z, self.noise_src)
+                                 self.noise_z, self.noise_src, phase, p.shift_frames)
         self.audio_model.copy_(audio)
 
     def _stage_post(self) -> None:

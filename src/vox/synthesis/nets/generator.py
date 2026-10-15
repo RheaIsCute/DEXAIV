@@ -60,7 +60,10 @@ class SineGen(nn.Module):
 
     Always FP32: the per-frame phase accumulation loses pitch accuracy in half precision
     (docs/research/06 §5). Phase restarts at zero on every call, exactly like the
-    references; continuity across hops is SOLA's job.
+    references; continuity across hops is SOLA's job. Unless ``phase`` is given
+    (experimental ``sine_phase_carry``): then the call starts at that phase and leaves in
+    it the phase reached at the start of frame ``phase_frames``, which is where the next
+    hop's window starts, so consecutive hops render the sine phase-continuously.
     """
 
     def __init__(self, samp_rate: int, upp: int, harmonic_num: int = 0, sine_amp: float = 0.1,
@@ -81,16 +84,23 @@ class SineGen(nn.Module):
         return (1, frames * self.upp, self.dim)
 
     @torch.no_grad()
-    def forward(self, f0: Tensor, noise: Tensor | None = None) -> Tensor:
+    def forward(self, f0: Tensor, noise: Tensor | None = None, phase: Tensor | None = None,
+                phase_frames: int = 0) -> Tensor:
         """``noise``: pre-drawn standard-normal samples of ``noise_shape(t)``. Passing them
         in keeps every random draw outside a captured CUDA graph (the hot path pre-fills
-        the buffer each hop); ``None`` draws fresh, the upstream behaviour."""
+        the buffer each hop); ``None`` draws fresh, the upstream behaviour. ``phase``: a
+        ``[1, 1, 1]`` buffer in cycles, read as the start phase and overwritten with the
+        phase at the start of frame ``phase_frames`` (in place: graph-safe, no sync)."""
         f0 = f0.float().unsqueeze(-1)  # [b, t, 1]
         # Phase advance within each frame, then carry the wrapped end-of-frame phase forward.
         rad = f0 / self.sampling_rate * self._ramp  # [b, t, upp]
         frame_end = torch.fmod(rad[..., -1:] + 0.5, 1.0) - 0.5
         carried = frame_end.cumsum(dim=1).fmod(1.0)
         rad = rad + F.pad(carried, (0, 0, 1, -1))
+        if phase is not None:
+            rad = rad + phase
+            k = phase_frames
+            phase.copy_(torch.fmod(phase + carried[:, k - 1:k, :], 1.0))
         rad = rad.reshape(f0.shape[0], -1, 1) * self._harmonics
         if self.dim > 1:
             # Upstream draws a random start phase per harmonic; the fundamental stays at 0.
@@ -113,9 +123,10 @@ class SourceModuleHnNSF(nn.Module):
         self.l_sin_gen = SineGen(sampling_rate, upp, harmonic_num)
         self.l_linear = nn.Linear(harmonic_num + 1, 1)
 
-    def forward(self, f0: Tensor, noise: Tensor | None = None) -> Tensor:
+    def forward(self, f0: Tensor, noise: Tensor | None = None, phase: Tensor | None = None,
+                phase_frames: int = 0) -> Tensor:
         with torch.autocast(f0.device.type, enabled=False):
-            sine = self.l_sin_gen(f0, noise)
+            sine = self.l_sin_gen(f0, noise, phase, phase_frames)
             merged = torch.tanh(self.l_linear(sine.to(self.l_linear.weight.dtype)))
         return merged.transpose(1, 2)  # [b, 1, t * upp]
 
@@ -188,14 +199,16 @@ class GeneratorNSF(_GeneratorBase):
             else:
                 self.noise_convs.append(nn.Conv1d(1, channels, kernel_size=1))
 
-    def source(self, f0: Tensor, noise: Tensor | None = None) -> Tensor:
+    def source(self, f0: Tensor, noise: Tensor | None = None, phase: Tensor | None = None,
+               phase_frames: int = 0) -> Tensor:
         """The excitation signal; kept separate so a decoder backend can reuse it (P5)."""
-        return self.m_source(f0, noise)
+        return self.m_source(f0, noise, phase, phase_frames)
 
     def forward(self, x: Tensor, f0: Tensor, g: Tensor | None = None,
-                source: Tensor | None = None, source_noise: Tensor | None = None) -> Tensor:
+                source: Tensor | None = None, source_noise: Tensor | None = None,
+                phase: Tensor | None = None, phase_frames: int = 0) -> Tensor:
         if source is None:
-            source = self.source(f0, source_noise)
+            source = self.source(f0, source_noise, phase, phase_frames)
         source = source.to(x.dtype)
         x = self.conv_pre(x)
         if g is not None:

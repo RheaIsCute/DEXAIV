@@ -20,9 +20,12 @@ LATER = {"calibrate": "Phase 5 (calibration)"}
 RUN_HELP = """\
 live commands (type and press Enter):
   pitch N | index X | protect X | envelope X   hot parameters, applied before the next hop
+  ceiling HZ                                   soft F0 ceiling after transposition (0 = off)
   gate on|off                                  silence gate
   level auto|off | level DB                    mic auto level on/off, or the input trim (dB)
+  suppress on|off | suppress MIX               RNNoise on/off, or its wet/dry mix (0-1)
   hop MS | extra MS | crossfade MS | f0 rmvpe|fcpe   restart-class: brief gated pause
+                                               (hops snap to multiples of 20 ms)
   stats                                        print one stats line now
   q                                            stop"""
 
@@ -42,9 +45,20 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--f0-method", choices=("rmvpe", "fcpe"), default=None)
     p.add_argument("--f0-unvoiced", choices=("zero", "interp"), default=None)
     p.add_argument("--sola-mode", choices=("plain", "pv"), default=None)
-    p.add_argument("--block-ms", type=float, default=None)
+    p.add_argument("--f0-ceiling-hz", type=float, default=None,
+                   help="soft-knee F0 ceiling after transposition, Hz (0 = off; singing "
+                        "safety: very high notes are bent flat)")
+    p.add_argument("--f0-trim-tail", type=int, choices=(1, 2), default=None,
+                   help="RMVPE frames dropped at the right edge (2 = guard, the default; "
+                        "1 = upstream)")
+    p.add_argument("--sine-phase-carry", action="store_true", default=None,
+                   help="experimental: NSF sine phase continuous across hops")
+    p.add_argument("--block-ms", type=float, default=None,
+                   help="hop in ms, snapped to a multiple of 20 (whole HuBERT frames)")
     p.add_argument("--crossfade-ms", type=float, default=None)
     p.add_argument("--extra-ms", type=float, default=None)
+    p.add_argument("--onset-ramp-ms", type=float, default=None,
+                   help="fade-in of a gate-onset hop (default 5; 0 = the whole overlap)")
     p.add_argument("--hubert-fp16", action="store_true", help="same as --hubert-autocast fp16")
     p.add_argument("--hubert-autocast", choices=("auto", "fp16", "bf16", "off"), default=None,
                    help="HuBERT autocast: auto (default; first of fp16, bf16 that matches "
@@ -62,6 +76,8 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                    help="input trim in dB on top of auto level (default: calibration.json)")
     p.add_argument("--conditioning", choices=("on", "off"), default=None,
                    help="the whole input chain (high-pass, level, limiter); off = raw mic")
+    p.add_argument("--suppression-mix", type=float, default=None,
+                   help="RNNoise wet/dry mix 0-1 when suppression is on (default 1)")
 
 
 def conditioning_config(profile, args: argparse.Namespace):
@@ -70,10 +86,12 @@ def conditioning_config(profile, args: argparse.Namespace):
 
     cal = profile.calibration
     trim = getattr(args, "input_gain_db", None)
+    mix = getattr(args, "suppression_mix", None)
     return ConditioningConfig(enabled=getattr(args, "conditioning", None) != "off",
                               auto_level=getattr(args, "auto_level", None) != "off",
                               trim_db=cal.input_gain_db if trim is None else trim,
-                              noise_floor_dbfs=cal.noise_floor_dbfs)
+                              noise_floor_dbfs=cal.noise_floor_dbfs,
+                              suppression_mix=1.0 if mix is None else mix)
 
 
 def gate_config(profile, args: argparse.Namespace):
@@ -93,6 +111,7 @@ def resolve(args: argparse.Namespace):
     import dataclasses
 
     from vox.config.store import load_profile, resolve_runtime_params
+    from vox.engine import chunker
     from vox.models.registry import ModelRegistry
 
     profile = load_profile(args.profile)
@@ -101,8 +120,15 @@ def resolve(args: argparse.Namespace):
     config = ModelRegistry(args.models_dir).config(args.model)
     params = resolve_runtime_params(profile, config, vars(args))
     shape = profile.runtime.shape()
-    overrides = {k: getattr(args, k) for k in ("block_ms", "crossfade_ms", "extra_ms")
-                 if getattr(args, k) is not None}
+    overrides = {k: getattr(args, k, None)
+                 for k in ("block_ms", "crossfade_ms", "extra_ms", "onset_ramp_ms")
+                 if getattr(args, k, None) is not None}
+    if "block_ms" in overrides:
+        snapped = chunker.snap_block_ms(overrides["block_ms"])
+        if snapped != overrides["block_ms"]:
+            print(f"hop {overrides['block_ms']:g} ms -> {snapped:g} ms (whole 20 ms HuBERT "
+                  "frames)")
+        overrides["block_ms"] = snapped
     shape = dataclasses.replace(shape, **overrides)
     precision = profile.runtime.precision()
     if args.hubert_fp16:
@@ -214,6 +240,8 @@ def _run_command(session, line: str) -> bool:
             print("params:", session.set_params(volume_envelope=float(arg)))
         elif cmd == "unvoiced":
             print("params:", session.set_params(f0_unvoiced=arg))
+        elif cmd == "ceiling":
+            print("params:", session.set_params(f0_ceiling_hz=float(arg)))
         elif cmd == "gate":
             print("gate:", session.set_gate(enabled=arg == "on"))
         elif cmd == "level":
@@ -221,8 +249,16 @@ def _run_command(session, line: str) -> bool:
                 print("input:", session.set_conditioning(auto_level=arg != "off"))
             else:
                 print("input:", session.set_conditioning(trim_db=float(arg)))
+        elif cmd == "suppress":
+            if arg in ("on", "off"):
+                session.suppression = arg == "on"
+                print("input:", session.set_conditioning(suppression=arg == "on"))
+            else:
+                print("input:", session.set_conditioning(suppression_mix=float(arg)))
         elif cmd == "hop":
-            print("shape:", session.set_shape(block_ms=float(arg)))
+            from vox.engine.chunker import snap_block_ms
+
+            print("shape:", session.set_shape(block_ms=snap_block_ms(float(arg))))
         elif cmd == "extra":
             print("shape:", session.set_shape(extra_ms=float(arg)))
         elif cmd == "crossfade":

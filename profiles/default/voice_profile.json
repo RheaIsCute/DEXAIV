@@ -11,9 +11,6 @@
     "spectral_tilt_db_per_oct": 0.0
   },
   "f0_extractor": {
-    "method": "rmvpe",
-    "f0_min_hz": 50.0,
-    "f0_max_hz": 1100.0,
     "median_filter_frames": 0,
     "octave_flip_rate": {}
   }

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from vox.audio import devices as audio_devices
+from vox.audio import suppression
 from vox.audio.conditioning import ConditioningConfig
 from vox.audio.recorder import SessionRecorder
 from vox.audio.rings import SPSCRing
@@ -93,6 +94,7 @@ class LiveSession:
         self.in_device = None
         self.out_device = None
         self.suppression = False
+        self.suppression_why = ""
         self._event_seq = 0  # first event the next snapshot reports
         self._record_events = 0  # first event of the current take
         self._record_started = 0.0
@@ -115,7 +117,12 @@ class LiveSession:
         input_name = self.in_device.name if self.in_device is not None else None
         self.suppression, why = resolve_suppression(cfg.suppression, cfg.suppression_profile,
                                                     input_name)
+        reason = suppression.unavailable_reason(sr)
+        if self.suppression and reason is not None:
+            self.suppression, why = False, f"unavailable: {reason}"
+        self.suppression_why = why
         self.log(f"suppression: {'on' if self.suppression else 'off'} ({why})")
+        cfg.conditioning = dataclasses.replace(cfg.conditioning, suppression=self.suppression)
 
         cache: dict = cfg.cache if cfg.cache is not None else {}
         engine = load_engine(cfg.models_dir, cfg.model, cfg.shape, cfg.params, cfg.precision,
@@ -144,7 +151,7 @@ class LiveSession:
         self.worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
                                       engine.timers, self.in_ring, self.out_ring, self.hop_event,
                                       fill_target, extractors, log=self.log,
-                                      conditioner=engine.conditioner)
+                                      conditioner=engine.conditioner, shape=cfg.shape)
         self.worker.start()
         self.worker.ready.wait(timeout=10.0)
 
@@ -183,13 +190,14 @@ class LiveSession:
 
     def describe(self) -> str:
         e, cfg = self.engine, self.cfg
-        plan = e.plan
+        plan = self.worker.plan  # the active plan: ``engine.plan`` is the one at start
         src = (f"file {cfg.input_file.name}" if cfg.input_file is not None
                else f"{self.in_device.index} {self.in_device.name}")
         return (f"live: {cfg.model} | in: {src} | out: {self.out_device.index} "
                 f"{self.out_device.name} | {plan.device_sr} Hz, callback {cfg.callback_ms:.0f} ms"
                 f" | hop {plan.block_ms:.0f} ms, overlap {plan.overlap_ms:.0f}, search "
-                f"{plan.search_ms:.0f}, extra {plan.extra_ms:.0f} | f0 {e.params.f0_method} | "
+                f"{plan.search_ms:.0f}, extra {plan.extra_ms:.0f} | f0 "
+                f"{self.worker.params.f0_method} | "
                 f"mode {e.mode} | gate {'on' if cfg.gate.enabled else 'off'} | "
                 f"suppression {'on' if self.suppression else 'off'} | "
                 f"fill target {1000 * self.worker.fill_target / plan.device_sr:.0f} ms | "
@@ -232,32 +240,37 @@ class LiveSession:
         recorder, self.worker.recorder = self.worker.recorder, None
         if recorder is None:
             return None
-        time.sleep(2 * self.engine.plan.block_ms / 1000.0)  # let a hop in flight finish
-        e = self.engine
+        time.sleep(2 * self.worker.plan.block_ms / 1000.0)  # let a hop in flight finish
+        e, w = self.engine, self.worker
+        plan = w.plan  # what ran: a live rebuild replaces it, ``engine.plan`` stays stale
         events = e.timers.events
         first = self._record_events
         meta = {
             "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._record_started)),
             "model": self.cfg.model, "input": self.describe(),
-            "params": dataclasses.asdict(self.worker.params),
-            "shape": dataclasses.asdict(self.cfg.shape),
-            "gate": dataclasses.asdict(self.worker.gate.config),
+            "params": dataclasses.asdict(w.params),
+            "shape": dataclasses.asdict(w.shape),
+            "gate": dataclasses.asdict(w.gate.config),
             "conditioning": dataclasses.asdict(self.cfg.conditioning),
-            "plan": {"hop_ms": e.plan.block_ms, "overlap_ms": e.plan.overlap_ms,
-                     "search_ms": e.plan.search_ms, "extra_ms": e.plan.extra_ms},
+            # RNNoise delays the conditioned track (and the output) against mic_raw
+            "input_chain_delay_ms": (e.conditioner.delay_ms
+                                     if getattr(e, "conditioner", None) is not None else 0.0),
+            "plan": {"hop_ms": plan.block_ms, "overlap_ms": plan.overlap_ms,
+                     "search_ms": plan.search_ms, "extra_ms": plan.extra_ms},
             "mode": e.mode,
             "event_counts_in_take": {k: sum(1 for ev in events.since(first) if ev["kind"] == k)
                                      for k in ("gate_open", "gate_close", "underrun")},
             "events": events.since(first),
             "underruns_session": self.out_ring.underruns,
             "note": "tracks are sample-aligned; output trails the mic by the SOLA delay "
-                    f"({e.plan.stream_delay * 1000 / e.plan.device_sr:.0f} ms)",
+                    f"({plan.stream_delay * 1000 / plan.device_sr:.0f} ms)",
         }
         stem = time.strftime("take_%Y%m%d_%H%M%S", time.localtime(self._record_started))
         return recorder.save(folder, stem, meta)
 
     def set_conditioning(self, **changes: Any) -> ConditioningConfig:
-        """Input chain, hot: ``auto_level``, ``trim_db`` (and the AGC's bounds)."""
+        """Input chain, hot: ``auto_level``, ``trim_db`` (and the AGC's bounds),
+        ``suppression`` and ``suppression_mix`` (crossfaded in the conditioner)."""
         config = dataclasses.replace(self.cfg.conditioning, **changes)
         self.cfg.conditioning = config
         self.worker.apply_conditioning(config)
@@ -265,7 +278,9 @@ class LiveSession:
 
     def set_shape(self, f0_method: str | None = None, sola_mode: str | None = None,
                   **changes: Any) -> ShapeParams:
-        """Restart-class: hop / extra / crossfade / F0 method. Brief gated pause."""
+        """Restart-class: hop / extra / crossfade / F0 method. Brief gated pause. Returns
+        the shape requested; ``worker.shape`` becomes it (as the chunker rounds it) once
+        the worker has rebuilt."""
         shape = dataclasses.replace(self.cfg.shape, **changes)
         self.cfg.shape = shape
         self.worker.apply_shape(ShapeRequest(shape, f0_method, sola_mode))
@@ -342,6 +357,7 @@ class LiveSession:
         sr = self.engine.plan.device_sr
         rate_note = (f" | INPUT RATE {rate:.0f} Hz != {sr} (device/driver mismatch, R9)"
                      if rate and abs(rate - sr) > 0.02 * sr else "")
+        rnnoise = f" + rnnoise {lat['input_chain']:.0f}" if lat.get("input_chain") else ""
         return (f"[{s['t']:6.1f}s] hop {s['total']['p50']:.1f}/{s['total']['p95']:.1f}/"
                 f"{s['total']['p99']:.1f} ms  f0 {pair('f0')} emb {pair('embed')} syn "
                 f"{pair('synth')} sola {pair('sola')} | ring in {s['in_fill_ms']:.0f} out "
@@ -352,5 +368,5 @@ class LiveSession:
                 f"{s['event_counts']['gate_close']} | in gain {s['input_gain_db']:+.0f} dB | est "
                 f"{lat['total']:.0f} ms (hop {lat['hop']:.0f} + in {lat['input_backlog']:.0f} + "
                 f"cmp {lat['compute']:.0f} + out {lat['output_ring']:.0f} + sola {lat['sola']:.0f}"
-                f" + dev {lat['devices']:.0f}) | peak in {s['input_peak']:.2f} out "
+                f" + dev {lat['devices']:.0f}{rnnoise}) | peak in {s['input_peak']:.2f} out "
                 f"{s['output_peak']:.2f}{rate_note}")

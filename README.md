@@ -116,6 +116,14 @@ vox gui --no-window                      # only the local control API; prints it
 
 Typing in the bar on the Live screen speaks the text in the model's voice over the same
 output as the live voice; the microphone is muted while the clip is rendered and played.
-Suppression, headphone monitoring, hop auto-tuning and calibration are shown but not built
-yet. Design, deviations and measured acceptance: [docs/gui/GUI_SPEC.md](docs/gui/GUI_SPEC.md)
-and section 6 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md).
+Headphone monitoring, hop auto-tuning and calibration are shown but not built yet. Design,
+deviations and measured acceptance: [docs/gui/GUI_SPEC.md](docs/gui/GUI_SPEC.md) and
+section 6 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md).
+
+**Speak / Sing** (next to Pitch on the Live screen) keeps two sets of pitch, index rate,
+protect and pitch ceiling per voice. Sing starts 5 semitones below your Speak pitch with
+less index, more protect, a soft pitch ceiling at 360 Hz and a gentler input level; move any
+slider in Sing to keep your own value. **Suppression** runs RNNoise on the microphone
+(`pip install --no-deps -r requirements/suppression.txt`); its Amount slider keeps some of
+the dry voice for sustained notes. It defaults off on the NVIDIA Broadcast mic, which is
+already denoised. Section 8 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md) has the details.

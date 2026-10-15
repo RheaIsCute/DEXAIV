@@ -587,3 +587,239 @@ it says (+14% F0 spread, median unchanged).
 - The engine's input level as heard in the GUI session: taken equal to the OBS capture.
 - MaeASMR, the model of the report's own recording.
 - Live runs used the file-backed input; the Shure MV6 was not connected.
+
+## 8. Singing, onsets, noise suppression (2026-10-15)
+
+The user now sings as well as speaks (sung F0 180-280 Hz against ~100-130 Hz speech). Two
+takes recorded with the Record button were analysed by a second external report:
+`take_20261015_004247` (Mom, 7 s) and `take_20261015_004329` (GoatMommy, 113 s), both
+through the NVIDIA Broadcast virtual mic with hops of 60 ms. Its findings were triaged by
+the feature prompt (v3); where the two differ, the prompt was followed. Same machine; NVIDIA
+Broadcast, Discord, browsers and OBS were resident on the GPU throughout (no other compute
+job), so "idle GPU" below means that. No A/B of section 7 had been listened to when this
+work started (the user had not found the files), so none of them became a default.
+
+### 8.1 Deviations
+
+| # | Prompt / report said | What was built | Why |
+|---|---|---|---|
+| S1 | Persisted runtime.json / gui_state.json store only what the user changed; new engine fields fall through | `RuntimeProfile`'s shape and precision fields and the voice profile's F0 method / range are `None` = "engine default" and never written (`store.save_as` drops unset values); `profiles/default/runtime.json` and `voice_profile.json` lost the ten copies of defaults they held; `gui_state.json` is saved compacted (no nulls, no empty groups, `exclusive` only once switched) | `save_tuned` rewrote the whole `RuntimeProfile` on every warmup, so runtime.json held a full copy of the defaults of the day: any later default (e.g. `decoder_context_ms`) would have been overridden by a stale `0.0`. The report's claim that the A/B fields were *disabled by* the profile is half right: they were off because they are off by default (no A/B approved); the clobbering was latent |
+| S2 | Shape / plan desync (take 1: shape 60, plan 30) | `LiveSession.describe()` and the take JSON read the worker's plan and a new `worker.shape` (set from the plan the chunker built at each rebuild); `engine.plan` is only the plan at start | Take 1 ran at 60 ms (119 hops in 7.14 s, fill target 140 = 70 x 60/30). The session had started at 30 ms and been rebuilt; the take reported the start plan |
+| S3 | Hop snapped to multiples of 20 ms in the controller and CLI; GUI slider steps by 20 | `chunker.snap_block_ms` (halves round up, minimum 20) in `EngineController.set_shape` and `_shape` (an old saved 30 becomes 40), `vox run --block-ms` / `hop MS`, `vox convert`; slider 20-100 step 20 | `hubert_phase_stable` always holds. The chunker still plans any 10 ms multiple: `vox bench` measures 30 ms hops on purpose |
+| S4 | Gate VAD: max probability over the hop's 512-sample chunks | `GateConfig.vad_reduce = "max"` (default); `"last"` keeps the pre-fix rule; a hop that completes no chunk keeps the previous probability | Stated in the prompt |
+| S5 | Onset: short (~5 ms) ramp instead of the overlap fade from a silent SOLA tail | `ShapeParams.onset_ramp_ms = 5` (0 = pre-fix); `Sola.mark_onset()` blends to the short sin^2 ramp through a 0-dim device weight inside the captured SOLA graph, for one hop; the worker and the simulator call it (and `pipeline.on_onset()`) on a gate onset when no drain is pending | The head of the onset hop is decoded audio from just before the block (the overlap + search decoded ahead of it), i.e. the consonant the gate opened on. It can only keep what was decoded: `overlap + search` = 30 ms before the block. `pv` SOLA mode is unchanged |
+| S6 | Speak / Sing preset switch, per model, each with its own pitch, index rate, protect, ceiling; Sing pitch = Speak - 5..6 st (configurable), index 0.3, protect 0.35 | Controller-level presets: the model entry of `gui_state.json` is Speak (as before), `models.<name>.sing` holds only the Sing values the user moved; Sing defaults: Speak pitch - 5 (`sing_pitch_offset` overrides), index 0.3, protect 0.35, ceiling 360 Hz; switching is hot (four `set_params` fields + the input chain), no recapture. Live screen: Speak / Sing next to Pitch; Settings: a Pitch ceiling slider (per preset) | The engine knows nothing of presets: they are four hot parameters and two input-chain bounds |
+| S7 | Soft F0 ceiling, semitone soft knee after transposition; off in Speak, ~360 Hz in Sing | `RuntimeParams.f0_ceiling_hz` (hot, 0 = off): `pitch.base.soft_ceiling`, unchanged up to 4 st below the ceiling, then `knee * 2^(4 tanh(st/4) / 12)`; a device scalar (inf = exact no-op), applied to the continuous F0 before the coarse buckets, live and in the full-file converter | It bends very high notes off-key and is a safety, not the fix: with the ceiling at 360 Hz a transposed 300 Hz note is untouched (0.01 st), 330 Hz comes out 0.28 st flat, 400 Hz 2.2 st flat, and 600 Hz is pinned near 360 Hz (8.9 st flat) (`tests/unit/test_pitch.py`) |
+| S8 | RMVPE right-edge guard: `TRIM_TAIL` 1 -> 2, A/B the pitch step at hop seams | `RuntimeParams.f0_trim_tail`, a recapture-class flag like `f0_bridge_ms`; **default 2** (the measurement in 8.4 agreed); `--f0-trim-tail 1` / `vox bench ... --set f0_trim_tail=1` is upstream | Like upstream, the trimmed estimate is written flush with the end of the cache, so the guard also puts F0 10 ms later against the features: it buys the seam frames 10 ms more right context that way. `test_pitch_cache_matches_full_window_f0` now states the alignment for either value |
+| S9 | Experimental `sine_phase_carry`: SineGen phase continuous across hops; persistent 0-dim buffer advanced by `shift_frames` each hop; reset on gate onset and recapture; graph-safe | As specified, but the buffer is the pipeline's (`HopPipeline.sine_phase`, `[1, 1, 1]`) and is passed down through `RvcModel.infer` -> `SineGen.forward(phase, phase_frames)`, which reads it and writes the phase at frame `shift_frames` in place. Off by default | The loaded model is shared with typed-clip renders on a second CUDA stream: a phase buffer stored on the model would be advanced by the clip render and raced by it |
+| S10 | RNNoise (48 kHz, 10 ms frames) after the high-pass, before AGC and the gate; live toggle with ~20 ms crossfade; `suppression_mix` | `audio/suppression.py`: the `rnnoise.dll` of the **pyrnnoise 0.4.5** wheel (xiph RNNoise, installed `--no-deps`, `requirements/suppression.txt`) through ctypes on preallocated buffers, one state carried across hops; mix and toggle as specified, plus a 100 ms unheard warm-up after an idle period; the user's on/off is remembered per microphone (`gui_state.json`), so the Broadcast mic keeps its own default (off, TARGET.md) | pyrnnoise is maintained and ships a Windows DLL (the machine has no compiler); its Python layer allocates per frame and imports audiolab and matplotlib, so only the DLL is used. Measured: **20 ms delay** (960 samples, correlation 0.99) and **0.39 ms CPU per 10 ms frame** (8.5) |
+| S11 | Sing preset: AGC max +10 dB, trim 0 dB; one-time toast when Broadcast is the input while singing | As specified; the input-gain slider is locked at 0 in Sing; the toast shows once per app run, on switching to Sing, choosing the Broadcast mic, or starting with both | |
+
+Not followed from the report (hard rules or not approved): lowering SineGen's unvoiced
+noise (`sine_amp / 3` is what the models were trained with); `f0_unvoiced = "interp"` as a
+default (it disables protect, which keys on `pitchf < 1`); `decoder_context_ms = 60`,
+`embed_pad_ms = 20`, `f0_bridge_ms = 50`, `noise_roll`, `volume_envelope = 0.4`, protect
+0.35 / index 0.3 as engine defaults (no A/B approved: the Sing preset carries index and
+protect only for singing); a 40 ms default hop; an onset margin of 3 dB (measured as an
+A/B, 8.3); a protect floor above 300 Hz. Two of the report's factual claims did not hold:
+the gate no longer wipes the pitch cache on close (section 7, fix 3), and "Promise you" was
+not cut by 170 ms (8.3).
+
+### 8.2 Step 1: hop size and the underruns
+
+The take-1 JSON counted 222 underruns *in the session*, none in the take. The user's
+account: "20 worked fine on a model but was stuttering on another, but 10 was worst on
+both" (the old hop slider went down to 10 ms). Measured with `vox bench underrun` (paced:
+hop N is available at N x hop, the output ring modelled as live with the default fill of
+two hops + 10 ms; 20 s of `mic_script.wav`, pitch +6, input chain on, gate off so every hop
+runs the model) and two 60 s live runs (`vox run --input-file ... --loop-file --output
+"Line 1" --exclusive --gate off`, the takes' output mode). "+Broadcast" = the NVIDIA
+Broadcast mic held open by a side process (audio discarded) so its denoiser runs on the
+same GPU, as when it is the input.
+
+| model | hop | extra | hop p50 / p99 (ms) | underruns |
+|---|---|---|---|---|
+| GoatMommy (48 kHz) | 20 | 1000 | 14.8 / 16.5 | 0 |
+| GoatMommy | 40 / 60 | 1000 | 14.9 / 16.6, 15.1 / 18.2 | 0 / 0 |
+| GoatMommy | 20 | **2200** (the takes) | 15.9 / 17.7 | 0 |
+| GoatMommy | 40 / 60 | 2200 | 15.9 / 17.4, 16.3 / 17.9 | 0 / 0 |
+| GoatMommy +Broadcast | 20 | 1000 / 2200 | 14.8 / 16.5, 16.1 / 18.0 | 0 / 0 |
+| GoatMommy +Broadcast | **10** | 2200 | 15.9 / 17.6 | **361 in 20 s** |
+| Mom (32 kHz) | 20 / 40 / 60 | 1000 | 14.8 / 16.6, 14.9 / 16.6, 15.5 / 19.0 | 0 / 0 / 0 |
+| Mom | 20 / 40 / 60 | 2200 | 15.9 / 17.6, 15.5 / 17.7, 15.8 / 17.7 | 0 / 0 / 0 |
+| Mom +Broadcast | 20 | 1000 / 2200 | 15.0 / 16.2, 16.5 / 18.5 | 0 / 0 |
+| live, GoatMommy, exclusive | 20 | 2200 | window p99 max 19.1 (60 s, 3,007 hops) | 0, no PortAudio flag |
+| live, GoatMommy +Broadcast | 20 | 2200 | window p99 max 18.9 (60 s) | 0, no flag |
+
+- **Hop 10 cannot work on this GPU**: the hop costs ~16 ms (R5), over a 10 ms budget every
+  time. 361 underruns in 20 s; a few seconds there account for the session's 222. The hop
+  is now snapped to multiples of 20 ms everywhere a user picks it, so 10 is no longer
+  offered.
+- **Hop 20 does not underrun** on an idle GPU at either context, with either model, with or
+  without Broadcast's denoiser running (it costs ~0.3-0.9 ms of p99 at 2200 ms context).
+  The "stutter on one model at 20 ms" is not reproduced as an underrun. What does change
+  between 20 and 60 ms on sung notes is the seam rate (50 vs 17 per second) with SOLA
+  offsets jumping ~3 ms at most seams (8.4), which is audible as flutter on held notes
+  rather than as gaps. The Performance screen's underrun counter tells the two apart on the
+  user's side: flutter with 0 underruns is the former.
+- Not hidden by a larger hop: the default stays 20 ms. Take 1's "fill target 140 ms" is a
+  70 ms target (a 30 ms start) scaled by the rebuild to 60 ms.
+- The 2-minute gated soaks of 8.5 show p99 windows of 21-24 ms at the same script position
+  every loop (the first hops after a gated pause), with or without suppression: a pre-existing
+  effect, absorbed by the 50 ms fill target except once with suppression on.
+
+### 8.3 Step 2: phrase entrances
+
+`vox bench onset` on take 2's raw mic track from 21.0 s through 75 s (so the auto level has
+its session state at both entrances), GoatMommy +6, gate -45 dBFS, trim -3 dB (the take's
+settings), hop 60 (the takes) and 20. "Lag" = the first output frame within 30 dB of the
+output's loud frames, minus the input entrance (10 ms frames).
+
+| entrance | hop | pre-fix | VAD max | + 5 ms ramp (default) | A/B: onset margin 3 dB |
+|---|---|---|---|---|---|
+| "Promise you" (22.0 s) | 60 | gate +20 ms, lag 0 | same | same; first 30 ms +2.7 dB | same as default |
+| | 20 | gate +60 ms, lag 40 | same | same; first 30 ms -0.9 dB | same as default |
+| "In you and me" (72.83 s) | 60 | gate **+190 ms**, lag 160 | same | same; first 30 ms +1.9 dB | gate **+10 ms**, lag 0 |
+| | 20 | gate **+170 ms**, lag 140 | same | same | gate **+30 ms**, lag 0 |
+
+- **"Promise you" was not amputated.** On the Broadcast mic the pause before it is digital
+  silence (Broadcast gates its output) and the "Pr" is -75 to -60 dBFS in the raw track:
+  Broadcast removed the plosive before the engine saw it. The energy-onset rule (a rise of
+  >12 dB to >6 dB over the threshold) opens the gate on the first loud hop. The report's
+  21.85 s start does not match the track, which is digital silence until 21.96 s.
+- **"In you and me" was clipped by 140-190 ms, and the two prompt fixes do not change it.**
+  The sung entrance is soft: about -41 dBFS after conditioning, 4 dB over the -45 gate and
+  2 dB under the +6 dB energy margin, so the gate waits for Silero, which reaches 0.5 only
+  ~140 ms in (0.09, 0.36, 0.39, 0.25, 0.66 over the first 32 ms chunks). Taking the max over
+  a hop's chunks cannot help when every chunk is under 0.5, and the ramp can only keep what
+  is decoded ahead of the block (overlap + search = 30 ms).
+- **An energy-onset margin of 3 dB opens it 10-30 ms after the entrance** (the A/B column;
+  `GateConfig.onset_margin_db`, unchanged default 6). Not made a default: it was not asked
+  for, and on a raw mic whose room tone the auto level lifts it may reopen the gate in
+  pauses more often (section 7 needed the rise rule for exactly that; not measured here).
+- The short ramp does what it should where the onset hop has decoded audio before the block:
+  the first 30 ms of output gain ~2-3 dB at hop 60; at hop 20 the onset hop's head is the
+  previous hop's region and gains little. `tests/unit/test_sola.py` and
+  `tests/engine/test_singing.py` cover it (a decoded burst at the head of the onset hop keeps
+  >65% of its energy against <15% with the overlap fade).
+- Listening clips (L = raw mic, R = output): `out/ab/onset_{promise,inyou}_{before,vad_max,
+  after,margin_3db}_hop{20,60}.wav`.
+
+### 8.4 Step 3: singing
+
+`vox bench sing` on take 2's first 13.5 s (continuous singing, 7.8 s of held notes), Sing
+preset (index 0.3, protect 0.35, ceiling 360 Hz, input chain +10 dB max / trim 0), pitch +6,
+hop 20 unless stated, every hop through the model. Offsets and jumps after the first second;
+"held" = hops that kept the previous hop's SOLA offset; "seam" = |cents| between the F0 a hop
+rendered its saved tail with and the F0 the next hop renders the same frames with (voiced
+frames). Click = seam vs mid-hop roughness (+-0.07 between seeds, 8.6). These ran before the
+trim-tail default changed, so every row but `trimtail 2` has `f0_trim_tail = 1`.
+
+| model, hop | variant | offset p50 | held | jump mean / p95 (ms) | seam p50 / p95 (cents) | click | output F0 p95 / max (Hz) |
+|---|---|---|---|---|---|---|---|
+| GoatMommy, 20 | reference (trim 1) | 5.88 ms | - | 2.96 / 7.35 | 1.6 / **21.1** | 1.35 | 325 / 341 |
+| | **trim tail 2** | 6.33 | - | 2.95 / 7.57 | 1.1 / **9.9** | 1.41 | 325 / 341 |
+| | phase carry | 5.58 | - | 2.56 / 7.27 | 1.6 / 21.1 | 1.48 | 326 / 341 |
+| | noise roll | 5.81 | 7% | 2.53 / 7.25 | 1.6 / 21.1 | 1.44 | 325 |
+| | carry + roll | 5.00 | 9% | 2.03 / 7.26 | 1.6 / 21.1 | 1.37 | 325 |
+| | carry + roll + 80 ms decoder context | 4.02 | 19% | 1.15 / 5.07 | 1.6 / 21.1 | 1.40 | 326 |
+| | no ceiling | 5.77 | - | 3.04 / 7.73 | 1.7 / 21.1 | 1.33 | **331 / 357** |
+| GoatMommy, 60 | reference / trim 2 | 3.99 / 4.41 | - | 2.90 / 3.44 | 1.8 / 22.2 -> 1.3 / **17.3** | 0.86 / 0.80 | 324 |
+| | phase carry | 4.08 | - | 2.71 / 6.32 p95 | 1.8 / 22.2 | 0.92 | 323 |
+| Mom, 20 | reference (trim 1) | 5.71 | 1% | 3.05 / 7.53 | 1.6 / 21.1 | 1.24 | 332 |
+| | trim tail 2 | 5.83 | 1% | 2.95 / 7.70 | 1.1 / **9.9** | 1.33 | 332 |
+| | phase carry | 6.19 | 2% | 2.59 / 8.01 | 1.6 / 21.1 | 1.39 | 331 |
+| | carry + roll + 80 ms decoder context | 4.52 | 11% | 1.54 / 6.06 | 1.6 / 21.1 | 1.43 | 330 |
+| | no ceiling | 5.85 | 1% | 3.05 / 7.71 | 1.7 / 21.1 | 1.31 | 336 |
+
+On speech (`vox bench ab`, Mom +12, `mic_script.wav`, gate -40, the section 7 setup):
+
+| variant | R3 | click | voiced | HF/LF p90 |
+|---|---|---|---|---|
+| reference (trim 1) | 0.725 (2.73x) | 1.31 | 67.5% | +13.0 dB |
+| trim tail 2 | 0.727 (2.74x) | 1.38 | 69.4% | +12.5 dB |
+| phase carry | 0.728 (2.74x) | 1.23 | 69.8% | +13.0 dB |
+
+- **Trim tail 2 halves the pitch step at the seams of held notes** (p95 21 -> 10 cents at
+  hop 20 on both voices, 22 -> 17 at hop 60) and is neutral on speech R3. It costs a
+  slightly rougher seam by the click metric (+0.06-0.09, at the edge of the seed spread)
+  and puts F0 10 ms later against the features (S8; the +1.9 points of voicing on speech
+  are likely voicing reaching 10 ms further into consonants). Made the default, as the
+  prompt states; `f0_trim_tail = 1` is the A/B the other way.
+- **The ceiling** at 360 Hz pulled GoatMommy +6's sung peaks from 357 to 341 Hz (F0 p95
+  331 -> 325); on Mom +6, p95 336 -> 332. On these takes it rarely engages; it is there for
+  +11-type transpositions of a sung line.
+- **Phase carry does not make the offsets collapse toward 0** (at 0: 1-2% of hops in every
+  variant). Alone it trims the mean offset jump by 15% and roughens the seams (click +0.13);
+  combined with noise roll and 80 ms of decoder context the renders become more coherent
+  (19% of hops keep the previous offset, mean jump 1.15 ms) but the click ratio still ends
+  up worse than the reference. The sine phase is not what decorrelates consecutive hops: the
+  latent noise is redrawn per hop (noise roll fixes that), and the head of each decoded slice
+  sits on the decoder's zero-padded left edge (decoder context fixes that). On held notes
+  SOLA also jumps between whole F0 periods (2.5-4 ms at 255-395 Hz), which is benign. Not
+  clearly helpful: `sine_phase_carry` stays off, and the 5 ms search was not tried (the
+  chunker plans search in whole 10 ms frames; 5 ms would need sub-frame planning, and the
+  premise did not hold).
+- Wavs: `out/ab/sing_{phasecarry_off,phasecarry_on,noiseroll,phasecarry_noiseroll,
+  phasecarry_noiseroll_decctx80,trimtail_2,ceiling_off}.wav` (GoatMommy, hop 20),
+  `hop60_sing_*` (GoatMommy, hop 60), `mom_sing_*` (Mom, hop 20), `s8_{reference,
+  trimtail_2,phase_carry}.wav` (speech).
+
+### 8.5 Step 4: noise suppression
+
+`vox bench suppress` (CPU; RMVPE only to find held notes) on the raw default-mic OBS capture
+of 2026-10-13 (49 s, unity gain, no filters) and take 2's mic track; live numbers from two
+2-minute soaks (GoatMommy +6 with the Sing preset's values, hop 20, extra 1000, gate -40,
+`mic_script.wav` looped, VAC exclusive).
+
+| measure | result |
+|---|---|
+| added latency | **20.0 ms** (960 samples; cross-correlation 0.99). Blocks are whole 10 ms frames, so there is no further alignment buffer. The latency estimate and the take JSON (`input_chain_delay_ms`) include it while it runs |
+| CPU per hop (worker thread) | 20 ms hop: p50 0.78 ms, p99 1.02 ms; 60 ms hop: 2.28 / 2.52 ms (0.39 ms per 10 ms frame) |
+| raw-mic pauses (room tone, fan, bleed) | mix 1.0: **-11.7 dB**; mix 0.5: -5.1 dB |
+| loudest 2% of pause frames (clicks, keys, thumps) | mix 1.0: -12.2 dB; mix 0.5: -5.2 dB |
+| speech frames | -0.1 dB at either mix |
+| held sung notes, 1.5-4 kHz | mix 1.0: -0.1 dB; mix 0.5: 0.0 dB (0.1-1 kHz: 0.0) |
+| live toggle inside speech | largest step in the 20 ms fade: 0.30x (on) and 1.07x (off) the speech's own p99.9 step there: no click |
+| live soak, suppression on vs off | 1 underrun (10 ms, at 11.2 s) vs 0; window p99 median 17.9 vs 17.2 ms, max 24.2 vs 23.4 ms |
+
+- The sung-note figure is on take 2's mic track, which NVIDIA Broadcast had already
+  denoised (and, per the report, notched): it shows RNNoise does not carve those notes
+  further, not what it does to a raw sustained note. That needs the user's raw-Shure
+  re-record.
+- RNNoise's ~0.8 ms per 20 ms hop is on the worker's critical path (it has to precede the
+  upload and the gate). It pushed one of the existing 21-24 ms post-pause spikes into a
+  10 ms underrun in 2 minutes. Moving it off that path (into the input callback, whose
+  10 ms blocks are exactly one RNNoise frame) is the follow-up if the user's soak shows
+  underruns with suppression on; it would move the high-pass with it.
+- The Broadcast rule stands: on the "NVIDIA Broadcast" mic suppression defaults off (and
+  the state says why); switching it on there is remembered for that mic only.
+
+### 8.6 What changed by default, and the tests
+
+Defaults: hop choices snap to 20 ms; the gate takes the max VAD probability over a hop's
+chunks; the onset hop fades in over 5 ms; `f0_trim_tail = 2`; shape and precision come from
+the engine defaults unless a profile file sets them. New and opt-in: the Sing preset (Speak
+is the old behaviour), the soft ceiling (off in Speak), suppression (off unless switched on
+or `rnnoise_enabled` in calibration.json; off on the Broadcast mic). Off: `sine_phase_carry`.
+
+Tests: 400 CPU tests (unit, api, tts; 368 before) and the GPU engine tests (28 pass, one
+seam xfail, one seam xpass) pass. New: profile fall-through
+(`test_schemas`, `test_target`, `test_controller`), hop snapping (`test_controller`), VAD
+max-prob (`test_gate`), onset ramp (`test_sola`, `test_singing`), suppression state,
+alignment, crossfade and allocation (`test_suppression`), presets and persistence
+(`test_controller`), soft ceiling and trim tail (`test_pitch`), phase carry
+(`test_sine_phase`, `test_singing`), take report (`test_live_session`). The two seam-click
+xfails of section 7 are no longer strict: the ratio moves 1.18-1.45 with the decoder-noise
+seed alone on the test clip, and trim tail 2 with seed 0 landed under the 1.25 guard.
+
+### 8.7 Not verified
+
+- Nothing was listened to; every new wav is for the user's ears.
+- No raw (non-Broadcast) singing: the acceptance re-record (raw Shure, Sing preset) is the
+  user's. The entrance and suppression conclusions above rest on Broadcast-processed takes.
+- The GUI controls were driven through the controller API and its tests, and rendered once
+  headless (Live and Settings, in Speak and in Sing, on a copy of the profile); a person did
+  not click them in the window. The Broadcast toast was checked in the tests only.
+- Live runs used the file-backed input; the microphone path through the GUI was not run.
+- The 3 dB onset margin was not measured for false openings on a raw mic in pauses.

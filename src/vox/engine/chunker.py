@@ -19,10 +19,22 @@ FRAME_16K = 160  # one 10 ms feature frame
 MAX_SOLA_UNITS = 4  # overlap is pure algorithmic latency: capped at 40 ms
 HUBERT_STRIDE = 320
 HUBERT_FIELD = 400
+# The hop the user picks (GUI, ``vox run``) is a whole number of 20 ms HuBERT frames, so
+# ``hubert_phase_stable`` always holds. The chunker itself still plans any 10 ms multiple
+# (benchmarks measure 30 ms hops on purpose).
+HOP_STEP_MS = 20.0
 
 
 class ChunkPlanError(ValueError):
     pass
+
+
+def snap_block_ms(block_ms: float) -> float:
+    """Nearest multiple of ``HOP_STEP_MS`` (halves round up), at least one step. Values
+    <= 0 pass through unchanged so the planner can reject them."""
+    if block_ms <= 0:
+        return block_ms
+    return HOP_STEP_MS * max(1, math.floor(block_ms / HOP_STEP_MS + 0.5))
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,9 @@ class ChunkPlan:
     decoder_out: int  # samples at model_sr
     out_device: int  # samples at device_sr: block + sola_buffer + sola_search
     embed_pad_16k: int = 0  # replicated right edge appended before ContentVec (A/B)
+    # Device samples of the fade-in on a gate-onset hop; 0 or >= sola_buffer = the plain
+    # overlap fade (engine/sola.py ``mark_onset``).
+    onset_ramp: int = 0
 
     def ms(self, device_samples: int) -> float:
         return 1000.0 * device_samples / self.device_sr
@@ -119,13 +134,14 @@ def from_shape(shape, model_sr: int, f0_tail_16k: int = 0) -> ChunkPlan:
     """``plan`` for a ``ShapeParams`` (read by attribute: the chunker imports nothing)."""
     return plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms, shape.sola_search_ms,
                 shape.device_sr, model_sr, f0_tail_16k, shape.decoder_context_ms,
-                shape.overlap_beyond_hop, round(ANALYSIS_SR * shape.embed_pad_ms / 1000.0))
+                shape.overlap_beyond_hop, round(ANALYSIS_SR * shape.embed_pad_ms / 1000.0),
+                shape.onset_ramp_ms)
 
 
 def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: float,
          device_sr: int, model_sr: int, f0_tail_16k: int = 0,
          decoder_context_ms: float = 0.0, overlap_beyond_hop: bool = False,
-         embed_pad_16k: int = 0) -> ChunkPlan:
+         embed_pad_16k: int = 0, onset_ramp_ms: float = 0.0) -> ChunkPlan:
     """Derive every size from the four user-facing durations.
 
     ``f0_tail_16k`` is the pitch extractor's tail requirement; when it exceeds the
@@ -133,6 +149,7 @@ def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: 
     lifts the overlap <= hop clamp (the pre-fix geometry, for A/B listening only).
     ``embed_pad_16k`` samples of replicated right edge are appended to the window before
     ContentVec (A/B: so its last 50 Hz frame covers the end of the window).
+    ``onset_ramp_ms`` is the fade-in of a gate-onset hop (any length, not 10 ms units).
     """
     if device_sr % 100 or model_sr % 100:
         raise ChunkPlanError("sample rates must be multiples of 100 Hz")
@@ -180,4 +197,5 @@ def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: 
         shift_frames=block_u, hubert_frames=hubert_frames, p_len=p_len,
         decoder_out=return_length * (model_sr // 100), out_device=return_length * zc,
         embed_pad_16k=embed_pad_16k,
+        onset_ramp=max(0, round(device_sr * onset_ramp_ms / 1000.0)),
     )

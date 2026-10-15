@@ -43,6 +43,14 @@ from vox.profiling.timers import StageTimers
 HOLD_CUSHION_S = 0.5  # silence queued while a hold shares the GPU with a clip render
 
 
+def _applied(shape: ShapeParams, plan: chunker.ChunkPlan) -> ShapeParams:
+    """``shape`` with the sizes the chunker actually planned (whole 10 ms units)."""
+    return dataclasses.replace(shape, block_ms=plan.block_ms,
+                               crossfade_ms=plan.ms(plan.crossfade),
+                               sola_search_ms=plan.search_ms, extra_ms=plan.extra_ms,
+                               device_sr=plan.device_sr)
+
+
 @dataclass
 class ShapeRequest:
     shape: ShapeParams
@@ -86,9 +94,14 @@ class InferenceWorker(threading.Thread):
                  graphs: StageGraphs, timers: StageTimers, in_ring: SPSCRing,
                  out_ring: SPSCRing, hop_event: threading.Event, fill_target: int,
                  extractors: dict[str, PitchExtractor] | None = None,
-                 log=print, conditioner: InputConditioner | None = None) -> None:
+                 log=print, conditioner: InputConditioner | None = None,
+                 shape: ShapeParams | None = None) -> None:
         super().__init__(name="vox-inference", daemon=True)
         self.pipeline = pipeline
+        # The shape the hop runs at, as the chunker rounded it: replaced by ``_rebuild``
+        # together with the plan, so a report never pairs a new shape with an old plan.
+        self.shape = _applied(shape or ShapeParams(device_sr=pipeline.plan.device_sr),
+                              pipeline.plan)
         self.sola = sola
         self.gate = gate
         # The microphone's input chain (high-pass, auto level, trim, soft limit) runs on
@@ -172,6 +185,8 @@ class InferenceWorker(threading.Thread):
             "hop": plan.block_ms, "input_backlog": s.in_backlog_ms, "compute": compute_p50_ms,
             "output_ring": s.out_fill_ms, "sola": plan.overlap_ms + plan.search_ms,
             "devices": device_ms,
+            # RNNoise's own delay while suppression runs (audio/suppression.py)
+            "input_chain": self.conditioner.delay_ms if self.conditioner is not None else 0.0,
         }
         parts["total"] = sum(parts.values())
         return parts
@@ -251,6 +266,11 @@ class InferenceWorker(threading.Thread):
                                     vad_prob=decision.vad_prob)
         silent = False  # this hop puts nothing but zeros in the ring
         if decision.speech:
+            if decision.onset and not sola.draining:
+                # Gate onset: short fade-in (keeps the decoded pre-onset consonant) and the
+                # sine phase restarts, as the first hop of a stream does.
+                sola.mark_onset()
+                pipeline.on_onset()
             infer = pipeline.process_hop()
             with timers.stage("sola"):
                 stitched = sola.stitch(infer)
@@ -342,6 +362,7 @@ class InferenceWorker(threading.Thread):
             self.graphs.capture()
         except Exception as err:  # noqa: BLE001
             self.log(f"worker: recapture after {why} failed ({err}); running eager")
+        self.pipeline.on_onset()  # carried sine phase restarts with the new graphs
         self.log(f"worker: recaptured graphs ({why}) in "
                  f"{(time.perf_counter() - start) * 1000:.0f} ms")
 
@@ -369,6 +390,7 @@ class InferenceWorker(threading.Thread):
         plan = chunker.from_shape(shape, model.tgt_sr, f0_tail)
         if plan.overlap_note:
             self.log(f"worker: {plan.overlap_note}")
+        self.shape = _applied(shape, plan)
         # 3. replan everything that depends on the plan
         pipeline.set_plan(plan)
         pipeline.set_params(self.params)

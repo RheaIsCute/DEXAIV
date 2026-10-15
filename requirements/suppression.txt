@@ -1,0 +1,7 @@
+# Noise suppression (RNNoise) on the live mic. Optional: without it the Suppression switch
+# says why it is unavailable. Install WITHOUT dependencies:
+#   pip install --no-deps -r requirements/suppression.txt
+# Only the wheel's rnnoise.dll (xiph RNNoise, BSD) is used, through ctypes on preallocated
+# buffers (src/vox/audio/suppression.py). The package's own Python layer allocates per
+# frame and pulls audiolab / matplotlib / tqdm, none of which the engine needs.
+pyrnnoise==0.4.5
