@@ -131,3 +131,7 @@ speaking and steers it onto the voice's own pitch, so a low mumble and an excite
 register both reach the model where it was trained; your intonation is kept.
 Typed clips follow the TTS voice's own loudness (`vox say --plain` for the
 model's level). Section 8 of [docs/DEVIATIONS.md](docs/DEVIATIONS.md) has the details.
+
+How the conversion is put together: [docs/ARCHITECTURE_AND_METHODS.md](docs/ARCHITECTURE_AND_METHODS.md). What to collect when something sounds wrong:
+[docs/WHAT_I_NEED_TO_DEBUG.md](docs/WHAT_I_NEED_TO_DEBUG.md). Every recording and
+A/B render so far: [takes/](takes/README.md) (Git LFS).

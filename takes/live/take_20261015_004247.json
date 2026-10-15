@@ -1,0 +1,82 @@
+{
+ "started": "2026-10-15 00:42:47",
+ "model": "Mom",
+ "input": "live: Mom | in: 28 Microphone (NVIDIA Broadcast) | out: 23 Line 1 (Virtual Audio Cable) | 48000 Hz, callback 10 ms | hop 30 ms, overlap 20, search 10, extra 2200 | f0 rmvpe | mode graphs | gate on | suppression off | fill target 140 ms | device latency in 22.0 / out 10.7 ms",
+ "params": {
+  "f0_up_key": 11.0,
+  "index_rate": 0.85,
+  "protect": 0.22,
+  "volume_envelope": 1.0,
+  "f0_method": "rmvpe",
+  "f0_min_hz": 50.0,
+  "f0_max_hz": 1100.0,
+  "f0_unvoiced": "zero",
+  "sid": 0,
+  "sola_mode": "plain",
+  "f0_bridge_ms": 0.0,
+  "noise_roll": false
+ },
+ "shape": {
+  "block_ms": 60.0,
+  "crossfade_ms": 20.0,
+  "sola_search_ms": 10.0,
+  "extra_ms": 2200.0,
+  "device_sr": 48000,
+  "decoder_context_ms": 0.0,
+  "overlap_beyond_hop": false,
+  "embed_pad_ms": 0.0
+ },
+ "gate": {
+  "enabled": true,
+  "threshold_dbfs": -45.0,
+  "vad_threshold": 0.5,
+  "hangover_ms": 350,
+  "use_vad": true,
+  "hysteresis_db": 6.0,
+  "vad_hysteresis": 0.15,
+  "onset_margin_db": 6.0
+ },
+ "conditioning": {
+  "enabled": true,
+  "auto_level": true,
+  "trim_db": 3.0,
+  "highpass_hz": 70.0,
+  "target_dbfs": -20.0,
+  "max_gain_db": 18.0,
+  "min_gain_db": -12.0,
+  "noise_floor_dbfs": -60.0,
+  "freeze_margin_db": 6.0,
+  "limit_dbfs": -3.0
+ },
+ "plan": {
+  "hop_ms": 30.0,
+  "overlap_ms": 20.0,
+  "search_ms": 10.0,
+  "extra_ms": 2200.0
+ },
+ "mode": "graphs",
+ "event_counts_in_take": {
+  "gate_open": 1,
+  "gate_close": 0,
+  "underrun": 0
+ },
+ "events": [
+  {
+   "seq": 10,
+   "kind": "gate_open",
+   "hop": 2699,
+   "t": 85.00166749999698,
+   "value": -32.21946119272778
+  }
+ ],
+ "underruns_session": 222,
+ "note": "tracks are sample-aligned; output trails the mic by the SOLA delay (30 ms)",
+ "sr": 48000,
+ "seconds": 7.14,
+ "files": {
+  "output": "take_20261015_004247_output.wav",
+  "mic_raw": "take_20261015_004247_mic_raw.wav",
+  "mic_conditioned": "take_20261015_004247_mic_conditioned.wav"
+ },
+ "gate_open_per_hop": "00000000000000000000000000001111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+}

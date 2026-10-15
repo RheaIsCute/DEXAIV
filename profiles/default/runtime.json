@@ -576,6 +576,28 @@
           "hops": 50
         }
       }
+    },
+    "Mom|hop40|extra1900|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.019684305414557457,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 17.13209999797982,
+          "p99": 18.606524003771483,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 16.60855000227457,
+          "p99": 18.694849000457907,
+          "hops": 50
+        }
+      }
     }
   }
 }
