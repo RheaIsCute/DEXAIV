@@ -152,6 +152,120 @@
           "hops": 50
         }
       }
+    },
+    "Mom|hop20|extra1100|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.043534036725759506,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 15.570850000585779,
+          "p99": 18.629748997736897,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 15.91914999880828,
+          "p99": 17.186651998054003,
+          "hops": 50
+        }
+      }
+    },
+    "Mom|hop40|extra2500|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.02221282571554184,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 16.596850000496488,
+          "p99": 18.42204799901083,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 16.46249999976135,
+          "p99": 17.49142400105484,
+          "hops": 50
+        }
+      }
+    },
+    "Mom|hop20|extra1400|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "off",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.0825483575463295,
+          "passed": false
+        },
+        "bf16": {
+          "log_mel_l1": 0.22725766897201538,
+          "passed": false
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 16.184500002054847,
+          "p99": 17.900749000509677,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 15.683399999034009,
+          "p99": 16.269459001305222,
+          "hops": 50
+        }
+      }
+    },
+    "GoatMommy|hop20|extra1400|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.026475287973880768,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": false,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 16.309750000800705,
+          "p99": 17.498606998524338,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 17.621549999603303,
+          "p99": 19.51866000006703,
+          "hops": 50
+        }
+      }
+    },
+    "GoatMommy|hop100|extra1400|xf20|search10|sr48000|rmvpe|dec32|torch2.7.1+cu128": {
+      "hubert_autocast": "fp16",
+      "hubert_match": {
+        "fp16": {
+          "log_mel_l1": 0.024903252720832825,
+          "passed": true
+        }
+      },
+      "cudnn_autotune": true,
+      "cudnn_timings": {
+        "heuristic": {
+          "p50": 19.009950001418474,
+          "p99": 20.804766000437667,
+          "hops": 50
+        },
+        "autotune": {
+          "p50": 18.022750000454835,
+          "p99": 19.539700000314042,
+          "hops": 50
+        }
+      }
     }
   }
 }

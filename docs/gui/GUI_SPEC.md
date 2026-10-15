@@ -42,6 +42,10 @@ they show; where behavior isn't visible in static HTML, this document defines it
   the one the gate measures. "Auto level" toggle (default on) and an "Input gain" slider
   (-12..+24 dB, a trim on top of auto level, or the whole gain with it off); its label
   shows the gain being applied while live.
+- (Added 2026-10-15.) Record button beside START, live only: captures the raw mic, the mic
+  after the input chain and the converted output as sample-aligned float32 WAVs plus a JSON
+  (settings, gate events) in `recordings/`; stopping (or stopping the engine) saves the take
+  and opens Explorer with the output file selected.
 - Type-to-speak bar: text + Enter (or Speak) renders TTS via src/vox/tts and plays it
   through the SAME output path as live conversion. While the clip plays, the converted
   mic feed is muted (priority override), then live resumes; the engine never stops.

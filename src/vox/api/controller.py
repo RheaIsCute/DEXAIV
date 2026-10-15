@@ -102,6 +102,13 @@ def _clean(value: Any) -> Any:
     return value
 
 
+def _reveal_in_explorer(path: Path) -> None:
+    """Open a File Explorer window on ``path``'s folder with the file selected."""
+    import subprocess
+
+    subprocess.Popen(f'explorer /select,"{Path(path)}"')
+
+
 def _db(amplitude: float) -> float:
     return 20.0 * math.log10(amplitude) if amplitude > 1e-6 else METER_FLOOR_DB
 
@@ -111,10 +118,17 @@ class EngineController:
                  input: str | int | None = None, output: str | int | None = None,
                  device: str | None = None, input_file: Path | None = None,
                  loop_file: bool = False, reports_dir: Path | None = None,
-                 bus: EventBus | None = None, session_factory=LiveSession, log=print) -> None:
+                 bus: EventBus | None = None, session_factory=LiveSession, log=print,
+                 recordings_dir: Path | None = None, reveal=None) -> None:
         self.models_dir = Path(models_dir)
         self.profile_dir = Path(profile_dir)
         self.reports_dir = Path(reports_dir) if reports_dir else self.profile_dir / "reports"
+        # Takes of the Record button (mic + output WAVs); ``reveal`` shows a saved file
+        # (default: Windows Explorer with the file selected).
+        self.recordings_dir = (Path(recordings_dir) if recordings_dir
+                               else self.models_dir.parent / "recordings")
+        self._reveal = reveal or _reveal_in_explorer
+        self._last_take: str | None = None
         self.device = device
         self.input_file = input_file
         self.loop_file = loop_file
@@ -457,6 +471,9 @@ class EngineController:
                 "exclusive": bool(self.store.get("exclusive")),
                 "devices": self._devices(),
                 "tts": self._tts_state(),
+                "recording": {"active": running
+                              and getattr(session, "recording", None) is not None,
+                              "last": self._last_take},
                 "models": models,
                 "models_dir": str(self.models_dir),
                 "profile": {"name": self.profile_dir.name,
@@ -564,6 +581,8 @@ class EngineController:
             return
         self.status = "stopping"
         self.publish_state()
+        if getattr(session, "recording", None) is not None:  # stopping mid-take keeps it
+            self._save_take(session)
         try:
             with self._pa_lock:
                 session.stop()
@@ -575,6 +594,35 @@ class EngineController:
         if self.session is not None:
             self._stop()
             self._start()
+
+    # recording ---------------------------------------------------------------------
+
+    def record(self, enabled: bool) -> dict[str, Any]:
+        """Start or stop a take: raw mic, conditioned mic and converted output as aligned
+        WAVs plus a JSON of the settings and gate events, in ``recordings/``. Stopping
+        opens Explorer on the output file."""
+        session = self.session
+        if enabled:
+            if session is None or self.status != "running":
+                raise ApiError("Start the engine to record")
+            session.start_recording()
+            self.publish_state()
+            return {"recording": True}
+        if session is None or session.recording is None:
+            return {"recording": False}
+        return self._submit("Saving recording", self._save_take, session)
+
+    def _save_take(self, session) -> None:
+        paths = session.stop_recording(self.recordings_dir)
+        if paths is None:
+            return
+        self._last_take = str(paths["output"])
+        self._log(f"recording saved: {paths['output']}")
+        self.toast(f"Recording saved: {paths['output'].name}")
+        try:
+            self._reveal(paths["output"])
+        except Exception as err:  # noqa: BLE001 - the take is saved either way
+            self._log(f"could not open Explorer: {err}")
 
     # hot parameters ----------------------------------------------------------------
 
@@ -1066,10 +1114,12 @@ class EngineController:
         stats, health = session.worker.stats, session.audio.health
         out_peak, health.output_peak = health.output_peak, 0.0
         health.input_peak = 0.0
+        take = getattr(session, "recording", None)
         return _clean({"running": True, "in_db": stats.gate_rms_dbfs, "out_db": _db(out_peak),
                        "in_gain_db": stats.input_gain_db,
                        "gate_open": stats.gate_open, "vad": stats.gate_vad,
-                       "speaking": session.worker.override.active})
+                       "speaking": session.worker.override.active,
+                       "rec_s": take.seconds if take is not None else None})
 
     def _publish_perf(self, session) -> None:
         snap = session.snapshot()
@@ -1117,7 +1167,7 @@ class EngineController:
 COMMANDS = {
     "start": "start", "stop": "stop", "get_state": "get_state", "shutdown": "shutdown",
     "set_param": "set_param", "reset_pitch": "reset_pitch", "set_gate": "set_gate",
-    "set_input_level": "set_input_level",
+    "set_input_level": "set_input_level", "record": "record",
     "set_suppression": "set_suppression", "set_monitor": "set_monitor",
     "set_auto_tune": "set_auto_tune", "set_shape": "set_shape", "set_graphs": "set_graphs",
     "set_exclusive": "set_exclusive", "set_device": "set_device",

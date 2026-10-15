@@ -40,3 +40,6 @@ out/expressive/mae/*
 # GUI session state (what the user changed in the window) and exported reports
 profiles/*/gui_state.json
 profiles/*/reports/
+
+# takes of the GUI Record button (mic + output WAVs)
+/recordings/

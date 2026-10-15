@@ -72,6 +72,20 @@ class FakeSession:
     def set_conditioning(self, **changes):
         self.calls.append(("conditioning", changes))
 
+    recording = None
+
+    def start_recording(self):
+        self.recording = SimpleNamespace(seconds=3.0)
+
+    def stop_recording(self, folder):
+        if self.recording is None:
+            return None
+        self.recording = None
+        folder.mkdir(parents=True, exist_ok=True)
+        out = folder / "take_output.wav"
+        out.write_bytes(b"")
+        return {"output": out, "mic_raw": folder / "take_mic_raw.wav"}
+
     def set_shape(self, **changes):
         self.calls.append(("shape", changes))
 
@@ -295,6 +309,27 @@ def test_hot_parameters_reach_the_running_session(env):
     assert len(FakeSession.created) == 1  # nothing restarted
     with pytest.raises(ApiError, match="unknown parameter"):
         c.set_param("volume", 1)
+
+
+def test_record_saves_a_take_and_reveals_the_output(env, tmp_path):
+    shown = []
+    c = env.make(model="Alpha", recordings_dir=tmp_path / "takes", reveal=shown.append)
+    with pytest.raises(ApiError, match="Start the engine"):
+        c.record(True)
+    c.start()
+    settle(c)
+    assert c.record(True) == {"recording": True}
+    assert c.state()["recording"]["active"] is True
+    c.record(False)
+    settle(c)
+    assert shown == [tmp_path / "takes" / "take_output.wav"]
+    state = c.state()["recording"]
+    assert state == {"active": False, "last": str(tmp_path / "takes" / "take_output.wav")}
+    # stopping the engine mid-take keeps the take
+    c.record(True)
+    c.stop()
+    settle(c)
+    assert len(shown) == 2
 
 
 def test_input_level_defaults_on_is_hot_and_persists(env):

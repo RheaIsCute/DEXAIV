@@ -56,7 +56,8 @@ def engine(device):
                        device=device, cache={})
 
 
-def run_live(engine, audio: np.ndarray, gate: bool, seed: int = 0, fill_ms: float = 50.0):
+def run_live(engine, audio: np.ndarray, gate: bool, seed: int = 0, fill_ms: float = 50.0,
+             recorder=None):
     plan = engine.plan
     in_ring = SPSCRing(2 * SR, guard=4 * CALLBACK)
     out_ring = SPSCRing(SR, guard=2 * plan.block)
@@ -73,6 +74,7 @@ def run_live(engine, audio: np.ndarray, gate: bool, seed: int = 0, fill_ms: floa
     worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
                              engine.timers, in_ring, out_ring, hop_event, fill, log=lambda *_: None,
                              conditioner=engine.conditioner)
+    worker.recorder = recorder
     seconds = len(audio) / SR + 0.5
     feeder = FileInput(audio, SR, CALLBACK, in_ring, plan.block, hop_event)
     reader = OutputReader(out_ring, seconds)
@@ -127,6 +129,30 @@ def test_worker_gate_closes_and_output_is_silent_in_pauses(engine, clip_48k):
     # the middle of the pause (allowing hangover + drain + prefill delay) is digital silence
     mid = int(3.2 * SR)
     assert np.abs(live[mid:mid + SR // 2]).max() == 0.0
+
+
+def test_worker_records_aligned_mic_and_output_takes(engine, clip_48k, tmp_path):
+    """The Record button's capture: what the worker read, conditioned and wrote, hop by hop."""
+    import soundfile as sf
+
+    from vox.audio.recorder import SessionRecorder
+
+    audio = clip_48k[: 3 * SR]
+    recorder = SessionRecorder(SR)
+    live, worker, out_ring, _ = run_live(engine, audio, gate=True, recorder=recorder)
+    assert worker.stats.errors == [] and out_ring.underruns == 0
+    paths = recorder.save(tmp_path, "take", {})
+    raw, _ = sf.read(str(paths["mic_raw"]), dtype="float32")
+    cond, _ = sf.read(str(paths["mic_conditioned"]), dtype="float32")
+    out, _ = sf.read(str(paths["output"]), dtype="float32")
+    assert len(raw) == len(cond) == len(out) >= len(audio) - engine.plan.block
+    np.testing.assert_array_equal(raw[: len(audio)], audio[: len(raw)])  # the mic, untouched
+    assert np.abs(cond).max() > np.abs(raw).max() * 0.5  # the input chain's output
+    # the output track is the played stream, ahead of it by the output prefill only
+    n = min(len(out), len(live))
+    best = min(range(0, int(0.2 * SR), engine.plan.zc // 2),
+               key=lambda lag: np.mean(np.abs(live[lag:n] - out[: n - lag])))
+    assert np.mean(np.abs(live[best:n] - out[: n - best])) < 1e-6
 
 
 def test_worker_rebuilds_shape_live_and_keeps_running(engine, clip_48k):

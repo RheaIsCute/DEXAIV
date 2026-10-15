@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from vox.audio.conditioning import ConditioningConfig, InputConditioner
+from vox.audio.recorder import SessionRecorder
 from vox.audio.rings import SPSCRing
 from vox.config.schemas import RuntimeParams, ShapeParams
 from vox.engine import chunker, warmup
@@ -114,6 +115,9 @@ class InferenceWorker(threading.Thread):
         self.first_hop = threading.Event()  # set once the first hop is in the output ring
         self.override = ClipOverride(self.plan.block)  # typed clips over the live voice
         self.hold = False  # control path: treat every hop as gated (see ``_hop``)
+        # Control path sets it to record a take (audio/recorder.py): raw mic, conditioned
+        # mic and output, one hop at a time. None: not recording.
+        self.recorder: SessionRecorder | None = None
         self._cushion = 0  # extra silence queued for the duration of a hold, in samples
         self._fill_before_hold = 0  # output ring fill when the cushion went in
         self._alloc()
@@ -308,6 +312,9 @@ class InferenceWorker(threading.Thread):
             releasing = True  # the reader trims; do not also drift-trim this hop
         overriding = self.override.mix(self._host_out_np)
         self.out_ring.write(self._host_out_np)
+        recorder = self.recorder  # read once: the control thread starts and stops takes
+        if recorder is not None:
+            recorder.add(self._host_block, block_in, self._host_out_np, decision.speech)
         if (not decision.speech and not overriding and not hold and not releasing
                 and not self.out_ring.drop_pending
                 and fill_before > self.fill_target + block):

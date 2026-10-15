@@ -17,6 +17,7 @@ from typing import Any
 
 from vox.audio import devices as audio_devices
 from vox.audio.conditioning import ConditioningConfig
+from vox.audio.recorder import SessionRecorder
 from vox.audio.rings import SPSCRing
 from vox.audio.streams import DuplexAudio, FileInput, OutputTap, StreamConfig
 from vox.config import defaults
@@ -93,6 +94,8 @@ class LiveSession:
         self.out_device = None
         self.suppression = False
         self._event_seq = 0  # first event the next snapshot reports
+        self._record_events = 0  # first event of the current take
+        self._record_started = 0.0
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -209,6 +212,49 @@ class LiveSession:
         self.worker.apply_gate(config)
         self.cfg.gate = config
         return config
+
+    # ---------------------------------------------------------------- recording
+
+    @property
+    def recording(self) -> SessionRecorder | None:
+        return self.worker.recorder if self.worker is not None else None
+
+    def start_recording(self) -> None:
+        """Start a take: raw mic, conditioned mic and output, aligned (audio/recorder.py)."""
+        if self.worker.recorder is not None:
+            return
+        self._record_events = self.engine.timers.events.total
+        self._record_started = time.time()
+        self.worker.recorder = SessionRecorder(self.engine.plan.device_sr)
+
+    def stop_recording(self, folder: Path) -> dict[str, Path] | None:
+        """End the take and write it to ``folder``; None when nothing was recording."""
+        recorder, self.worker.recorder = self.worker.recorder, None
+        if recorder is None:
+            return None
+        time.sleep(2 * self.engine.plan.block_ms / 1000.0)  # let a hop in flight finish
+        e = self.engine
+        events = e.timers.events
+        first = self._record_events
+        meta = {
+            "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._record_started)),
+            "model": self.cfg.model, "input": self.describe(),
+            "params": dataclasses.asdict(self.worker.params),
+            "shape": dataclasses.asdict(self.cfg.shape),
+            "gate": dataclasses.asdict(self.worker.gate.config),
+            "conditioning": dataclasses.asdict(self.cfg.conditioning),
+            "plan": {"hop_ms": e.plan.block_ms, "overlap_ms": e.plan.overlap_ms,
+                     "search_ms": e.plan.search_ms, "extra_ms": e.plan.extra_ms},
+            "mode": e.mode,
+            "event_counts_in_take": {k: sum(1 for ev in events.since(first) if ev["kind"] == k)
+                                     for k in ("gate_open", "gate_close", "underrun")},
+            "events": events.since(first),
+            "underruns_session": self.out_ring.underruns,
+            "note": "tracks are sample-aligned; output trails the mic by the SOLA delay "
+                    f"({e.plan.stream_delay * 1000 / e.plan.device_sr:.0f} ms)",
+        }
+        stem = time.strftime("take_%Y%m%d_%H%M%S", time.localtime(self._record_started))
+        return recorder.save(folder, stem, meta)
 
     def set_conditioning(self, **changes: Any) -> ConditioningConfig:
         """Input chain, hot: ``auto_level``, ``trim_db`` (and the AGC's bounds)."""

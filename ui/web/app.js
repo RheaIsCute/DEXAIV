@@ -201,6 +201,7 @@ function render() {
   setValue($("input-gain"), level.gain_db);
   $("auto-level").checked = level.auto;
   renderInputGain();
+  renderRecord();
   $("noise-floor").textContent = calibrated
     ? "Threshold set from your calibration noise floor (" + Math.round(gate.noise_floor_dbfs) + " dB)"
     : "Not calibrated yet: the threshold is the profile default";
@@ -279,7 +280,23 @@ function renderMeters() {
   $("meter-in-db").textContent = meters.running ? meterText(meters.in_db) : "–";
   $("meter-out-db").textContent = meters.running ? meterText(meters.out_db) : "–";
   renderInputGain();
+  renderRecord();
   renderStatus();
+}
+
+// Record: only while live; the label counts the take (seconds come with the meters).
+function renderRecord() {
+  if (!state) return;
+  const live = state.engine.status === "running";
+  const on = live && !!(state.recording && state.recording.active);
+  const btn = $("record");
+  btn.disabled = !live || state.engine.busy === "Saving recording";
+  btn.classList.toggle("on", on);
+  btn.title = live ? (on ? "Stop and save the take (opens it in Explorer)"
+    : "Record the mic and the converted voice to WAV files") : "Start the engine to record";
+  const s = Math.floor(meters.rec_s || 0);
+  $("record-label").textContent = on ? "Stop · " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0")
+    : state.engine.busy === "Saving recording" ? "Saving…" : "Record";
 }
 
 // The trim the slider sets, plus (live, with auto level on) the total gain being applied.
@@ -475,6 +492,7 @@ function wire() {
   const sendGain = throttled((v) => cmd("set_input_level", { gain_db: v }));
   $("input-gain").addEventListener("input", (e) => { renderInputGain(); sendGain(+e.target.value); });
   $("auto-level").addEventListener("change", (e) => cmd("set_input_level", { auto: e.target.checked }));
+  $("record").addEventListener("click", () => cmd("record", { enabled: !(state && state.recording && state.recording.active) }));
   const sendIndex = throttled((v) => cmd("set_param", { name: "index_rate", value: v }));
   $("index-rate").addEventListener("input", (e) => { $("index-rate-value").textContent = (e.target.value / 100).toFixed(2); sendIndex(e.target.value / 100); });
   const sendProtect = throttled((v) => cmd("set_param", { name: "protect", value: v }));
