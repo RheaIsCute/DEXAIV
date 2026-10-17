@@ -924,3 +924,103 @@ back after a controller restart. Typed clips at typed 0 / -12 / +12 dB read abou
 slider move. Around typed clips there were 3 underruns in 13 clips with this code and 3
 in 7 clips on e3ba942 with no volume code at all (same script, `--typed 0,...`), so they
 belong to the typed-over-live hold, not to the volume path; still open.
+
+## 11. Modernization, Phase 0 (2026-10-17): the ear-and-metric loop
+
+The modernization report (`docs/research/15_MODERNIZATION_REPORT.md`, built from a code
+audit of main@2b2cf93 and ~100 sources) found the project strong on performance and blind on
+quality: no WER, speaker-similarity, MOS or blind-A/B number anywhere, defaults chosen by
+ear against metrics that disagreed with the ear, and one dominant complaint (the speech
+"stutter") never heard on a raw microphone. Phase 0 builds the measurements; it changes no
+engine default. Phase 1 (inference-time fixes) waits for the user's raw-mic matrix (11.4).
+Same machine; NVIDIA Broadcast, OBS, Discord and browsers resident on the GPU (~4.4 GB).
+
+### 11.1 Deviations
+
+| # | Prompt / report said | What was built | Why |
+|---|---|---|---|
+| M1 | New `benchmarks/quality.py`, reusable by every bench subcommand | `benchmarks/quality.py` (pure functions + CPU scorers + `QualityKit`), wired into `vox bench ab --quality --pairs`, a standalone `vox bench quality --files`, and `vox bench take --analyze`; `benchmarks/target_f0.py` and `benchmarks/matrix.py` beside it | The scorers (faster-whisper small.en int8, speechbrain ECAPA-TDNN or WavLM-SV, UTMOS22 strong via torch.hub) run on the CPU so a GPU render is never disturbed; weights land under `models/_tools`, `_embedders`, `_predictors/hub` (gitignored). `requirements/tools.txt` pins faster-whisper 1.2.1 and speechbrain 1.1.2 |
+| M2 | WER on a fixed script with the known transcript | `benchmarks/corpus/speech_script.txt` (150 words, no digits, sibilant and plosive runs, one near-whisper line, one shout); `--transcript FILE`, `--transcript mic` (the un-converted mic's own Whisper transcript is the reference: for recordings of no known script, such as `mic_script_2026-10-13.wav`) | The existing mic script was never read from a text; `mic` mode makes the mic's WER 0 and an output's WER "what the conversion lost" |
+| M3 | Speaker similarity against held-out target recordings; `vox say` renders as a labelled proxy if unavailable | `takes/target/<Model>/*.wav` (none exist yet); the proxy is two seeds of the script through the model, labelled "proxy: vox say" in every table and record; the targets' own pairwise cosine is printed as the ceiling (0.986 for the proxy: two seeds of one TTS render, so it is not a real ceiling) | The user must supply the clips; until then every similarity number measures distance to the model's typed voice |
+| M4 | Seed floor: two renders, different seeds | In `ab --quality` the gated stream is rendered twice (seed 0 and 1) and their cosine is the floor; in `quality --files` and `take` there is one render per file, so the floor column is empty | A second live take cannot be re-seeded |
+| M5 | UTMOS as a naturalness proxy, report but never rank on it | Scored in 15 s chunks averaged by duration (the SSL front end on a 60 s clip on the CPU); the table footer repeats the rule | |
+| M6 | F0 stats: median, IQR, octave flips/min, voiced ratio | RMVPE track (the engine's own) at 100 Hz; IQR in semitones; flips = steps >= 8 st between consecutive voiced frames per voiced minute | A glide never moves 8 st in 10 ms; an octave error is 12 |
+| M7 | No MCD, F0-RMSE, PESQ, NISQA-PSTN | Not implemented; `test_quality_never_offers_the_metrics_the_report_rules_out` keeps them out | SVCC 2023/2025 |
+| M8 | `--pairs`: blind A/B pairs, randomised X/Y, answer key | `write_pairs`: `pairNN_X.wav` / `pairNN_Y.wav`, `pairs.md` (what to listen for, a blank per pair, no answers), `answer_key.json`; one fixed seed (2026) so a sheet can be regenerated | |
+| M9 | 0.2: render a 60 s script through each model with `vox say` (Kokoro, pitch auto off), write the output's median F0 as `target_f0_median_hz`, auto pitch must use it | `vox bench target-f0` does exactly that (pitch 0, `TypedPolish()` plain) and writes `defaults.target_f0_median_hz` into `models/<Name>/config.json` **and** `profiles/default/model_overrides.json` (the committed copy; `target_f0_hint` reads the override first). Beside it, `target_f0_calibration` keeps two other estimators: a -8..+8 st sweep (cents error, voicing kept, flips, UTMOS per shift) and the coarse-pitch embedding's movement against the pretrained base (f0G32k.pth fetched for the 32 kHz models) | **The prompt's estimator is circular**: RVC copies the source F0 contour, so at pitch 0 the output median is the TTS voice's (193 Hz) for every model (11.2). The written value is kept as specified; the embedding estimator is the one that reads the training register (Q13) |
+| M10 | 0.3: `vox bench take --matrix`: input {Shure, Broadcast} x gate x AGC x hop {20, 40}; the user talks, the command sequences, labels, scores, pairs | As specified; one `LiveSession` per input, hop changes as in-place rebuilds, gate and auto level hot; the Enter key starts and ends each cell (`--take-seconds` for a fixed length); `--plan`, `--only`, `--analyze DIR`. Gate threshold per cell: -40 dBFS with auto level, -55 without (`--gate-threshold-agc/raw`) | The gate measures the conditioned level: the same threshold cannot serve both AGC states (7.3). Inputs are named `Microphone (Shure MV6)` / `Microphone (NVIDIA Broadcast)` and a resolved cable is refused: the user renamed the cable's capture end "(Shure MV6x)", so "Shure MV6" alone recorded the engine's own output in the smoke test |
+| M11 | DEVIATIONS §10 | This is §11: §10 is the volume controls of 2026-10-17 | |
+
+### 11.2 Per-model target register (`vox bench target-f0 --utmos`)
+
+Kokoro `af_heart`, the 150-word script (56 s of TTS), full-file conversion, RMVPE on the
+output. "Rendered" is the written value.
+
+| model | rendered (pitch 0) | TTS voice | sweep best | embedding register (p10-p90, peak/median) | UTMOS by shift -8/-4/0/+4/+8 |
+|---|---|---|---|---|---|
+| Mom (32k) | 194 Hz | 193 Hz | -4 / -8 st (two runs) | **265 Hz** (94-677, x5.0) | 2.77 / 3.16 / **3.47** / 3.45 / 3.10 |
+| GoatMommy (48k) | 194 Hz | 193 Hz | +8 / +4 st | 304 Hz (85-540, x2.2) | 3.29 / 3.89 / 4.06 / **4.13** / 3.61 |
+| MaeASMR (32k) | 193 Hz | 193 Hz | -8 / -4 st | 545 Hz (120-958, x2.2) | 3.59 / 4.10 / **4.17** / 3.83 / 3.66 |
+| base_f0_48k_v2 | 192 Hz | 193 Hz | -4 st | (is the base) | 4.37 / 4.39 / 4.39 / 4.33 / 3.84 |
+
+Reading: the rendered column is the TTS register to within 2 Hz on every model, as predicted
+from the pipeline (the written value therefore changes auto pitch by -0.5 st against the old
+200 Hz fallback and nothing more). The sweep's cents error is 1-25 cents at every shift
+(the decoder follows the sine wherever it is asked), so its "best" rides on the octave-flip
+count (6-74/min across shifts) and moved between two runs of the same command: not an
+estimator. The embedding estimator has a clear profile only for Mom (peak 5x the median;
+265 Hz with a wide p10-p90) and a weak one for the other two. UTMOS peaks at 0 or +4 st for
+the three voices and is flat for the base, which trained on every register. What auto pitch
+should aim at is now Phase 1.4's A/B (194 vs 265 Hz on Mom), not a measurement.
+
+### 11.3 The §7.4 variants under the new metrics (`vox bench ab --quality --pairs`)
+
+Mom +12, the mic script (25.75 s), gate -40 after the input chain, coherent-hop defaults,
+`--transcript mic` (the microphone's own Whisper transcript: "Like, it, trust me, it's
+working. It's working, but not too well. ..."), speaker targets = the `vox say` proxy.
+
+| variant | WER | spk cos (proxy) | seed floor | UTMOS | F0 med | IQR st | flips/min | voiced | click | R3 x | HF/LF |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| reference | 25.7% | 0.577 | 0.959 | 1.54 | 197 | 2.5 | 57.3 | 69% | 1.27 | 2.75 | +13.3 |
+| f0_interp | **20.0%** | 0.585 | 0.964 | 1.44 | 198 | 2.7 | 55.9 | 76% | 1.32 | 2.77 | **+9.3** |
+| sola_blend3 | 25.7% | **0.604** | 0.963 | 1.50 | 198 | 2.5 | 56.2 | 71% | **1.04** | 2.73 | +12.2 |
+| index_0.35 | 28.6% | 0.566 | 0.952 | 1.48 | 197 | 2.4 | 65.5 | 69% | 1.34 | 2.66 | +13.5 |
+
+Reading: a quarter of the words the microphone carried do not survive the conversion at
+this gate setting (part of that is the 150 ms of gated speech and Whisper's tolerance of a
+quiet, bled-into mic recording); interp recovers a fifth of the loss. Speaker cosine moves
+by less than the seed floor's distance from 1 (0.04) for every variant, so none of them
+changes identity measurably against the proxy. UTMOS sits at 1.4-1.5 for every mic render
+against 3.5 for the same model on typed speech (11.2): the naturalness proxy sees the
+microphone path as the problem, which is what the user hears. Blind pairs for these three
+comparisons: `out/ab/p0_pairs/` (`pairs.md`, then `answer_key.json`).
+
+### 11.4 The matrix (`vox bench take --matrix`): built, smoke-tested, not recorded
+
+A two-cell smoke run on the quiet room (hop 20 then 40, gate and auto level on, 5 s each)
+exercised the whole path: session start on the named microphone, the in-place hop rebuild
+(2.2 s), start/stop recording, file labelling, the JSON (cell, script, SOLA delay), the
+analysis table and one blind pair. It also found M10's cable-name trap (the first attempt
+recorded the cable's capture end at -99 dBFS). The 16-cell matrix needs the user: about 16
+minutes of reading, `vox bench take --matrix` (or `--hops 20` for 8 cells), then
+`out/ab/matrix_<stamp>_pairs/pairs.md` for the verdicts. Phase 1.1 (the gate redesign) is
+conditional on those verdicts and nothing in Phase 1 was started.
+
+### 11.5 Acceptance
+
+| check | result |
+|---|---|
+| Phase 0.1 metrics in `vox bench`, with tests | `tests/unit/test_quality.py` (12), `tests/unit/test_matrix_and_target_f0.py` (10): pure functions, pairs, kit plumbing with stubbed scorers, take analysis on a synthetic take |
+| 0.2 per-model target F0 written and used | `target_f0_median_hz` in every model's config.json and `model_overrides.json`; `target_f0_hint` (vox say, `vox run`, the GUI's auto pitch) reads it: the 200 Hz fallback no longer applies to Mom, GoatMommy, MaeASMR, base_f0_48k_v2 |
+| 0.3 matrix protocol | built and smoke-tested; recording waits for the user |
+| suite | CPU suites (unit, api, tts) green; engine (GPU) see below |
+| defaults changed | none |
+
+### 11.6 Not verified
+
+- Nothing was listened to. `out/ab/p0_pairs/` and the matrix pairs are for the user.
+- Speaker similarity against the real target voices: no held-out clips exist
+  (`takes/target/<Model>/`).
+- Whether the matrix's gate thresholds (-40 / -55 dBFS) suit the Shure at the user's
+  distance and the Broadcast mic's level; the meter line during each cell shows the level.
+- UTMOS on 48 kHz RVC output at these levels: a proxy, calibrated on TTS at 16 kHz.

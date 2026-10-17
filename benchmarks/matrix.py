@@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT / "benchmarks"))
 
 from quality import Pair, QualityKit, Scores, load_script, wer
 
-INPUTS = {"shure": "Shure MV6", "broadcast": "NVIDIA Broadcast"}  # key -> device name fragment
+# key -> device name fragment. "Microphone (...)" on purpose: the user renamed the virtual
+# cable's ends after the Shure, so a bare "Shure MV6" resolves to the cable's capture side.
+INPUTS = {"shure": "Microphone (Shure MV6)", "broadcast": "Microphone (NVIDIA Broadcast)"}
 GATE_THRESHOLD_AGC = -40.0  # dBFS after auto level (docs/DEVIATIONS.md 7.3)
 GATE_THRESHOLD_RAW = -55.0  # dBFS on the raw mic (speech sits near -42 on this one)
 TRACKS = ("output", "mic_raw", "mic_conditioned")
@@ -194,6 +196,7 @@ class _Meter(threading.Thread):
         super().__init__(name="vox-matrix-meter", daemon=True)
         self.session, self.log = session, log
         self._stop = threading.Event()
+        self._underruns0 = session.out_ring.underruns  # a hop rebuild before the take counts too
 
     def run(self) -> None:
         while not self._stop.wait(1.0):
@@ -205,7 +208,8 @@ class _Meter(threading.Thread):
             self.log(f"    [{s['t']:5.1f}s] gate {'open' if s['gate_open'] else 'shut'} "
                      f"level {s['gate_rms_dbfs']:6.1f} dBFS vad {s['gate_vad']:.2f} "
                      f"in gain {s['input_gain_db']:+.0f} dB | hop p99 {s['total']['p99']:.1f} ms"
-                     f" | underruns {s['underruns']} | closes {s['event_counts']['gate_close']}")
+                     f" | underruns {s['underruns'] - self._underruns0} | closes "
+                     f"{s['event_counts']['gate_close']}")
 
     def stop(self) -> None:
         self._stop.set()
@@ -269,6 +273,14 @@ def record_matrix(runs: list[Run], folder: Path, *, model: str, models_dir: Path
             log(f"could not start on {first.input_spec!r}: {type(err).__name__}: {err}; "
                 "skipping this input")
             continue
+        if session.in_device is None or session.in_device.is_cable:
+            # The matrix is about the microphone: recording the cable's capture side (the
+            # engine's own output) would measure nothing. Name the device more exactly.
+            log(f"input {first.input_spec!r} resolved to {session.in_device.name!r}, a virtual "
+                "cable; skipping this input (pass --inputs with the device's full name)")
+            session.stop()
+            continue
+        log(f"microphone: {session.in_device.index} {session.in_device.name}")
         try:
             current_hop = first.hop_ms
             for run in mine:

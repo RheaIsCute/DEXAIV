@@ -31,6 +31,26 @@ F0 median ~100 Hz; sung lines 140-280 Hz).
 | `obs_default_mic_2026-10-13.wav` | 49.7 s OBS capture of the **default mic at unity, no filters** (stereo): the user reading, with room tone and bleed from another voice in the pauses. Speech at -42 dBFS. The basis of the gate and auto-level work (§7) and of the suppression measurements (§8.5) |
 | `mic_script_2026-10-13.wav` | the two speech passages of that capture cut together (25.75 s, mono): the standard test script of every speech benchmark (`vox bench ab`, `accept`, `underrun`) |
 
+## `target/<Model>/` — held-out recordings of the target voice (none yet)
+
+Two or three clips (10-30 s each, any rate, speech not singing) of the **real person or
+voice the model was trained on**, not from its training set. `vox bench quality`,
+`vox bench ab --quality` and `vox bench take --analyze` embed them (ECAPA-TDNN) and report
+every render's speaker cosine against them. Until the folder exists the proxy is two
+`vox say` renders of the fixed script through the model, labelled "proxy: vox say" in every
+table (a proxy says how far a render is from the model's own typed voice, not from the real
+target). Ask the user for the clips; drop them in `takes/target/Mom/`, `takes/target/GoatMommy/`
+and so on.
+
+## `live/matrix_*/` — raw-microphone matrix takes (`vox bench take --matrix`)
+
+One folder per session, one take per cell `<input>_gate<on|off>_agc<on|off>_hop<ms>`
+(`shure_gateon_agcon_hop20_{output,mic_raw,mic_conditioned}.wav` + `.json`, same tracks as a
+Record-button take, plus the cell, the script and the SOLA delay in the JSON), the
+`matrix_report.md` with the metric table, and the blind pairs in `out/ab/<folder>_pairs/`.
+The user reads `benchmarks/corpus/speech_script.txt` in every cell. None recorded yet (the
+smoke test on a silent cable is not kept).
+
 ## `ab/` — A/B renders for listening
 
 Renders of the test material through the engine with one setting changed at a time. The
@@ -50,6 +70,8 @@ first 13.5 s of `live/take_20261015_004329_mic_raw.wav`.
 | `suppress_mic_mix1`, `suppress_mic_mix0.5` | OBS raw mic | RNNoise at full and half mix (no conversion) | §8.5 |
 | `suppress_sung_mix1`, `suppress_sung_mix0.5` | take 2 mic | RNNoise on the (Broadcast-processed) sung track | §8.5 |
 | `autopitch_speech_*`, `autopitch_sing_*` | script / take 2, GoatMommy | fixed +6 vs auto pitch (target 200 Hz) vs auto with range 0.7 | §9 |
+
+| `p0_reference`, `p0_f0_interp`, `p0_sola_blend3`, `p0_index_0.35` (+ `p0_pairs/`) | script, Mom +12, gate -40 | the §7.4 variants re-rendered with the coherent-hop defaults and scored with the Phase 0 metrics (WER, speaker cosine, UTMOS, F0 stats); `p0_pairs/` holds them as blind X/Y pairs with `pairs.md` and `answer_key.json` | §11 |
 
 Regenerate any of them with `vox bench ab|typed|sing|onset|suppress` (see
 `benchmarks/bench.py`); the exact commands and settings are in the sections cited.

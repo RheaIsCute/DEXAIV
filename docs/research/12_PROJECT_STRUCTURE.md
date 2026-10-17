@@ -112,8 +112,11 @@ rvc-vox/
 │   └── fixtures/
 ├── benchmarks/
 │   ├── bench.py                  # `vox bench` implementation (doc 10)
+│   ├── quality.py                # Phase 0 metrics: WER, speaker cosine, UTMOS, F0 stats, blind pairs (doc 15)
+│   ├── target_f0.py              # per-model target register estimators (Q13)
+│   ├── matrix.py                 # the raw-mic take protocol (`vox bench take`)
 │   ├── sweeps/*.yaml
-│   ├── corpus/                   # user corpus (gitignored), manifest committed
+│   ├── corpus/                   # user corpus (gitignored), manifest committed; speech_script.txt
 │   ├── baselines/
 │   └── results/
 ├── scripts/

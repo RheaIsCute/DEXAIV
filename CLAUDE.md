@@ -3,7 +3,9 @@
 Realtime RVC voice conversion engine (Windows, PyTorch, CUDA graphs) plus `vox say`
 (typed text -> TTS -> the model's voice). Layout and dependency rules: `12_PROJECT_STRUCTURE.md`,
 enforced by `tests/unit/test_import_rules.py`. Measurements and departures from the research
-docs: `docs/DEVIATIONS.md`. TTS findings: `docs/TTS_NOTES.md`.
+docs: `docs/DEVIATIONS.md`. TTS findings: `docs/TTS_NOTES.md`. Modernization plan and
+its Phase 0 tooling (`vox bench quality|target-f0|take`): `docs/research/15_MODERNIZATION_REPORT.md`,
+`docs/DEVIATIONS.md` §11.
 
 ## Target hardware
 

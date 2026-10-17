@@ -492,3 +492,59 @@ The singing work kept `f0_unvoiced = zero` (protect keys on `pitchf < 1`). The p
 change that did ship is the RMVPE right-edge guard (`f0_trim_tail = 2`): the pitch step at
 the seams of held notes halves (p95 21 -> 10 cents), at the price of F0 10 ms later against
 the features.
+
+---
+
+# Modernization Phase 0 (2026-10-17; docs/research/15, docs/DEVIATIONS.md §11)
+
+The measurement loop the report asked for exists (`vox bench quality | ab --quality --pairs |
+target-f0 | take --matrix`); nothing was listened to yet and no default changed.
+
+## Q2 - FCPE vs RMVPE: tooling ready, measurement waits for Phase 1.5
+
+The per-voice octave-flip rate the question asks for is now a reported number
+(`flips_per_min` of `benchmarks/quality.py`, steps >= 8 st between consecutive voiced 10 ms
+frames, per voiced minute). On the Mom +12 mic-script renders RMVPE reads 56-66 flips/min
+(§11), so the baseline is noisy enough to tell a tracker change apart. The FCPE A/B itself is
+Phase 1.5 (graph-safe FCPE), on the raw-mic matrix takes.
+
+## Q13 - target median F0: measured, and the prompt's estimator is circular
+
+`vox bench target-f0` renders the fixed script (Kokoro af_heart, pitch 0) through each model
+and writes the output's median voiced F0 as `target_f0_median_hz` (config.json defaults and
+`profiles/default/model_overrides.json`). The values are 192-195 Hz for **every** model
+because RVC copies the source contour: at pitch 0 the output median is the TTS voice's
+(193 Hz), so this number is the 200 Hz fallback measured to the hertz. Two other estimators
+are stored beside it (`target_f0_calibration`): a transposition sweep (-8..+8 st, where the
+decoder carried the requested pitch most faithfully; the winner moves between runs because
+it rides on the flip count, so it carries little information at this script length) and the
+coarse-pitch embedding's movement against the pretrained base (f0G32k/40k/48k):
+
+| model | pitch-embedding register (p10-p90, peak over median) | UTMOS peak over the sweep |
+|---|---|---|
+| Mom (32k) | **265 Hz** (94-677, x5.0: a clear profile) | 0 / +4 st (3.47 / 3.45) |
+| GoatMommy (48k) | 304 Hz (85-540, x2.2: weak) | +4 st (4.13) |
+| MaeASMR (32k) | 545 Hz (120-958, x2.2: weak) | 0 st (4.17) |
+
+Open: which estimator auto pitch should aim at. The embedding one is the only one that reads
+the training distribution and it says Mom sits near 265 Hz, 5 st above what was written;
+Phase 1.4 (median-matched auto pitch as the Speak default) is the A/B that decides, with the
+user's ear on `autopitch_*` renders at 194 vs 265 Hz.
+
+## Q14 - audible equivalence: now has a WER and a similarity number, still needs ears
+
+Stream vs full-file on the mic script (Mom +12, gate -40, §11): the gated stream reads WER
+20-29% against the microphone's own Whisper transcript (the mic's own WER is 0 by
+construction), speaker cosine 0.57-0.60 against the model's `vox say` proxy (seed floor
+0.95-0.96), UTMOS 1.4-1.5. Whether that is the streaming or the model is what the
+`accept_full` vs `accept_stream` listening (still queued) and the held-out target clips
+(still missing) will tell.
+
+## Q15 - interp: the first metric that moves in its favour beyond hiss
+
+`f0_interp` on the mic script: WER 25.7% -> 20.0% (the only variant to lower it), voiced
+69% -> 76%, HF/LF +13.3 -> +9.3 dB, speaker cosine 0.577 -> 0.585 (within the seed floor),
+UTMOS 1.54 -> 1.44. Still an A/B (`out/ab/p0_pairs/pair01`): Phase 1.2 decouples `protect`
+from `pitchf` first, so that interp no longer disables consonant protection, then the pair
+is re-rendered on the raw-mic takes.
+

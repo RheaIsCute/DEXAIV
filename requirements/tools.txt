@@ -1,5 +1,12 @@
-# Offline tuning / benchmark only (Phase 5+). Not installed by setup_env.ps1; pin at lock time.
-faster-whisper
+# Offline tuning / benchmark only. Not installed by setup_env.ps1.
+# Phase 0 quality metrics (benchmarks/quality.py; docs/research/15): all run on the CPU.
+# Frozen from the working environment on 2026-10-17 (Python 3.13.15, torch 2.7.1+cu128).
+faster-whisper==1.2.1       # WER (small.en, int8); pulls ctranslate2 4.8.3, av 19.0.1
+speechbrain==1.1.2          # ECAPA-TDNN speaker embeddings (spkrec-ecapa-voxceleb)
+# WavLM-SV (the alternative speaker backend) and UTMOS (torch.hub tarepan/SpeechMOS v1.2.0)
+# need nothing beyond runtime.txt (transformers) and the network on first use. Weights land
+# under models/_tools, models/_embedders and models/_predictors/hub (gitignored).
+# Earlier placeholders, not used by the code:
 resemblyzer
 praat-parselmouth
 matplotlib

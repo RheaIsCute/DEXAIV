@@ -155,6 +155,13 @@ Quality sweep excerpt (block 15 ms — *invented values*):
 Human A/B remains the final arbiter (doc 08 §6.3); objective metrics shrink the candidate set and
 catch regressions.
 
+*2026-10-17 (doc 15, Phase 0):* `benchmarks/quality.py` ships the first four rows (RMVPE F0
+stats, ECAPA-TDNN or WavLM-SV cosine against held-out target recordings with a seed floor,
+faster-whisper WER against the fixed script with the un-converted mic's WER beside it, UTMOS
+reported but never ranked on) and blind X/Y pairs with an answer key; `vox bench ab --quality
+--pairs`, `vox bench quality`, `vox bench take --analyze`. PESQ, MCD, F0 RMSE and NISQA are
+deliberately absent (SVCC 2023/2025: they do not track MOS for voice conversion).
+
 ## 7. Regression gating between code changes
 
 - `bench regress` runs a **pinned reference config** (the shipped profile) on the full corpus:

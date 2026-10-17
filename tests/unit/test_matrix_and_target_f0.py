@@ -35,8 +35,8 @@ def test_plan_covers_every_cell_with_one_session_per_input_and_one_rebuild_per_h
 
 
 def test_gate_threshold_follows_the_auto_level_state():
-    on = mx.Run("shure", "Shure MV6", True, True, 20.0)
-    off = mx.Run("shure", "Shure MV6", True, False, 20.0)
+    on = mx.Run("shure", "Microphone (Shure MV6)", True, True, 20.0)
+    off = mx.Run("shure", "Microphone (Shure MV6)", True, False, 20.0)
     assert on.gate_threshold() == -40.0 and off.gate_threshold() == -55.0
     assert off.gate_threshold(-38.0, -50.0) == -50.0
     assert "auto level OFF" in off.describe() and "hop 20 ms" in off.describe()
@@ -130,6 +130,7 @@ def test_analyze_take_reads_gate_behaviour_and_scores_the_output(tmp_path):
     assert kit.transcribed  # the mic was transcribed here because none was given
     assert info["label"] == label and info["meta"]["plan"] == {"hop_ms": 20.0}
     assert mx.recorded_runs(tmp_path) == [mx.Run("shure", "Shure MV6", True, True, 20.0)]
+    assert all("Microphone (" in spec for spec in mx.INPUTS.values())  # not the cable
 
 
 def test_analyze_matrix_transcribes_each_microphone_once(tmp_path):

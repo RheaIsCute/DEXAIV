@@ -43,6 +43,16 @@ Also useful once, not per take: the mic's level while speaking normally (the IN 
 auto level off), and whether the room has a steady noise (fan) or intermittent noise
 (keyboard, other voices).
 
+Since 2026-10-17 this is a command: `vox bench take --matrix` records the whole
+input x gate x auto-level x hop matrix with the Record pipeline while the user reads
+`benchmarks/corpus/speech_script.txt` (16 cells of about a minute; `--only` or `--hops 20`
+for a subset), labels the files, scores them and writes blind pairs (docs/DEVIATIONS.md §11).
+
+**Held-out target recordings.** The speaker-similarity metric needs 2-3 clips of the real
+target voice that were *not* in the model's training set, in `takes/target/<Model>/`. Without
+them every similarity number is against the model's own `vox say` renders and says so
+("proxy"). Ask for the clips before trusting any similarity ranking.
+
 ## 3. Listening verdicts, per file
 
 Metrics and ears have disagreed twice (§8.8): the seam-roughness ratio and the log-mel
@@ -67,6 +77,11 @@ Every mic render of the speech script stutters to the user, typed renders never 
    take; `mic_conditioned` vs `mic_raw` shows whether the auto level's gain ramps are
    audible (`raw_input` points there).
 3. Then a hop 40 take of the same: half the seams per second at the same compute (§8.2).
+
+Items 2 and 3 are now one session: `vox bench take --matrix` (see §2). Its blind pairs
+(`out/ab/matrix_*_pairs/pairs.md`) are the verdicts to collect: gate on vs off, auto level
+on vs off, hop 20 vs 40, Shure vs Broadcast, each with everything else held. Do not read the
+stutter's cause off the metric table; the pairs decide.
 
 ## 5. For typed speech (humanisation)
 
