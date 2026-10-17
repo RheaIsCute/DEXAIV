@@ -333,3 +333,92 @@ expressive delivery is wanted, evaluate an emotion-capable TTS backend behind th
 fast default. Other options noted while building this: a stable per-voice transposition
 (above); dictionary respelling of elongated words; slang with elongation (`omggg`, `plzzz`
 are not matched today).
+
+## Expressive backends: the bake-off (2026-10-17)
+
+Kokoro is deterministic and reads like a newsreader; RVC keeps the source's delivery, so the
+TTS engine is the naturalness ceiling. Five expressive engines were set up behind
+`TtsBackend` and rendered the same eight lines as Kokoro. Nothing was chosen: the user
+picks by ear.
+
+### How they run: one worker process per engine (`vox.tts.external`)
+
+Every candidate pins its own torch / transformers, and some want another Python, so none
+goes into the main `.venv`. Each has a virtual environment under `.tts_envs/<env>/` (its
+Python downloaded by uv into `.tts_envs/_python`, torch 2.7.1+cu128 forced over the
+package pins: the 2.6.0 that Chatterbox pins has no Blackwell kernels) and a worker script
+in `src/vox/tts/workers/` that imports nothing from `vox`. `ExternalBackend` starts the
+worker on first use and keeps it up; requests and replies are JSON lines
+(`workers/_protocol.py`; fd 1 is pointed at stderr inside the worker so a library's prints
+cannot corrupt the replies, which go to the worker log in `models/_tts/<name>_worker.log`).
+Engine knobs travel as `synthesize(..., controls={...})`. `scripts/setup_tts_envs.py`
+rebuilds everything; weights land in `models/_tts/hf` (Hugging Face cache) and
+`models/_tts/orpheus`.
+
+| backend | model | env | license (personal use: all OK) | expressive controls |
+|---|---|---|---|---|
+| `chatterbox` | Resemble AI Chatterbox 0.5B (chatterbox-tts 0.1.7) | py3.11 | MIT | `exaggeration` 0.25-2 (emotion intensity), `cfg_weight` (pace), `temperature`; voice cloning from a reference clip |
+| `chatterbox-turbo` | Chatterbox Turbo 350M (same package) | py3.11 | MIT | tags in the text: `[laugh]` `[chuckle]` `[sigh]` `[cough]` ...; no exaggeration |
+| `orpheus` | Canopy Orpheus 3B 0.1-ft, unsloth Q6_K GGUF in llama.cpp b11327 (CUDA 13.4 build) + SNAC 24 kHz | py3.12 | Apache-2.0 card; a Llama 3.2 3B fine-tune, so Meta's Llama 3.2 community license applies too | tags in the text: `<laugh>` `<chuckle>` `<sigh>` `<gasp>` `<groan>` `<yawn>` ...; 8 voices (tara default) |
+| `qwen3` | Qwen3-TTS-12Hz-1.7B-CustomVoice (qwen-tts 0.1.1) | py3.12 | Apache-2.0 | `instruct`: natural-language delivery ("sad and quiet"); 9 preset speakers, none a native-English woman (Serena used) |
+| `qwen3-design` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | py3.12 | Apache-2.0 | the voice itself is a description; `instruct` appended for delivery |
+| `f5` | F5-TTS v1 Base (f5-tts 1.1.22) | py3.11 | code MIT, **weights CC-BY-NC-4.0** (non-commercial) | none: it continues the voice *and delivery* of a reference clip; here 9.2 s of the user's own mic script (`models/_tts/f5/ref_user.wav`, transcript by F5's Whisper in `ref_user.txt`), so it speaks the way the user talks and RVC then makes it the model |
+
+Installation snags (all handled by the setup script): Chatterbox's Perth watermarker needs
+`pkg_resources` (setuptools < 81) and stamps an inaudible watermark on every render; F5 needs
+`datasets >= 3.6` (2.x breaks on pyarrow 26), `huggingface-hub < 1` (transformers 4.57), and
+torchcodec removed (built for a newer torch, it breaks Whisper's preprocessing; F5 does not
+use it); F5's own transcription path wants ffmpeg, so the worker hands Whisper the decoded
+array. Orpheus: llama-server does not stop on Orpheus's end-of-speech token, and a `stop`
+string on `<custom_token_2>` never fired; it ran on into a hallucinated text turn. The
+worker starts the server with `--override-kv tokenizer.ggml.eos_token_id=int:128258`, which
+ends generation exactly there, prompts with Canopy's token ids (start-of-human, text,
+end-of-text, end-of-human, start-of-AI, start-of-speech) and reads the codes from the
+returned token ids. Each worker renders one sentence while loading (Chatterbox's first
+`generate` otherwise takes 26 s).
+
+### Results (`scripts/tts_bakeoff.py --model Mom`, 2026-10-17 01:15)
+
+Eight lines, normalised first (`I don't know, what about you?` / `Haha, okay, be right back.` /
+`Oh my god, that was SO good!!` / a question / a sad line with `...` / `WE WON!! I can't
+believe we actually won!!` / the long movie line / `Hi.`). Kokoro took its production path
+(expressive pieces, variation 0.35, seed 7); each other engine rendered every line `plain`
+(default controls) and, where it has controls, `expressive` (set by hand per line:
+Chatterbox exaggeration 0.4-0.9 with cfg 0.3-0.5, `[laugh]` / `<laugh>` for "haha" and
+`[sigh]` / `<sigh>` before the sad line, a Qwen instruction per mood). Every render then went
+through Mom (auto pitch, the shipped typed polish). Render timings were taken **while a live
+session ran unheld** (the mic script looped through Mom into VAC Line 1, gate on), which is
+also how the underruns were counted.
+
+| backend | load s | warm, short line s (live / GPU idle) | RTF while live | VRAM: torch peak / GPU used MB | live underruns while rendering | Whisper WER after RVC, plain / expressive |
+|---|---|---|---|---|---|---|
+| kokoro (CPU) | 1.4 | 0.28 / 0.28 | ~0.2 (median render / median length) | 0 / 0 | 0 | 0.01 / — |
+| chatterbox | 39.6 | 4.2 / 1.7 | 2.0 | 3287 / 3656 | 35 | 0.08 / 0.15 |
+| chatterbox-turbo | 35.1 | 1.3 / 0.98 | 0.8 | 3026 / 3673 | 81 | 0.20 / 0.16 |
+| orpheus (llama.cpp) | 18.5 | 3.6 / 2.1 | 1.5 | 510 (SNAC) / 4751 | 890 | 0.03 / 0.02 |
+| qwen3 CustomVoice | 36.2 | 8.5 / 3.9 | 4.1 | 4435 / 4972 | 126 | 0.19 / 0.07 |
+| qwen3 VoiceDesign | 32.8 | 5.8 / 4.2 | 4.1 | 4375 / 4839 | 100 | 0.14 / 0.14 |
+| f5 (user's reference) | 33.4 | 3.1 / 1.6 | 0.9 | 1990 / 1173 | 305 | 0.06 / — |
+
+"Short line" = the median of `idk wbu`, `lol ok brb` and `hi` (warm worker); "GPU idle" =
+the same worker's 7-word smoke line with no live session. Load includes one warm-up render.
+RTF = render time / audio length. "GPU used" is `nvidia-smi` before vs. with the worker up
+(it includes the CUDA context and allocator cache; for Orpheus all of llama-server).
+
+- **Every GPU engine starves the live engine while it renders.** It is a second process, so
+  CUDA time-slices the two contexts and the hop graph waits. Today's GUI only holds the
+  live voice for the RVC convert (`worker.hold`), after the TTS render, which was free
+  while Kokoro ran on the CPU. A GPU engine needs the hold to start before the TTS render
+  as well: the live voice is then silent for render + convert, and a late hop only delays
+  silence (the hold cushion). That is the Step 3 change, whatever is picked.
+- **Budget (about 4 GB):** Chatterbox, Turbo and F5 fit; the two Qwen3 1.7B models sit at
+  4.4 GB of tensors; Orpheus takes 4.75 GB with a 4096-token context (2048 is enough for
+  about 24 s of speech and should cut that). The 0.6B Qwen3 models do not take
+  instructions.
+- **CAPS words get spelled out.** Normalisation keeps caps because Kokoro's expressive layer
+  turns them into emphasis; F5 read `WE WON` as "double-wee-woe", Turbo and Qwen3 as "to
+  be one" / "one". Any non-Kokoro engine needs caps lowered (or mapped to its own emphasis
+  control) after the expressive analysis. One-word `Hi.` is too short for Whisper to judge
+  (it heard "Fine", "Bye", "Okay"): listen to it.
+- Whisper transcripts and per-file WER: `out/tts_bakeoff/asr.json`; render timings per line:
+  `results.json`.

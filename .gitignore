@@ -46,3 +46,4 @@ profiles/*/reports/
 
 # takes of the GUI Record button (mic + output WAVs)
 /recordings/
+.tts_envs/
