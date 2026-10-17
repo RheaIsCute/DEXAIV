@@ -1339,7 +1339,7 @@ def cmd_take(args) -> int:
                   f"{r.gate_threshold(args.gate_threshold_agc, args.gate_threshold_raw):g} dBFS")
         print(f"\nscript ({len(script.split())} words):\n  {script}")
         print("\nrun with --matrix to record (the output goes to the virtual cable; nothing "
-              "plays on the speakers), --analyze DIR to score a recorded folder.")
+              "plays on the speakers; --monitor plays it on the headphones), --analyze DIR to score a recorded folder.")
         if not args.analyze:
             return 0
     folder = args.analyze
@@ -1784,9 +1784,16 @@ def main() -> int:
     parser.add_argument("--extra-ms", type=float, default=1000.0, help="take: context")
     parser.add_argument("--output", default=None,
                         help="take: output device (default: the virtual cable)")
+    parser.add_argument("--monitor", nargs="?", const="Headphones (Shure MV6)", default=None,
+                        metavar="DEVICE",
+                        help="take: play the converted voice on this output while recording "
+                             "(default device: the Shure headphones; speakers would feed the "
+                             "microphone)")
     parser.add_argument("--out-dir", type=Path, default=None,
                         help="take: where the matrix folder goes (default recordings/matrix_*)")
     args = parser.parse_args()
+    if args.command == "take" and args.monitor:
+        args.output = args.monitor
     if args.command == "take" and args.hops == "60,20":
         args.hops = "20,40"  # the matrix of docs/research/15 Phase 0.3 (onset keeps 60,20)
     if args.command == "take" and args.model == "base_f0_48k_v2":
