@@ -21,6 +21,15 @@ the stream simulator; there is no separate batch path.
     vox bench decctx                  quality vs decoder left context
     vox bench envelope                quality vs volume_envelope (RMS mix)
     vox bench graph-probe --stage S   capture one stage in a CUDA graph: eager vs replay cost
+    vox bench quality --files a,b     Phase 0 metrics on rendered wavs: WER (vs the script and
+                                      the un-converted mic), speaker cosine vs held-out target
+                                      recordings (+ seed floor), UTMOS, F0 stats; --pairs
+                                      writes blind X/Y pairs with an answer key
+    vox bench ab --quality --pairs    the same metrics on every ab variant, plus blind pairs
+    vox bench target-f0               per-model target register (target_f0_median_hz) from the
+                                      fixed script rendered through each model (Q13)
+    vox bench take --matrix           raw-mic take protocol: input x gate x AGC x hop, the
+                                      user reads the script, files labelled, metrics + pairs
 
 Results are appended to benchmarks/results/<name>.jsonl with the environment fingerprint.
 """
@@ -38,6 +47,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "benchmarks" / "results"
+if str(ROOT / "benchmarks") not in sys.path:  # quality.py, target_f0.py, matrix.py
+    sys.path.insert(0, str(ROOT / "benchmarks"))
+SCRIPT = ROOT / "benchmarks" / "corpus" / "speech_script.txt"
 SKIP = 50  # warmup hops discarded before statistics (docs/research/10 §3.2)
 
 
@@ -470,6 +482,12 @@ def cmd_ab(args) -> int:
     names = list(AB_VARIANTS) if not args.variants else args.variants.split(",")
     out = ROOT / "out" / "ab"
     rows = []
+    wavs: dict[str, Path] = {}
+    kit = script = targets = None
+    mic_wer = float("nan")
+    quality_rows = {}
+    import quality as quality_mod
+
     for name in names:
         shape_kw, param_kw, cond_kw, note = AB_VARIANTS[name]
         engine = _engine(args, registry, cache, shape_kw, cond_kw, **param_kw)
@@ -487,6 +505,28 @@ def cmd_ab(args) -> int:
         gated = sim.run(audio, seed=0, gate=True)
         report = live_report(engine, audio, full, gated)
         save_audio(out / f"{args.prefix}{name}.wav", gated.aligned[:len(audio)], sr)
+        wavs[name] = out / f"{args.prefix}{name}.wav"
+        if args.quality:
+            if kit is None:
+                kit = _quality_kit(args, engine)
+                script = _script_text(args)
+                targets = _targets(args, kit, registry, cache) if "speaker" in kit.enable \
+                    else None
+                if (script is not None or _mic_is_the_script(args)) and "wer" in kit.enable:
+                    mic_text = kit.transcript_of(audio, sr)
+                    if _mic_is_the_script(args):
+                        script, mic_wer = mic_text, 0.0
+                    else:
+                        mic_wer = quality_mod.wer(script, mic_text)
+                    print(f"mic transcript: {mic_text!r}\nmic WER {mic_wer:.1%}")
+            from vox.offline.metrics import active_frames
+
+            seed_pair = (gated.aligned[:len(audio)], sim.run(audio, seed=1, gate=True)
+                         .aligned[:len(audio)])
+            scores = kit.score(seed_pair[0], sr, reference_text=script, mic_wer=mic_wer,
+                               targets=targets, seed_pair=seed_pair,
+                               mask=active_frames(seed_pair[0], sr))
+            quality_rows[name] = scores
         cuts = report["mid_speech_cuts"]
         row = {"name": name, "note": note, "r3": quality["l1_speech"],
                "r3_ratio": quality["l1_speech"] / floor["l1_speech"], "bias": quality["bias"],
@@ -500,11 +540,15 @@ def cmd_ab(args) -> int:
                "active_dbfs": report["stream"]["active_rms_dbfs"],
                "hop_p50": total["host"]["p50"], "hop_p99": total["host"]["p99"]}
         rows.append(row)
+        if name in quality_rows:
+            quality_rows[name].extra.update(click=row["click"], r3=row["r3_ratio"],
+                                            hf_lf=row["hf_lf"])
         _record("ab", {"model": args.model, "audio": str(args.audio), "pitch": args.pitch,
                        "overrides": _overrides(args), "variant": name,
                        "shape": shape_kw, "params": param_kw, "conditioning": cond_kw,
                        "plan": dataclasses.asdict(plan), "noise_floor": floor,
-                       "quality": quality, "live": report, "row": row, "p50": p99})
+                       "quality": quality, "live": report, "row": row, "p50": p99,
+                       "phase0": quality_rows[name].as_dict() if name in quality_rows else None})
         print(f"[{name}] {note}: R3 {row['r3']:.3f} ({row['r3_ratio']:.2f}x floor) click "
               f"{row['click']:.2f} toggles {row['toggles_8s']:.1f}/8s lost "
               f"{row['speech_lost_ms']:.0f} ms voiced {row['voiced'] * 100:.1f}% HF/LF "
@@ -521,6 +565,146 @@ def cmd_ab(args) -> int:
               f"{r['hf_lf_shared']:>+7.1f} {r['hf_lf_full_shared']:>+6.1f} "
               f"{r['active_dbfs']:>6.1f} {r['hop_p99']:>5.1f}")
     print(f"\nwavs: {out}\\{args.prefix}<variant>.wav (gated stream, aligned to the input)")
+    if quality_rows:
+        print("\nPhase 0 quality (" + ", ".join(sorted(kit.enable)) + "):\n")
+        print(quality_mod.table(quality_rows, extra=(("click", "click", "{:.2f}"),
+                                                     ("R3 x", "r3", "{:.2f}"),
+                                                     ("HF/LF", "hf_lf", "{:+.1f}"))))
+    if args.pairs and len(names) > 1:
+        pairs = [quality_mod.Pair(names[0], other, f"{AB_VARIANTS[names[0]][3]} vs "
+                                  f"{AB_VARIANTS[other][3]}") for other in names[1:]]
+        pair_dir = out / f"{args.prefix}pairs"
+        quality_mod.write_pairs(pairs, wavs, pair_dir, seed=quality_mod.MATRIX_PAIRS_SEED,
+                                title=f"vox bench ab {args.model} {args.audio.name}")
+        print(f"\nblind pairs: {pair_dir} (pairs.md to fill in; answer_key.json afterwards)")
+    return 0
+
+
+# ------------------------------------------------------------------------------ quality
+
+# Phase 0.1 (docs/research/15): the measures the existing metrics cannot see, on the same
+# renders. Model-backed scorers run on the CPU and never touch the engine's GPU work.
+
+
+def _quality_kit(args, engine=None):
+    """A ``QualityKit`` with the engine's RMVPE as the F0 tracker (or a standalone one)."""
+    from quality import QualityKit
+
+    enable = tuple(m for m in ("wer", "speaker", "utmos", "f0")
+                   if m not in set((getattr(args, "skip_metrics", "") or "").split(",")))
+    if engine is not None:
+        def track(audio, sr):
+            from vox.audio.resample import resample_array
+
+            return _f0_100hz(engine, resample_array(audio, sr, engine.plan.device_sr))
+    else:
+        track = _f0_track
+    return QualityKit(args.models_dir, args.speaker_backend, args.whisper, track, enable)
+
+
+def _script_text(args) -> str | None:
+    """The WER reference: --transcript (a text file), the fixed script by default, none
+    (``--transcript none``: WER is skipped) or ``mic`` (the un-converted microphone's own
+    Whisper transcript, for recordings of no known script: the mic's WER is then 0 and an
+    output's WER is what the conversion lost)."""
+    from quality import load_script
+
+    spec = getattr(args, "transcript", None)
+    if spec is not None and str(spec).lower() in ("none", "mic"):
+        return None
+    return load_script(Path(spec) if spec else SCRIPT)
+
+
+def _mic_is_the_script(args) -> bool:
+    return str(getattr(args, "transcript", "") or "").lower() == "mic"
+
+
+def _proxy_targets(args, registry, cache):
+    """``vox say`` renders of the fixed script through the model (two seeds): the stand-in
+    for held-out recordings of the target, labelled as such wherever it is used."""
+    def render():
+        from vox.config.schemas import RuntimeParams
+        from vox.offline.convert import FullFileConverter
+        from vox.offline.simulate import load_engine
+        from vox.tts.backends import KokoroBackend
+        from vox.tts.cli import TTS_DIR
+        from vox.tts.speak import TypedPolish, convert_rendered, render_tts, split_pieces
+
+        text = _script_text(args) or TYPED_TEXT
+        backend = KokoroBackend("af_heart", args.models_dir / TTS_DIR)
+        backend.load()
+        pieces = split_pieces(text)
+        rendered = render_tts(backend, pieces)
+        engine = load_engine(args.models_dir, args.model, None, RuntimeParams(), None,
+                             warmup_hops=0, profile_dir=args.profile, registry=registry,
+                             cache=cache)
+        converter = FullFileConverter.from_engine(engine)
+        clips = []
+        for seed in (0, 1):
+            said = convert_rendered(converter, engine.device, engine.loaded.model.tgt_sr,
+                                    rendered, engine.params, None, seed=seed, pieces=pieces,
+                                    polish=TypedPolish())
+            clips.append((said.audio, said.sr))
+        return clips
+    return render
+
+
+def _targets(args, kit, registry, cache):
+    folder = args.targets_dir or (ROOT / "takes" / "target" / args.model)
+    targets = kit.targets(args.model, _proxy_targets(args, registry, cache), folder)
+    if targets.source == "held-out":
+        print(f"speaker targets: {len(targets.files)} held-out recording(s) in {folder}")
+    else:
+        print(f"speaker targets: no held-out recordings in {folder}; using {targets.source} "
+              "(two seeds of the script through the model). For a real similarity number, "
+              f"put 2-3 clips of the actual target voice there.")
+    return targets
+
+
+def cmd_quality(args) -> int:
+    """Score rendered wavs (``--files``) with the Phase 0 metrics. ``--mic`` is the
+    un-converted microphone (its WER against the script is the reference); ``--pairs``
+    also writes blind pairs of the first file against each other one."""
+    from quality import MATRIX_PAIRS_SEED, Pair, table, wer, write_pairs
+    from vox.audio.resample import load_audio
+    from vox.models.registry import ModelRegistry
+    from vox.offline.metrics import active_frames, boundary_click_ratio
+
+    if not args.files:
+        raise SystemExit("quality: give --files a.wav,b.wav")
+    files = {Path(f).stem: Path(f) for f in args.files.split(",")}
+    registry, cache = ModelRegistry(args.models_dir), {}
+    kit = _quality_kit(args)
+    script = _script_text(args)
+    targets = _targets(args, kit, registry, cache) if "speaker" in kit.enable else None
+    mic_wer = float("nan")
+    if args.mic is not None and (script is not None or _mic_is_the_script(args)) \
+            and "wer" in kit.enable:
+        mic, sr = load_audio(args.mic)
+        mic_text = kit.transcript_of(mic, sr)
+        if _mic_is_the_script(args):
+            script, mic_wer = mic_text, 0.0
+        else:
+            mic_wer = wer(script, mic_text)
+        print(f"mic transcript ({args.mic.name}): {mic_text!r}\nmic WER {mic_wer:.1%}")
+    rows = {}
+    for name, path in files.items():
+        audio, sr = load_audio(path)
+        scores = kit.score(audio, sr, reference_text=script, mic_wer=mic_wer, targets=targets,
+                           mask=active_frames(audio, sr))
+        scores.extra["click"] = boundary_click_ratio(audio, int(round(sr * args.block_ms / 1000)))
+        rows[name] = scores
+        print(f"[{name}] {scores.transcript!r}" if scores.transcript else f"[{name}]",
+              flush=True)
+        _record("quality", {"file": str(path), "model": args.model, **scores.as_dict()})
+    print()
+    print(table(rows, extra=(("click", "click", "{:.2f}"),)))
+    if args.pairs:
+        names = list(files)
+        pairs = [Pair(names[0], other, f"{names[0]} vs {other}") for other in names[1:]]
+        out = ROOT / "out" / "ab" / "pairs"
+        write_pairs(pairs, files, out, seed=MATRIX_PAIRS_SEED, title="vox bench quality")
+        print(f"\nblind pairs: {out} (pairs.md to fill in; answer_key.json afterwards)")
     return 0
 
 
@@ -1020,6 +1204,186 @@ def _band_loss_db(ref: np.ndarray, test: np.ndarray, sr: int, mask: np.ndarray,
     return float(10 * np.log10((e_test + 1e-12) / (e_ref + 1e-12)))
 
 
+# ----------------------------------------------------------------------------- target-f0
+
+
+def cmd_target_f0(args) -> int:
+    """Phase 0.2: the fixed script through Kokoro (pitch 0, no auto pitch) and through each
+    model; the output's median voiced F0 becomes ``target_f0_median_hz`` in the model's
+    config.json, with a transposition sweep and the pitch-embedding estimate stored beside
+    it (benchmarks/target_f0.py). ``--models`` limits the set; ``--dry-run`` writes nothing."""
+    import target_f0 as tf
+    from quality import f0_stats
+    from vox.audio.resample import save_audio
+    from vox.config.schemas import RuntimeParams
+    from vox.config.store import load_json, save_json
+    from vox.models import discovery
+    from vox.models.registry import ModelRegistry
+    from vox.offline.convert import FullFileConverter
+    from vox.offline.simulate import load_engine
+    from vox.tts.backends import KokoroBackend
+    from vox.tts.cli import TTS_DIR
+    from vox.tts.speak import TypedPolish, convert_rendered, render_tts, split_pieces
+
+    registry, cache = ModelRegistry(args.models_dir), {}
+    names = args.models.split(",") if args.models else [n for n in registry.names()
+                                                        if registry.config(n).f0]
+    script = _script_text(args) or TYPED_TEXT
+    backend = KokoroBackend(tf.TTS_VOICE, args.models_dir / TTS_DIR)
+    backend.load()
+    pieces = split_pieces(script)
+    rendered = render_tts(backend, pieces)
+    tts_16k = np.concatenate(rendered)
+    kit = _quality_kit(args) if args.utmos else None
+    shifts = [float(x) for x in args.shifts.split(",")]
+    out_dir = ROOT / "out" / "target_f0"
+    cals = []
+    for name in names:
+        engine = load_engine(args.models_dir, name, None, RuntimeParams(), None, warmup_hops=0,
+                             profile_dir=args.profile, registry=registry, cache=cache)
+        converter = FullFileConverter.from_engine(engine)
+        sr = engine.loaded.model.tgt_sr
+        f0_in = _f0_100hz(engine, tts_16k) if engine.plan.device_sr == 16000 else \
+            engine.pipeline.extractor.extract(torch.from_numpy(tts_16k).to(engine.device)) \
+            .float().cpu().numpy()
+        cal = tf.Calibration(name, tf.TTS_VOICE, str(SCRIPT.name),
+                             tts_hz=f0_stats(f0_in)["median_hz"])
+        for shift in sorted(set(shifts) | {0.0}):
+            said = convert_rendered(converter, engine.device, sr, rendered, engine.params,
+                                    pitch=shift, seed=0, pieces=pieces, polish=TypedPolish())
+            f0_out = _f0_100hz(engine, said.audio if engine.plan.device_sr == sr else
+                               __import__("vox.audio.resample", fromlist=["resample_array"])
+                               .resample_array(said.audio, sr, engine.plan.device_sr))
+            row = {"shift_st": shift, **tf.fidelity(f0_in, 2.0 ** (shift / 12.0), f0_out)}
+            cal.sweep.append(row)
+            if shift == 0.0:
+                cal.rendered_hz = row["median_hz"]
+                save_audio(out_dir / f"{name}_pitch0.wav", said.audio, sr)
+            if kit is not None:
+                cal.utmos[f"{shift:g}"] = kit.naturalness.score(said.audio, sr)
+            print(f"[{name}] shift {shift:+g} st: requested {row['requested_hz']:.0f} Hz, out "
+                  f"median {row['median_hz']:.0f} Hz ({row['cents_error']:+.0f} cents), voicing "
+                  f"kept {100 * row['voicing_kept']:.0f}%, flips {row['flips_per_min']:.1f}/min",
+                  flush=True)
+        best = min(cal.sweep, key=tf.fidelity_cost)
+        if tf.fidelity_cost(best) < float("inf"):
+            cal.sweep_best_st, cal.sweep_hz = best["shift_st"], best["median_hz"]
+        base = args.models_dir / "_pretrained" / f"f0G{sr // 1000}k.pth"
+        embedding_note = f"embedding: no pretrained base for {sr} Hz (models/_pretrained)"
+        if base.is_file():
+            fine = tf.load_pitch_table(args.models_dir / name / discovery.MODEL_FILE)
+            cal.embedding = tf.embedding_register(fine, tf.load_pitch_table(base))
+            if cal.embedding is None:
+                embedding_note = "embedding: the pitch table equals the base (this is the base)"
+        cals.append(cal)
+        print(tf.sweep_table(cal))
+        dis = cal.disagreement_st()
+        print(f"[{name}] rendered {cal.rendered_hz:.0f} Hz (TTS {cal.tts_hz:.0f}); sweep best "
+              f"{cal.sweep_best_st:+.0f} st -> {cal.sweep_hz:.0f} Hz ({dis['sweep']:+.1f} st); "
+              + (f"embedding {cal.embedding['median_hz']:.0f} Hz ({dis['embedding']:+.1f} st, "
+                 f"peak x{cal.embedding['peak_ratio']:.1f})" if cal.embedding else
+                 embedding_note))
+        if not args.dry_run:
+            path = args.models_dir / name / discovery.CONFIG_FILE
+            data = load_json(path)
+            data.setdefault("defaults", {}).update(cal.as_defaults())
+            save_json(path, data)
+            # ...and the profile's per-model overrides (committed; config.json is not):
+            # target_f0_hint reads the override first, then the model config.
+            overrides_path = args.profile / "model_overrides.json"
+            overrides = load_json(overrides_path) if overrides_path.is_file() else {"schema": 1}
+            entry = overrides.setdefault("models", {}).setdefault(name, {})
+            entry["target_f0_median_hz"] = round(cal.rendered_hz, 1)
+            save_json(overrides_path, overrides)
+            print(f"[{name}] wrote target_f0_median_hz = {cal.rendered_hz:.1f} to {path} and "
+                  f"{overrides_path}")
+        _record("target_f0", {"model": name, **dataclasses.asdict(cal)})
+        engine.graphs.release()
+        del engine
+    print()
+    print(tf.table(cals))
+    print("\nrendered = the output's median at pitch 0 (RVC copies the source contour, so this "
+          "largely echoes the TTS voice); sweep = where the decoder carried the requested pitch "
+          "most faithfully; embedding = where the coarse-pitch table moved during fine-tuning.")
+    return 0
+
+
+# --------------------------------------------------------------------------------- take
+
+
+def cmd_take(args) -> int:
+    """Phase 0.3: the raw-mic take protocol (benchmarks/matrix.py). ``--matrix`` records
+    every cell with the user reading the script; ``--plan`` only prints the cells;
+    ``--analyze DIR`` scores an existing matrix folder and writes the blind pairs."""
+    import matrix as mx
+    from quality import MATRIX_PAIRS_SEED, table, write_pairs
+
+    inputs = dict(mx.INPUTS)
+    if args.inputs:
+        inputs = {k: v for k, v in mx.INPUTS.items() if k in args.inputs.split(",")}
+        for spec in args.inputs.split(","):
+            if spec not in mx.INPUTS:
+                inputs[spec.lower().replace(" ", "")] = spec
+    flags = lambda s: tuple(x == "on" for x in s.split(","))
+    runs = mx.plan_runs(inputs, flags(args.gates), flags(args.agc),
+                        [float(h) for h in args.hops.split(",")])
+    if args.only:
+        wanted = set(args.only.split(","))
+        runs = [r for r in runs if r.label in wanted]
+    script = mx.script_or_default(args.transcript if args.transcript and
+                                  str(args.transcript).lower() != "none" else None)
+    if args.plan or not (args.matrix or args.analyze):
+        print(f"{len(runs)} runs (about {len(runs)} minutes of reading):")
+        for n, r in enumerate(runs, 1):
+            print(f"  {n:2d}. {r.label:<34} {r.describe()}, gate threshold "
+                  f"{r.gate_threshold(args.gate_threshold_agc, args.gate_threshold_raw):g} dBFS")
+        print(f"\nscript ({len(script.split())} words):\n  {script}")
+        print("\nrun with --matrix to record (the output goes to the virtual cable; nothing "
+              "plays on the speakers), --analyze DIR to score a recorded folder.")
+        if not args.analyze:
+            return 0
+    folder = args.analyze
+    if args.matrix:
+        folder = args.out_dir or (ROOT / "recordings" / time.strftime("matrix_%Y%m%d_%H%M%S"))
+        done = mx.record_matrix(runs, folder, model=args.model, models_dir=args.models_dir,
+                                profile_dir=args.profile, pitch=args.pitch, script_text=script,
+                                output=args.output, seconds=args.take_seconds,
+                                agc_thr=args.gate_threshold_agc, raw_thr=args.gate_threshold_raw,
+                                extra_ms=args.extra_ms)
+        print(f"\nrecorded {len(done)} of {len(runs)} runs into {folder}")
+        if not done:
+            return 1
+    if folder is None:
+        return 0
+    folder = Path(folder)
+    recorded = mx.recorded_runs(folder)
+    if not recorded:
+        raise SystemExit(f"no takes with a run label in {folder}")
+    from vox.models.registry import ModelRegistry
+
+    kit = _quality_kit(args)
+    targets = _targets(args, kit, ModelRegistry(args.models_dir), {}) \
+        if "speaker" in kit.enable else None
+    rows = mx.analyze_matrix(folder, kit, script, targets)
+    report = table(rows, extra=mx.MATRIX_EXTRA)
+    print("\n" + report)
+    pairs = mx.default_pairs(recorded)
+    wavs = {r.label: mx.take_files(folder, r.label)["output"] for r in recorded}
+    pair_dir = ROOT / "out" / "ab" / f"{folder.name}_pairs"
+    key = write_pairs(pairs, wavs, pair_dir, seed=MATRIX_PAIRS_SEED,
+                      title=f"raw-mic matrix {folder.name}")
+    (folder / "matrix_report.md").write_text(
+        f"# {folder.name}\n\nmodel {args.model}, pitch {args.pitch:+g}; script "
+        f"{SCRIPT.name}\n\n{report}\n\nblind pairs: `{pair_dir}` "
+        f"({len(key['pairs'])} pairs)\n", encoding="utf-8")
+    for label, s in rows.items():
+        _record("take", {"folder": str(folder), "label": label, "model": args.model,
+                         **s.as_dict()})
+    print(f"\nreport: {folder / 'matrix_report.md'}\nblind pairs: {pair_dir} "
+          f"({len(key['pairs'])}; pairs.md to fill in, answer_key.json afterwards)")
+    return 0
+
+
 # --------------------------------------------------------------------------------- perf
 
 
@@ -1323,7 +1687,7 @@ def main() -> int:
     parser.add_argument("command", choices=("accept", "ab", "typed", "perf", "extra", "sola",
                                             "block", "decctx", "envelope", "gate",
                                             "graph-probe", "sing", "onset", "suppress",
-                                            "underrun"))
+                                            "underrun", "quality", "target-f0", "take"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--audio", type=Path,
@@ -1376,7 +1740,59 @@ def main() -> int:
                         default="synth", help="graph-probe: which stage to capture")
     parser.add_argument("--sweep", type=Path,
                         default=ROOT / "benchmarks" / "sweeps" / "perf_grid.yaml")
+    # Phase 0 quality metrics (benchmarks/quality.py), blind pairs, target F0, takes
+    parser.add_argument("--quality", action="store_true",
+                        help="ab: also score every variant (WER, speaker cosine, UTMOS, F0)")
+    parser.add_argument("--pairs", action="store_true",
+                        help="ab / quality: write blind X/Y pairs with an answer key")
+    parser.add_argument("--files", default=None, help="quality: comma-separated wavs to score")
+    parser.add_argument("--mic", type=Path, default=None,
+                        help="quality: the un-converted microphone wav (its WER is the reference)")
+    parser.add_argument("--transcript", default=None,
+                        help="text file with the script the renders speak (default: "
+                             "benchmarks/corpus/speech_script.txt; 'none' skips WER; "
+                             "'mic' takes the un-converted microphone's own transcript)")
+    parser.add_argument("--targets-dir", type=Path, default=None,
+                        help="held-out recordings of the target voice (default "
+                             "takes/target/<model>; else vox say renders stand in, labelled)")
+    parser.add_argument("--speaker-backend", choices=("ecapa", "wavlm"), default="ecapa")
+    parser.add_argument("--whisper", default="small.en", help="faster-whisper model size")
+    parser.add_argument("--skip-metrics", default="",
+                        help="comma-separated subset of wer,speaker,utmos,f0 to skip")
+    parser.add_argument("--models", default=None,
+                        help="target-f0: comma-separated models (default: every f0 model)")
+    parser.add_argument("--shifts", default=",".join(f"{x:g}" for x in (-8, -4, 0, 4, 8)),
+                        help="target-f0: transposition sweep in semitones")
+    parser.add_argument("--utmos", action="store_true", help="target-f0: UTMOS per shift")
+    parser.add_argument("--dry-run", action="store_true", help="target-f0: write nothing")
+    parser.add_argument("--matrix", action="store_true", help="take: record every cell")
+    parser.add_argument("--plan", action="store_true", help="take: print the cells and exit")
+    parser.add_argument("--analyze", type=Path, default=None,
+                        help="take: score a recorded matrix folder and write the pairs")
+    parser.add_argument("--inputs", default=None,
+                        help="take: comma-separated input keys or device name fragments "
+                             "(default shure,broadcast)")
+    parser.add_argument("--gates", default="off,on", help="take: gate states (off,on)")
+    parser.add_argument("--agc", default="off,on", help="take: auto level states (off,on)")
+    parser.add_argument("--only", default=None, help="take: comma-separated run labels")
+    parser.add_argument("--take-seconds", type=float, default=0.0,
+                        help="take: fixed recording length (default: Enter stops a run)")
+    parser.add_argument("--gate-threshold-agc", type=float, default=-40.0,
+                        help="take: gate threshold with auto level on, dBFS")
+    parser.add_argument("--gate-threshold-raw", type=float, default=-55.0,
+                        help="take: gate threshold with auto level off, dBFS")
+    parser.add_argument("--extra-ms", type=float, default=1000.0, help="take: context")
+    parser.add_argument("--output", default=None,
+                        help="take: output device (default: the virtual cable)")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="take: where the matrix folder goes (default recordings/matrix_*)")
     args = parser.parse_args()
+    if args.command == "take" and args.hops == "60,20":
+        args.hops = "20,40"  # the matrix of docs/research/15 Phase 0.3 (onset keeps 60,20)
+    if args.command == "take" and args.model == "base_f0_48k_v2":
+        args.model = "Mom"  # the voice the user runs; --model overrides
+        if args.pitch == 0.0:
+            args.pitch = 12.0  # the saved GUI value for Mom (docs/DEVIATIONS.md 7)
     if not torch.cuda.is_available():
         print("warning: no CUDA device; timings describe the CPU fallback", file=sys.stderr)
     handler = {"accept": cmd_accept, "ab": cmd_ab, "typed": cmd_typed, "perf": cmd_perf,
@@ -1384,7 +1800,8 @@ def main() -> int:
                "block": cmd_block, "decctx": cmd_decctx, "envelope": cmd_envelope,
                "gate": cmd_gate, "graph-probe": cmd_graph_probe, "sing": cmd_sing,
                "onset": cmd_onset, "suppress": cmd_suppress,
-               "underrun": cmd_underrun}[args.command]
+               "underrun": cmd_underrun, "quality": cmd_quality, "target-f0": cmd_target_f0,
+               "take": cmd_take}[args.command]
     return handler(args)
 
 

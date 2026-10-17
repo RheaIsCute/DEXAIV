@@ -1,0 +1,15 @@
+# The fixed speech script (docs/research/15, Phase 0). Read it aloud at a normal pace with
+# natural pauses: about sixty seconds. The same text is rendered through every model with
+# `vox bench target-f0` and is the WER reference of `vox bench quality` and `take --matrix`.
+# No digits (word-error scoring would have to normalise them); plenty of sibilants, stops
+# and soft phrase starts.
+
+Please sit still for a moment and listen to the sound of this room.
+Somewhere behind the wall a fan is turning, slow and steady, and the floor creaks when I shift my weight.
+This is a test of the voice changer, so I will speak the way I usually do: sometimes quickly, sometimes with a pause.
+Six thick thistle sticks. She sells seashells by the seashore, and the shells she sells are surely seashells.
+Peter picked a peck of pickled peppers before the big black bus passed the bakery.
+Now a quieter line, almost a whisper, to see whether the soft start of a sentence survives.
+And now louder again! Can you hear me clearly? Does the voice still sound like the same person?
+Outside, the rain kept tapping on the window while the kettle started to sing.
+Thank you for listening. That is the end of the script.

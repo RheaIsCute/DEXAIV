@@ -4,7 +4,17 @@
   "models": {
     "base_f0_48k_v2": {
       "f0_up_key": 0.0,
-      "index_rate": 0.0
+      "index_rate": 0.0,
+      "target_f0_median_hz": 192.1
+    },
+    "Mom": {
+      "target_f0_median_hz": 194.2
+    },
+    "GoatMommy": {
+      "target_f0_median_hz": 193.7
+    },
+    "MaeASMR": {
+      "target_f0_median_hz": 192.5
     }
   }
 }
