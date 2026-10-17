@@ -32,6 +32,7 @@ PROVEN / LIKELY / EXPERIMENTAL and cited to file+line throughout docs 01–11.
 | 12 | **Project structure** | the repository layout and module contracts to start development from |
 | 13 | Implementation roadmap | 10 phases from skeleton to packaging, each with acceptance + benchmark gates |
 | 14 | Open questions | 13 unresolved items, each with a concrete test and a decision deadline |
+| 15 | Modernization report | 2026-10 audit of main@2b2cf93 plus ~100 external sources: what to keep, a three-phase plan (measure, inference-time fixes, retrain, distil) |
 
 ---
 
