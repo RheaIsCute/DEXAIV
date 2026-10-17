@@ -35,6 +35,7 @@ from vox.api.control import BROADCAST_MARKER, LiveConfig, LiveSession, resolve_s
 from vox.api.events import METERS, PERF, STATE, TOAST, EventBus
 from vox.audio import devices as audio_devices
 from vox.audio import suppression as rnnoise
+from vox.audio import volume as vol
 from vox.audio.conditioning import ConditioningConfig
 from vox.audio.resample import resample_array
 from vox.config.schemas import RuntimeParams, ShapeParams
@@ -53,6 +54,7 @@ PERF_EVERY = 8  # meter ticks between profiler snapshots (~2 Hz)
 PERF_HISTORY = 120  # 60 s of profiler snapshots
 CLIP_HISTORY = 20
 CLIP_FADE_MS = 5.0
+CLIP_PEAK = 0.99  # a typed clip's peak after the auto-match and the typed-speech volume
 HOLD_SETTLE_HOPS = 4  # hops between closing the live voice and starting a clip's GPU render
 METER_FLOOR_DB = -120.0
 INDEX_PRIME = 1e-6  # see _start: keeps the index loaded so its rate stays a hot parameter
@@ -217,7 +219,7 @@ class EngineController:
         store: dict[str, Any] = {"model": None, "models": {}, "input": None, "output": None,
                                  "exclusive": None, "gate": {}, "shape": {},
                                  "f0_method": None, "graphs": None, "tts": {},
-                                 "input_level": {}, "suppression": {}}
+                                 "input_level": {}, "suppression": {}, "volume": {}}
         path = self.profile_dir / STATE_FILE
         if path.is_file():
             try:
@@ -625,6 +627,7 @@ class EngineController:
                                 "trim_locked": sing,
                                 "max_gain_db": self._conditioning().max_gain_db,
                                 "range_db": list(INPUT_GAIN_RANGE)},
+                "volume": self._volume_state(),
                 "suppression": self._suppression_state(),
                 # Not built in the engine yet: shown, not switchable (docs/DEVIATIONS.md).
                 "monitor": {"enabled": False, "available": False},
@@ -716,7 +719,9 @@ class EngineController:
             loop_file=self.loop_file, device=self.device, registry=self.registry,
             cache=self.cache, profile_dir=self.profile_dir,
             suppression=self._suppression_choice(self._input_name()),
-            suppression_profile=self.profile.calibration.rnnoise_enabled)
+            suppression_profile=self.profile.calibration.rnnoise_enabled,
+            output_gain=vol.db_to_gain(self._volume()["output_db"]),
+            typed_gain=vol.db_to_gain(self._volume()["typed_db"]))
         self.status, self.error = "starting", None
         self.perf, self._rebuilds_seen, self._recapturing = None, 0, False
         self.perf_history.clear()
@@ -751,6 +756,10 @@ class EngineController:
         self.publish_state()
         if getattr(session, "recording", None) is not None:  # stopping mid-take keeps it
             self._save_take(session)
+        level = getattr(session, "voice_level_dbfs", None)
+        if level is not None:  # typed clips match it until the next session speaks
+            self.store["volume"]["live_level_dbfs"] = round(level, 2)
+            self._save_store()
         try:
             with self._pa_lock:
                 session.stop()
@@ -874,6 +883,71 @@ class EngineController:
             self._save_store()
         self.publish_state()
         return {"enabled": gate.enabled, "threshold_dbfs": gate.threshold_dbfs}
+
+    def _volume(self) -> dict[str, Any]:
+        user = self.store["volume"]
+        return {"output_db": float(user.get("output_db", 0.0)),
+                "typed_db": float(user.get("typed_db", 0.0)),
+                "auto_match": bool(user.get("auto_match", True))}
+
+    def _match_target(self) -> tuple[float, str]:
+        """The level typed clips are matched to, and where it comes from: the converted
+        voice of this session, else of the last one, else ``volume.DEFAULT_MATCH_DBFS``."""
+        session = self.session
+        level = getattr(session, "voice_level_dbfs", None) if session is not None else None
+        if level is not None:
+            return level, "live"
+        saved = self.store["volume"].get("live_level_dbfs")
+        if saved is not None:
+            return float(saved), "last session"
+        return vol.DEFAULT_MATCH_DBFS, "default"
+
+    def _volume_state(self) -> dict[str, Any]:
+        target, source = self._match_target()
+        return {**self._volume(), "output_range_db": list(vol.OUTPUT_DB_RANGE),
+                "typed_range_db": list(vol.TYPED_DB_RANGE),
+                "match_dbfs": round(target, 1), "match_source": source}
+
+    def set_volume(self, output_db: float | None = None, typed_db: float | None = None,
+                   auto_match: bool | None = None) -> dict[str, Any]:
+        """Output volume (everything sent to the output device) and typed-speech volume
+        (typed clips only), in dB, and whether typed clips are first matched to the live
+        voice's level. Hot while live (ramped, no click); kept for the next start."""
+        with self._lock:
+            user = self.store["volume"]
+            if output_db is not None:
+                user["output_db"] = round(vol.clamp(output_db, vol.OUTPUT_DB_RANGE), 2)
+            if typed_db is not None:
+                user["typed_db"] = round(vol.clamp(typed_db, vol.TYPED_DB_RANGE), 2)
+            if auto_match is not None:
+                user["auto_match"] = bool(auto_match)
+            current = self._volume()
+            if self.session is not None:
+                self.session.set_volume(output_gain=vol.db_to_gain(current["output_db"]),
+                                        typed_gain=vol.db_to_gain(current["typed_db"]))
+            self._save_store()
+        self.publish_state()
+        return current
+
+    def _clip_gain(self, clip: np.ndarray, sr: int) -> tuple[float, str]:
+        """Linear gain a typed clip gets before the typed-speech volume: the auto-match to
+        the live level (if on), reduced so that with the typed volume the clip peaks at
+        most at -0.1 dBFS. Returns the gain and a note for the log."""
+        settings = self._volume()
+        typed = vol.db_to_gain(settings["typed_db"])
+        match_db, note = 0.0, "auto-match off"
+        if settings["auto_match"]:
+            target, source = self._match_target()
+            level = vol.active_level_dbfs(clip, sr)
+            match_db = vol.match_gain_db(level, target)
+            note = (f"matched {match_db:+.1f} dB to {target:.1f} dBFS ({source})"
+                    if level is not None else "no speech to match")
+        gain = vol.db_to_gain(match_db)
+        peak = float(np.abs(clip).max()) if len(clip) else 0.0
+        if peak * gain * typed > CLIP_PEAK:
+            gain = CLIP_PEAK / (peak * typed)
+            note += f", limited to {20 * math.log10(gain):+.1f} dB by the peak"
+        return gain, note
 
     def set_input_level(self, auto: bool | None = None,
                         gain_db: float | None = None) -> dict[str, Any]:
@@ -1346,14 +1420,22 @@ class EngineController:
 
     def _play(self, clip: np.ndarray) -> None:
         """Through the live output path when live (the mic is muted for the clip), else
-        straight to the selected output device."""
+        straight to the selected output device. The clip is matched to the live level
+        first (``_clip_gain``); the typed-speech and output volumes are then applied by the
+        clip player and the output callback when live (hot), here when not."""
         session = self.session
         device_sr = self._shape().device_sr
+        gain, note = self._clip_gain(clip, device_sr)
+        self._log(f"speech level: {note}")
+        clip = (clip * gain).astype(np.float32)
         if session is not None and self.status == "running":
             session.worker.play_clip(clip)
         else:
             import sounddevice as sd
 
+            settings = self._volume()
+            clip *= vol.db_to_gain(settings["typed_db"] + settings["output_db"])
+            np.clip(clip, -1.0, 1.0, out=clip)
             try:
                 with self._pa_lock:
                     target = audio_devices.resolve_device(self.store.get("output"), "output")
@@ -1483,7 +1565,7 @@ class EngineController:
 COMMANDS = {
     "start": "start", "stop": "stop", "get_state": "get_state", "shutdown": "shutdown",
     "set_param": "set_param", "reset_pitch": "reset_pitch", "set_gate": "set_gate",
-    "set_input_level": "set_input_level", "record": "record",
+    "set_input_level": "set_input_level", "set_volume": "set_volume", "record": "record",
     "set_suppression": "set_suppression", "set_preset": "set_preset",
     "set_auto_pitch": "set_auto_pitch",
     "set_monitor": "set_monitor",

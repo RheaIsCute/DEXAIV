@@ -902,3 +902,25 @@ live rebuild. Rule restated: nothing off the hop thread touches a device tensor.
 Not verified: listening (`autopitch_*` are for the user); a voice that drifts *within* a
 phrase faster than the 2 s follow; what the tracker does on a sung line that spans more
 than the model's range (the `pitch_range` slider is the lever there).
+
+## 10. Volume controls (2026-10-17)
+
+Live screen, next to Input gain and the suppression amount; all hot (applied between hops
+or inside the output callback), all kept in `gui_state.json` under `volume`:
+
+| control | range | where it acts | how |
+|---|---|---|---|
+| Output volume | -24..+6 dB | `DuplexAudio` output callback: the last step before the device, so the converted voice and typed clips move together, and the OUT meter and the Record output tap see what plays | `audio.volume.RampedGain`: a new value ramps in linearly over 10 ms (480 samples) whatever the callback block, no allocation; unity is a no-op; clipped at full scale only while boosting |
+| Typed speech volume | -12..+12 dB | the clip player (`engine/override.py`), on the clip only | same ramp, so moving it mid-clip is click-free; clips played while not live get it (and the output volume) applied before `sd.play` |
+| Match typed speech to live level | on by default | controller, before the typed volume | the worker follows the converted voice's level over its speech hops (`SpeechLevel`: energy average, 3 s time constant, hops under -60 dBFS skipped); a clip's speech level (`active_level_dbfs`: 20 ms frames within 30 dB of its loudest, pauses excluded) is moved onto it, by at most -24 / +18 dB, then lowered if needed so that with the typed volume the clip peaks at -0.1 dBFS. Before the voice has spoken in a session, the last session's level is used (saved on stop), else -20 dBFS. The Live screen says which |
+| Monitor volume | — | not built | headphone monitoring does not exist in the engine yet (the Settings toggle is shown disabled), so there is nothing to set |
+
+Measured (`scripts/volume_check.py`: the mic script looped through Mom into VAC Line 1,
+gate off, OUT meter p75 of the GUI's own meter events per 5 s phase; three runs):
+output 0 / -12 / -24 dB read -7.0..-7.9 / -18.6..-19.0 / -31.1..-31.8 dB (steps of
+-11.2 and -24.1 dB on average), +6 dB pins the meter at 0 dB (the clip), and values came
+back after a controller restart. Typed clips at typed 0 / -12 / +12 dB read about -9 /
+-21 / -3.6 dB on the meter (+12 is held back by the peak guard). Underruns: none on any
+slider move. Around typed clips there were 3 underruns in 13 clips with this code and 3
+in 7 clips on e3ba942 with no volume code at all (same script, `--typed 0,...`), so they
+belong to the typed-over-live hold, not to the volume path; still open.

@@ -30,6 +30,7 @@ import torch
 from vox.audio.conditioning import ConditioningConfig, InputConditioner
 from vox.audio.recorder import SessionRecorder
 from vox.audio.rings import SPSCRing
+from vox.audio.volume import SpeechLevel
 from vox.config.schemas import RuntimeParams, ShapeParams
 from vox.engine import chunker, warmup
 from vox.engine.gate import GateConfig, GateDecision, SilenceGate
@@ -126,7 +127,10 @@ class InferenceWorker(threading.Thread):
         self._seen_underrun_samples = 0
         self.ready = threading.Event()
         self.first_hop = threading.Event()  # set once the first hop is in the output ring
-        self.override = ClipOverride(self.plan.block)  # typed clips over the live voice
+        # typed clips over the live voice
+        self.override = ClipOverride(self.plan.block, self.plan.device_sr)
+        # Level of the converted voice while it speaks: typed clips are matched to it.
+        self.voice_level = SpeechLevel()
         self.hold = False  # control path: treat every hop as gated (see ``_hop``)
         # Control path sets it to record a take (audio/recorder.py): raw mic, conditioned
         # mic and output, one hop at a time. None: not recording.
@@ -291,6 +295,8 @@ class InferenceWorker(threading.Thread):
         s.gate_vad = decision.vad_prob
         with timers.stage("download"):
             self._host_out.copy_(stitched)  # syncs the hop
+        if decision.speech:
+            self.voice_level.add(self._host_out_np, block / plan.device_sr)
         pipeline.register.publish()  # the GUI reads auto pitch from this host mirror
         fill_before = self.out_ring.fill()
         if s.hops == 0:

@@ -63,6 +63,10 @@ class LiveConfig:
     suppression: bool | None = None
     suppression_profile: bool = False  # calibration.json's rnnoise_enabled
     record_output_s: float = 0.0  # > 0: tap what the device plays (streams.OutputTap)
+    # Volumes, linear (audio/volume.py), hot through ``LiveSession.set_volume``: everything
+    # sent to the output device, and typed clips only.
+    output_gain: float = 1.0
+    typed_gain: float = 1.0
 
 
 BROADCAST_MARKER = "nvidia broadcast"
@@ -152,6 +156,7 @@ class LiveSession:
                                       engine.timers, self.in_ring, self.out_ring, self.hop_event,
                                       fill_target, extractors, log=self.log,
                                       conditioner=engine.conditioner, shape=cfg.shape)
+        self.worker.override.volume.jump(cfg.typed_gain)
         self.worker.start()
         self.worker.ready.wait(timeout=10.0)
 
@@ -160,6 +165,7 @@ class LiveSession:
         tap = OutputTap(sr, cfg.record_output_s) if cfg.record_output_s > 0 else None
         self.audio = DuplexAudio(stream_cfg, self.in_ring, self.out_ring, block, self.hop_event,
                                  tap)
+        self.audio.volume.jump(cfg.output_gain)
         if cfg.input_file is not None:
             from vox.audio.resample import load_audio
 
@@ -267,6 +273,23 @@ class LiveSession:
         }
         stem = time.strftime("take_%Y%m%d_%H%M%S", time.localtime(self._record_started))
         return recorder.save(folder, stem, meta)
+
+    def set_volume(self, output_gain: float | None = None,
+                   typed_gain: float | None = None) -> None:
+        """Output and typed-speech volume (linear), hot: ramped in by the output callback
+        and by the clip player respectively (audio/volume.py)."""
+        if output_gain is not None:
+            self.cfg.output_gain = float(output_gain)
+            if self.audio is not None:
+                self.audio.volume.target = float(output_gain)
+        if typed_gain is not None:
+            self.cfg.typed_gain = float(typed_gain)
+            self.worker.override.volume.target = float(typed_gain)
+
+    @property
+    def voice_level_dbfs(self) -> float | None:
+        """The converted voice's recent speech level (None until it has spoken)."""
+        return self.worker.voice_level.dbfs
 
     def set_conditioning(self, **changes: Any) -> ConditioningConfig:
         """Input chain, hot: ``auto_level``, ``trim_db`` (and the AGC's bounds),

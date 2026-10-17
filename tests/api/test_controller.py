@@ -77,6 +77,11 @@ class FakeSession:
     def set_conditioning(self, **changes):
         self.calls.append(("conditioning", changes))
 
+    def set_volume(self, **changes):
+        self.calls.append(("volume", changes))
+
+    voice_level_dbfs = None
+
     recording = None
 
     def start_recording(self):
@@ -707,3 +712,84 @@ def test_broadcast_mic_defaults_suppression_off_and_warns_once_when_singing(env)
     warned = [t for t in drain(toasts, TOAST) if "sustained notes" in t["message"]]
     assert len(warned) == 1 and warned[0]["kind"] == "warn"
     assert warned[0]["message"] == ctl.BROADCAST_SING_WARNING
+
+
+def test_volumes_are_hot_clamped_and_kept(env):
+    c = env.make(model="Alpha")
+    v = c.state()["volume"]
+    assert (v["output_db"], v["typed_db"], v["auto_match"]) == (0.0, 0.0, True)
+    assert v["output_range_db"] == [-24.0, 6.0] and v["typed_range_db"] == [-12.0, 12.0]
+    assert (v["match_dbfs"], v["match_source"]) == (-20.0, "default")
+    c.command("set_volume", {"output_db": -6, "typed_db": 3})
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    assert session.cfg.output_gain == pytest.approx(10 ** (-6 / 20))
+    assert session.cfg.typed_gain == pytest.approx(10 ** (3 / 20))
+    c.set_volume(output_db=40, typed_db=-40, auto_match=False)
+    gains = [call[1] for call in session.calls if call[0] == "volume"]
+    assert gains[-1] == {"output_gain": pytest.approx(10 ** (6 / 20)),
+                         "typed_gain": pytest.approx(10 ** (-12 / 20))}
+    session.voice_level_dbfs = -17.3
+    assert c.state()["volume"]["match_source"] == "live"
+    c.stop()
+    settle(c)
+    c.shutdown()
+    v = env.make().state()["volume"]
+    assert (v["output_db"], v["typed_db"], v["auto_match"]) == (6.0, -12.0, False)
+    assert (v["match_dbfs"], v["match_source"]) == (-17.3, "last session")
+
+
+def sine(seconds, amp, sr=48000):
+    t = np.arange(int(sr * seconds)) / sr
+    return (amp * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+
+
+def rms_db(x):
+    return 20 * np.log10(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+
+
+def test_typed_clips_are_matched_to_the_live_level_then_the_typed_volume(env):
+    c = env.make()
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    session.voice_level_dbfs = -26.0
+    c.set_volume(typed_db=4)
+    c._clips[1] = sine(1.0, 0.5)  # -9 dBFS
+    c.replay(1)
+    settle(c)
+    submitted = session.worker.override._pending
+    assert rms_db(submitted) == pytest.approx(-26.0, abs=0.1)  # the typed dB is the player's
+    assert c._clips[1].max() == pytest.approx(0.5, abs=1e-3)  # the kept clip is untouched
+    c.set_volume(auto_match=False)
+    c.replay(1)
+    settle(c)
+    assert np.array_equal(session.worker.override._pending, c._clips[1])
+
+
+def test_matching_never_pushes_a_clip_past_full_scale(env):
+    c = env.make()
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    session.voice_level_dbfs = -3.0
+    c.set_volume(typed_db=12)
+    c._clips[1] = sine(1.0, 0.1)
+    c.replay(1)
+    settle(c)
+    peak = np.abs(session.worker.override._pending).max() * 10 ** (12 / 20)
+    assert peak == pytest.approx(ctl.CLIP_PEAK, abs=1e-3)
+
+
+def test_offline_clips_carry_every_volume(env, monkeypatch):
+    import sounddevice as sd
+
+    played = []
+    monkeypatch.setattr(sd, "play", lambda clip, sr, device=None: played.append(clip.copy()))
+    c = env.make()
+    c.set_volume(output_db=-6, typed_db=-6)
+    c._clips[1] = sine(1.0, 0.5)
+    c.replay(1)
+    settle(c)
+    assert rms_db(played[-1]) == pytest.approx(-20.0 - 12.0, abs=0.1)  # default -20 target

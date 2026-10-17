@@ -225,6 +225,7 @@ function render() {
     : "Trim on top of auto level (or the whole input gain with auto level off)";
   $("auto-level").checked = level.auto;
   renderInputGain();
+  renderVolume();
   renderRecord();
   $("noise-floor").textContent = calibrated
     ? "Threshold set from your calibration noise floor (" + Math.round(gate.noise_floor_dbfs) + " dB)"
@@ -354,6 +355,19 @@ function renderInputGain() {
   const text = signed(trim) + " dB" + (locked ? " · Sing" : "");
   const live = meters.running && $("auto-level").checked && meters.in_gain_db != null;
   $("input-gain-value").textContent = live ? text + " · now " + signed(Math.round(meters.in_gain_db)) : text;
+}
+
+// Output and typed-speech volume (dB) and the typed-speech level match.
+function renderVolume() {
+  const v = state && state.volume;
+  if (!v) return;
+  setValue($("output-volume"), v.output_db);
+  setValue($("typed-volume"), v.typed_db);
+  if (document.activeElement !== $("output-volume")) $("output-volume-value").textContent = signed(Math.round(v.output_db)) + " dB";
+  if (document.activeElement !== $("typed-volume")) $("typed-volume-value").textContent = signed(Math.round(v.typed_db)) + " dB";
+  $("auto-match").checked = v.auto_match;
+  const from = { live: "your live voice", "last session": "your last live session", default: "a default level" }[v.match_source] || v.match_source;
+  $("match-level").textContent = v.auto_match ? "Typed clips matched to " + Math.round(v.match_dbfs) + " dBFS (" + from + ")" : "";
 }
 
 function fillDevices(select, list, current) {
@@ -541,6 +555,11 @@ function wire() {
   const sendGain = throttled((v) => cmd("set_input_level", { gain_db: v }));
   $("input-gain").addEventListener("input", (e) => { renderInputGain(); sendGain(+e.target.value); });
   $("auto-level").addEventListener("change", (e) => cmd("set_input_level", { auto: e.target.checked }));
+  const sendOutput = throttled((v) => cmd("set_volume", { output_db: v }));
+  $("output-volume").addEventListener("input", (e) => { $("output-volume-value").textContent = signed(+e.target.value) + " dB"; sendOutput(+e.target.value); });
+  const sendTyped = throttled((v) => cmd("set_volume", { typed_db: v }));
+  $("typed-volume").addEventListener("input", (e) => { $("typed-volume-value").textContent = signed(+e.target.value) + " dB"; sendTyped(+e.target.value); });
+  $("auto-match").addEventListener("change", (e) => cmd("set_volume", { auto_match: e.target.checked }));
   $("record").addEventListener("click", () => cmd("record", { enabled: !(state && state.recording && state.recording.active) }));
   const sendIndex = throttled((v) => cmd("set_param", { name: "index_rate", value: v }));
   $("index-rate").addEventListener("input", (e) => { $("index-rate-value").textContent = (e.target.value / 100).toFixed(2); sendIndex(e.target.value / 100); });

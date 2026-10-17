@@ -7,22 +7,27 @@ engine never stops and there is still exactly one writer of the output ring, so 
 clip and the live voice share one output path (docs/gui/GUI_SPEC.md, type-to-speak).
 
 Host side, numpy only, no allocation per hop. ``submit`` and ``cancel`` are single-slot
-mailboxes written by the control path and read by the worker between hops.
+mailboxes written by the control path and read by the worker between hops. ``volume``
+is the typed-speech volume (``volume.target``, linear, from the control path), ramped in
+while a clip plays so the slider works mid-clip.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from vox.audio.volume import RampedGain
+
 
 class ClipOverride:
-    def __init__(self, block: int) -> None:
+    def __init__(self, block: int, sr: int = 48000) -> None:
         self._pending: np.ndarray | None = None
         self._cancel = False
         self._clip: np.ndarray | None = None
         self._pos = 0
         self._fade_in_next = False
         self.played = 0  # clips started
+        self.volume = RampedGain.for_rate(sr)
         self.resize(block)
 
     def resize(self, block: int) -> None:
@@ -30,6 +35,7 @@ class ClipOverride:
         ramp = np.linspace(0.0, 1.0, block, endpoint=False, dtype=np.float32)
         self._fade_in = ramp
         self._fade_out = (1.0 - ramp).astype(np.float32)
+        self._scratch = np.zeros(block, dtype=np.float32)
 
     # ----------------------------------------------------------------- control path
 
@@ -74,7 +80,13 @@ class ClipOverride:
                 out *= self._fade_in
             return False
         n = min(out.shape[0], clip.shape[0] - self._pos)
-        out[:n] += clip[self._pos:self._pos + n]
+        if self.volume.unity:
+            out[:n] += clip[self._pos:self._pos + n]
+        else:
+            part = self._scratch[:n]
+            part[:] = clip[self._pos:self._pos + n]
+            self.volume.apply(part)
+            out[:n] += part
         self._pos += n
         if self._pos >= clip.shape[0]:
             self._clip = None

@@ -21,6 +21,7 @@ import numpy as np
 
 from vox.audio.devices import WASAPI, DeviceInfo
 from vox.audio.rings import SPSCRing
+from vox.audio.volume import RampedGain
 
 
 @dataclass
@@ -94,6 +95,10 @@ class DuplexAudio:
         n = 4 * cfg.callback_block  # PortAudio may hand over larger blocks in shared mode
         self._mono_in = np.zeros(n, dtype=np.float32)
         self._mono_out = np.zeros(n, dtype=np.float32)
+        # Output volume (``volume.target``, linear, set from the control path): the last
+        # thing before the device, so the converted voice and typed clips move together and
+        # the OUT meter and the output tap see what plays. Ramped, so a slider never clicks.
+        self.volume = RampedGain.for_rate(cfg.sr)
         self.in_channels = 0
         self.out_channels = 0
 
@@ -125,6 +130,11 @@ class DuplexAudio:
                 self.health.output_underflows += 1
         mono = self._mono_out[:frames]
         real = self.out_ring.read(mono)
+        volume = self.volume
+        if not volume.unity:
+            volume.apply(mono)
+            if volume.now > 1.0 or volume.target > 1.0:
+                np.clip(mono, -1.0, 1.0, out=mono)
         outdata[:] = mono[:, None]  # same signal on every channel
         if self.tap is not None:
             self.tap.write(mono, real)

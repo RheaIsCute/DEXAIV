@@ -120,6 +120,14 @@
           <span class="row between sub">Input gain <span class="num strong" id="input-gain-value">0 dB</span></span>
           <input type="range" id="input-gain" min="-12" max="24" step="1" value="0">
         </label>
+        <label class="col" style="gap:5px" title="Everything sent to the output: your converted voice and typed clips">
+          <span class="row between sub">Output volume <span class="num strong" id="output-volume-value">0 dB</span></span>
+          <input type="range" id="output-volume" min="-24" max="6" step="1" value="0">
+        </label>
+        <label class="col" style="gap:5px" title="Typed clips only, on top of the output volume">
+          <span class="row between sub">Typed speech volume <span class="num strong" id="typed-volume-value">0 dB</span></span>
+          <input type="range" id="typed-volume" min="-12" max="12" step="1" value="0">
+        </label>
       </div>
       <div class="col side" style="gap:12px">
         <label class="toggle"><span>Noise gate</span><input type="checkbox" id="gate-on"></label>
@@ -129,6 +137,8 @@
           <span class="row between sub">Amount <span class="num strong" id="suppression-mix-value">100 %</span></span>
           <input type="range" id="suppression-mix" min="0" max="100" step="5" value="100">
         </label>
+        <label class="toggle" title="Typed clips are brought to the level of your live voice before the typed speech volume"><span>Match typed speech to live level</span><input type="checkbox" id="auto-match"></label>
+        <div class="hint" id="match-level"></div>
         <div class="hint" id="noise-floor"></div>
       </div>
     </section>
