@@ -1,5 +1,6 @@
 """The ``TtsBackend`` contract and backend selection. Nothing here touches the network."""
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ def test_voice_defaults_and_availability_follows_the_reason(tmp_path):
 @pytest.mark.parametrize("cls", sorted(BACKENDS.values(), key=lambda c: c.name))
 def test_real_backends_honour_the_contract(cls, tmp_path, monkeypatch):
     assert issubclass(cls, TtsBackend) and BACKENDS[cls.name] is cls
+    assert inspect.signature(cls.synthesize).parameters["blend"].default == ()
     backend = cls(cache_dir=tmp_path)
     assert backend.voice == cls.default_voice
     assert isinstance(backend.available(), bool)

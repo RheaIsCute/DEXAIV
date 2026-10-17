@@ -170,3 +170,166 @@ for byte); the live microphone never sees them:
 On Mom: contour x1.2 widens the F0 spread 3.0 -> 3.4 st; the blend is darker (+3.0 -> +1.6
 dB HF/LF) and narrower (2.7 st); the 40 ms envelope mix narrows the loudness spread
 (8.9 -> 8.2 dB), the opposite of what the report expected. Nothing has been listened to.
+
+## Natural typed speech: normalisation and per-utterance variation
+
+Pipeline: raw text -> `normalize.normalize()` -> `expressive.analyze()` (via
+`speak.split_pieces`) -> one `variation.draw()` per utterance -> backend -> RVC. `vox say`
+and the GUI both take this path; `--no-normalize` / `--variation 0` switch each half off,
+and `vox say --dry-run "text"` prints raw -> normalized -> pieces without loading a model.
+
+### Normalisation (`vox.tts.normalize`, pure)
+
+In order: URLs become "link"; emoji are dropped except the laughing ones; `<3` is "love",
+other emoticons are dropped. Laughter (`lol`, `lmao`, `lmfao`, `rofl`, `haha...`, `hehe`,
+`xD`, 😂 😭 🤣) becomes one "haha" set off by commas, or nothing (`--laughter drop`, GUI
+Settings > Typed speech > Laughter); it is never spelled. Then the slang table, then
+numbers, then casing and the terminal mark. Every rule is in `tests/tts/test_normalize.py`
+(241 cases: one per shipped slang entry plus the tables below).
+
+**Slang table.** `src/vox/tts/data/slang_en.json` (103 entries), with
+`profiles/<name>/slang.json` merged over it. Schema:
+
+```json
+{"words": {"wsg": "what's good?", "tn": "tonight", "fr": "fr", "meh": ""}}
+```
+
+- Keys are matched as whole words, case-insensitively; they may hold spaces (`no prob`),
+  digits (`gr8`, `b4`, `2nite`: digits are only read as letters inside such entries) or a
+  slash (`w/`, `w/o`, which may run into the next word: `w/friends`). The longest key wins.
+- A value ending in `?` is a question phrase (`wbu`, `hbu`, `wyd`, `wdym`): at the end of a
+  line it gets the `?` and a comma before it ("I don't know, what about you?"); elsewhere
+  neither. A value starting with `,` is an aside (`ngl`, `tbh`, `imo`, `btw`, `omg`, `ofc`,
+  `jk`, `istg`): commas where it meets other words ("Not gonna lie, I'm tired.").
+- An empty value drops the word; mapping a word to itself switches a shipped entry off.
+- A flat `{"word": "spoken"}` object is accepted too; keys starting with `_` are comments.
+- The user file is re-read when it changes (mtime), or on Settings > Reload. A broken file
+  is reported (GUI note under the buttons, a `vox say` warning) and the shipped list is
+  used alone. Settings > Edit slang list creates the file with two examples the first time
+  and opens it in the default editor.
+- Case: an all-caps contraction keeps its emphasis (`DONT` -> `DON'T`); an all-caps
+  abbreviation is not shouting (`IDK` -> "I don't know"); in a line typed in caps with at
+  least one real caps word, every expansion is upper-cased (`WHY R U LIKE THIS` ->
+  `WHY ARE YOU LIKE THIS`).
+- Ambiguous entries are decided by small context rules only: `ur` is "you're" before an
+  `-ing` word or a short adjective list ("ur so funny", "ur the best"), else "your";
+  `r` is "are" between two words or opening a line before a pronoun ("r u ok"), else left
+  alone; `ya` stays "ya" after see/love/thank/miss/... ("see ya"), else "yeah". `ill`,
+  `were`, `its`, `well`, `lets` are deliberately not in the table.
+
+**Numbers** use `num2words==0.5.14` (pure Python plus docopt; it installed cleanly on
+Windows / Python 3.13 into the main `.venv` and is pinned in `requirements/tts.txt`; without
+it digits pass through and espeak reads them). Money (`$5.50` -> "five dollars and fifty
+cents", `$5k`, `€`, `£`), percentages, clock times (`10:30` "ten thirty", `10:05am` "ten oh
+five AM", `12:00` "twelve o'clock"), `3pm` -> "three PM", ordinals, ranges (`2-3` "two to
+three"), years 1100-2099 as years ("twenty twenty-six"), leading-zero codes digit by digit;
+digits inside words (`ps5`) are left alone. `&` -> "and", `@` -> "at", `#tag` -> "tag",
+`*` and `~` are removed. AM, PM and AFK were added to the expressive acronym allowlist so
+espeak spells them without them counting as emphasis.
+
+**Casing and the terminal mark.** A lone `i` is `I`; a sentence starts with a capital (not
+after `...`, not after an initial: "the U.S. tomorrow"); a sentence or clause opening with
+okay/yeah/nah/yep/nope/alright/hey gets a comma after it. A line without `. ! ? …` gets `?`
+when it opens like a question (auxiliary + pronoun: "are you", "r u"; a wh-word + auxiliary
+or "about"; "why") and `.` otherwise. A line ending in a dash pause, or whose last clause
+the expressive layer will end with `!` (caps / `!!` emphasis), is left open.
+
+**The expressive markers survive.** Dots, dashes, letter runs, caps words and repeated
+`!?` are never rewritten (caps are only ever raised).
+`test_every_expressive_test_input_keeps_its_hints` runs all 33 inputs of
+`test_expressive.py` with and without normalisation: identical speed, gain and pauses.
+
+Why it matters, checked with kokoro's phonemizer (`kokoro_onnx.tokenizer`, espeak-ng):
+`$5` reads "dollar five", `IM` reads "ɪm", `fr` is spelled "F R", `lol` is "lahl", and a
+lone capital `A` is the article (`A F K` -> "ə F K"; `AFK` / `afk` are spelled correctly).
+
+### Variation (`vox.tts.variation`)
+
+One knob, `variation` 0..1 (default 0.35; `vox say --variation`, GUI slider), drawn once per
+utterance from `numpy.random.default_rng(seed)`; `seed` is the clock unless `--seed` is
+given (the CLI prints it, so a draw can be reproduced). Every piece of the utterance uses
+the same draw.
+
+| what | bound at variation v | at the default 0.35 |
+|---|---|---|
+| TTS speed | x(1 ± 0.04 v), on top of the expressive speed | ±1.4% |
+| Kokoro style | blend of 1-2 other voices with the same prefix (`af_*` for `af_heart`), together ≤ 0.15 v | ≤ 5.25% |
+| transposition | ± 0.4 v semitones on top of the auto / manual pitch | ±0.14 st |
+| explicit pauses (dots, dashes) | x(1 ± 0.25 v); the plain 200 ms sentence gap is not varied | ±8.75% |
+| RVC seed | a fresh 31-bit seed | |
+
+- **kokoro-onnx 0.6.1 takes a style array** in place of a voice name (`create(voice=
+  NDArray)`); voice styles are (510, 1, 256) float32. `KokoroBackend.style(blend)` mixes
+  them; a render without a blend still passes the voice name, as before. edge-tts voices
+  cannot be blended (`TtsBackend.blends = False`). The GUI's allowlist can be set as
+  `tts.blend_voices` in `gui_state.json` (default: the voice's own prefix family).
+- **Fractional transposition needs no other path:** `f0_up_key` is a float through
+  `semitones_to_ratio` (`2 ** (key / 12)`) in the full-file converter.
+- **`variation 0` is the old path.** It draws nothing and passes the caller's seed (`vox say`
+  0, the GUI None, as before). Verified byte-identical on `Mom`: one pre-rendered kokoro wav
+  per piece of "hey... hey!! are you for real right now" through `speak.speak` on `main`
+  (af28754) and on this branch with `draw(0.0, 0)`, seed 0: `cmp` finds no difference.
+- **Kokoro was never deterministic.** Two renders of "Hi." in one process differ by up to
+  0.089 in sample value, and `onnxruntime.set_seed()` does not change that. So "hi" twice
+  was never bit-identical, and the two `hi_fixed_*` wavs below differ in bytes too; what
+  sounded identical was the delivery (speed, style, transposition, pauses), which is what
+  variation now changes.
+- **`f0_contour_scale`** (`--f0-contour-scale`, GUI "Livelier intonation" = 1.15; default
+  1.0 = off) spreads voiced F0 around the median in semitone space before RVC. On `main`
+  it is `TypedPolish.contour_scale` (the converter's `scale_contour`, median per piece);
+  the branch's own `WidenedContour` (one median per utterance) was dropped when the two
+  met. Off until approved by ear; no wav uses it yet.
+- Prep cost (normalise + split into pieces + draw) per utterance, 500 runs of the cases
+  below on the 7900X: median 0.066 ms, p99 0.40 ms, max 12 ms (one outlier); the budget was
+  5 ms. Each clip's line in the GUI log now carries `prep N ms`.
+
+### Acceptance (2026-10-16, kokoro `af_heart`, model `Mom`, auto pitch, target 200 Hz)
+
+`scripts/natural_cases.py --model Mom` (`--dry-run` prints only the first table and the
+timing). Dry run of the acceptance texts:
+
+| raw | normalized | pieces (hints) |
+|---|---|---|
+| `idk wbu` | `I don't know, what about you?` | one piece, plain |
+| `im so tired rn ngl` | `I'm so tired right now, not gonna lie.` | one piece, plain |
+| `lol ok brb` | `Haha, okay, be right back.` | one piece, plain |
+| `omg that was SO good!!` | `Oh my god, that was SO good!!` | `Oh my god,` plain / `that was so good!` speed 1.05, gain +1.5 dB |
+| `hi` | `Hi.` | one piece, plain |
+| `ngl i thought the movie was gonna be mid but it was SO good lol, we got there at 7:30 and it cost like $15 each... wbu, u still going tmrw?` | `Not gonna lie, I thought the movie was gonna be mid but it was SO good, haha, we got there at seven thirty and it cost like fifteen dollars each... what about you, you still going tomorrow?` | `Not gonna lie,` plain / `I thought the movie was gonna be mid but it was so good!` speed 1.05, gain +1.5 dB / `haha, we got there at seven thirty and it cost like fifteen dollars each` pause 250 ms / `what about you, you still going tomorrow?` plain |
+
+Rendered wavs in `out/tts_natural/` (variation 0.35 unless "off"):
+
+| file | variation draw | TTS median F0 | auto pitch | offset | length |
+|---|---|---|---|---|---|
+| idk_wbu.wav | speed x0.998, pauses x0.95, 3.3% af_aoede | 198.9 Hz | +0 | +0.000 | 1.76 s |
+| tired_rn_ngl.wav | speed x1.005, pauses x0.98, 1.3% af_aoede | 195.8 Hz | +0 | +0.063 | 2.54 s |
+| lol_ok_brb.wav | speed x1.002, pauses x0.91, 1.5% af_river | 190.2 Hz | +1 | +0.134 | 1.98 s |
+| omg_so_good.wav | speed x1.013, pauses x0.98, 2.5% af_jessica | 206.4 Hz | -1 | -0.120 | 2.45 s |
+| hi_var_1.wav | speed x1.010, pauses x0.95, 2.8% af_nicole + 0.4% af_bella | 208.2 Hz | -1 | +0.032 | 0.80 s |
+| hi_var_2.wav | speed x1.001, pauses x1.07, 1.4% af_nova | 208.6 Hz | -1 | +0.044 | 0.80 s |
+| hi_var_3.wav | speed x0.986, pauses x0.97, 1.2% af_nicole | 206.4 Hz | -1 | -0.102 | 0.80 s |
+| hi_fixed_1.wav | off | 208.6 Hz | -1 | 0 | 0.80 s |
+| hi_fixed_2.wav | off | 209.0 Hz | -1 | 0 | 0.80 s |
+| long_casual.wav | speed x1.005, pauses x1.01, 0.6% af_sky + 0.5% af_kore | 196.3 Hz | +0 | -0.128 | 11.07 s |
+
+- **The auto pitch is per utterance and rounded, so it is not stable across clips.** "Hi."
+  measures 206-209 Hz, astride the 205.9 Hz line where `round(12 log2(200 / f))` flips
+  between 0 and -1: in a first run of the same script `hi_var_1` came out +0 and the other
+  four "hi" -1. Across sentences the median moves with the content (190-206 Hz above), so
+  an excited line is pulled down a semitone and a flat one pushed up. That spread (±1 st) is
+  larger than the variation offset (±0.14 st) and predates this work. The fix would be one
+  transposition per TTS voice and model (measured once on a reference sentence and kept),
+  not one per utterance. Not changed here: it alters the `variation 0` output.
+- Not verified by ear yet: the wavs are for listening; durations, medians and offsets are
+  what the tables measure. The expressive layer's two-repeat spelling still reaches espeak:
+  `soo` is read "sue" and `waay` "wahee" (checked with the phonemizer), so "sooo tired"
+  will say "sue tired" until that rule spells to the dictionary word.
+
+### Later (not built)
+
+Kokoro has no emotion control: variation and punctuation are the ceiling here. If more
+expressive delivery is wanted, evaluate an emotion-capable TTS backend behind the existing
+`TtsBackend` interface (one with an exaggeration / emotion parameter), keeping Kokoro as the
+fast default. Other options noted while building this: a stable per-voice transposition
+(above); dictionary respelling of elongated words; slang with elongation (`omggg`, `plzzz`
+are not matched today).

@@ -4,3 +4,5 @@
 kokoro-onnx==0.6.1
 onnxruntime==1.31.0
 edge-tts==7.3.1
+# vox.tts.normalize writes numbers out in words ($5, 3pm, 1st, 2026); pure Python, pulls docopt.
+num2words==0.5.14

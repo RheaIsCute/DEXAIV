@@ -7,6 +7,10 @@ transposition is used for the whole utterance so the voice does not jump between
 Informal text gets its render hints from ``vox.tts.expressive``: per-piece TTS speed, a
 per-boundary pause (dots and dashes) and a per-piece gain applied to the *converted* audio
 so it survives the RVC stage. A text without any mark takes exactly the old path.
+
+Callers normalise chat text first (``vox.tts.normalize``); a ``vox.tts.variation.Variation``
+drawn once per utterance scales speed and explicit pauses, blends the TTS style, offsets the
+transposition and seeds the converter. A neutral variation is the pre-variation path.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from vox.offline.convert import SR, FullFileConverter
 from vox.offline.simulate import load_engine
 from vox.tts.base import TtsBackend, TtsError
 from vox.tts.expressive import SENTENCE_GAP_S, ExpressivePiece, analyze, split_sentences
+from vox.tts.variation import Variation
 
 DEFAULT_TARGET_F0_HZ = 200.0
 TARGET_F0_KEY = "target_f0_median_hz"  # optional, in model_overrides.json or config.json
@@ -173,7 +178,7 @@ def target_f0_hint(profile: Profile | None, config: ModelConfig) -> float:
 class SayResult:
     audio: np.ndarray  # mono float32 at ``sr`` (the model's sample rate)
     sr: int
-    pitch: float
+    pitch: float  # the utterance's transposition, before the variation offset
     auto_pitch: bool
     tts_median_f0: float
     target_f0: float
@@ -181,6 +186,8 @@ class SayResult:
     tts_seconds: float
     path: Path | None = None
     hints: list[ExpressivePiece] = dataclasses.field(default_factory=list)
+    pitch_offset: float = 0.0  # variation, in semitones, on top of ``pitch``
+    variation: Variation | None = None
 
     @property
     def seconds(self) -> float:
@@ -192,22 +199,27 @@ class SayResult:
         return not all(p.plain for p in self.hints)
 
 
-def render_tts(backend: TtsBackend, pieces: list[ExpressivePiece]) -> list[np.ndarray]:
+def render_tts(backend: TtsBackend, pieces: list[ExpressivePiece],
+               variation: Variation | None = None) -> list[np.ndarray]:
     """Render each piece at its speed and load it as the mono 16 kHz the converter expects.
 
     Each piece but the last gets its boundary pause appended as silence (both backends trim
-    their own trailing silence).
+    their own trailing silence). ``variation`` scales every piece's speed and every explicit
+    pause the same way and blends the style of every piece alike (one draw per utterance).
     """
+    var = variation or Variation()
+    extra = {"blend": var.blend} if var.blend and backend.blends else {}
     rendered = []
     with tempfile.TemporaryDirectory(prefix="vox_tts_") as tmp:
         for n, piece in enumerate(pieces):
             wav = Path(tmp) / f"piece_{n:03d}.wav"
-            backend.synthesize(piece.text, wav, speed=piece.speed)
+            backend.synthesize(piece.text, wav, speed=piece.speed * var.speed, **extra)
             audio, _ = load_audio(wav, SR)
             if not len(audio):
                 raise TtsError(f"{backend.name} produced no audio for {piece.text[:40]!r}")
             if n < len(pieces) - 1:
-                gap = np.zeros(round(SR * piece.pause_after_s), np.float32)
+                pause = piece.pause_after_s * (var.pause_scale if piece.explicit else 1.0)
+                gap = np.zeros(round(SR * pause), np.float32)
                 audio = np.concatenate([audio, gap])
             rendered.append(audio)
     return rendered
@@ -230,24 +242,29 @@ def speak(text: str, backend: TtsBackend, models_dir: Path, model_name: str,
           params: RuntimeParams | None = None, pitch: float | None = None,
           target_f0: float = DEFAULT_TARGET_F0_HZ, precision: PrecisionParams | None = None,
           device: str | None = None, seed: int | None = 0, out: Path | None = None,
-          max_piece_s: float = MAX_PIECE_S, polish: TypedPolish | None = None) -> SayResult:
+          max_piece_s: float = MAX_PIECE_S, polish: TypedPolish | None = None,
+          variation: Variation | None = None) -> SayResult:
     """Speak ``text`` in the voice of ``model_name``.
 
     ``pitch=None`` measures the rendered TTS audio and transposes its median F0 onto
     ``target_f0``; ``params.f0_up_key`` is ignored either way (it is calibrated for the
     user's microphone voice, not for a TTS voice). ``polish`` defaults to ``DEFAULT_POLISH``
-    (``TypedPolish()`` is the plain path).
+    (``TypedPolish()`` is the plain path). ``variation`` (drawn by the caller) replaces
+    ``seed`` with its own RVC seed; without it the old path runs with ``seed``.
     """
     pieces = split_pieces(text, max_piece_s)
     if not pieces:
         raise TtsError("nothing to say: the text is empty")
-    rendered = render_tts(backend, pieces)
+    variation = variation or Variation(rvc_seed=seed)
+    rendered = render_tts(backend, pieces, variation)
 
     engine = load_engine(models_dir, model_name, None, params, precision, device, warmup_hops=0)
     result = convert_rendered(FullFileConverter.from_engine(engine), engine.device,
                               engine.loaded.model.tgt_sr, rendered, engine.params, pitch,
-                              target_f0, seed, pieces,
-                              DEFAULT_POLISH if polish is None else polish)
+                              target_f0, variation.rvc_seed, pieces,
+                              DEFAULT_POLISH if polish is None else polish,
+                              pitch_offset=variation.pitch_offset)
+    result.variation = variation
     if out is not None:
         save_audio(out, result.audio, result.sr)
         result.path = Path(out)
@@ -259,13 +276,14 @@ def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int
                      pitch: float | None = None, target_f0: float = DEFAULT_TARGET_F0_HZ,
                      seed: int | None = 0,
                      pieces: list[ExpressivePiece] | None = None,
-                     polish: TypedPolish | None = None) -> SayResult:
+                     polish: TypedPolish | None = None, pitch_offset: float = 0.0) -> SayResult:
     """Convert rendered 16 kHz TTS pieces with an already loaded converter.
 
     The half of ``speak`` that needs the models; the control API calls it with the live
     engine's converter so a typed clip uses the voice that is already loaded. ``pieces``
     are the render hints the audio was made from; their per-piece gain is applied here.
-    ``polish`` (default: none) applies the typed-speech prosody options.
+    ``polish`` (default: none) applies the typed-speech prosody options. ``pitch_offset``
+    (semitones, fractional) goes on top of the auto or manual pitch.
     """
     polish = polish or TypedPolish()
     measured = 0.0
@@ -276,7 +294,9 @@ def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int
         else:
             measured = median_voiced_f0(converter.extractor, rendered, device)
             pitch = auto_pitch(measured, target_f0)
-    params = dataclasses.replace(params, f0_up_key=float(pitch))
+    if converter.extractor is None:
+        pitch_offset = 0.0
+    params = dataclasses.replace(params, f0_up_key=float(pitch) + pitch_offset)
     if not polish.plain:
         params = dataclasses.replace(params, volume_envelope=polish.envelope)
 
@@ -293,7 +313,8 @@ def convert_rendered(converter: FullFileConverter, device: torch.device, sr: int
     if any(gains):
         joined = limit_peak(joined)
     return SayResult(joined, sr, float(pitch), auto, measured, target_f0, len(rendered),
-                     sum(len(a) for a in rendered) / SR, hints=list(pieces or []))
+                     sum(len(a) for a in rendered) / SR, hints=list(pieces or []),
+                     pitch_offset=pitch_offset)
 
 
 def play(audio: np.ndarray, sr: int, device: str | None = None) -> None:

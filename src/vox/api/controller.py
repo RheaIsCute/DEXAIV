@@ -180,6 +180,7 @@ class EngineController:
         self._tts = None
         self._tts_speaking_until = 0.0
         self._tts_last: dict[str, Any] | None = None
+        self._slang_error: str | None = None
         self._clips: dict[int, np.ndarray] = {}
         self._history: deque[dict[str, Any]] = deque(maxlen=CLIP_HISTORY)
         self._clip_id = 0
@@ -532,10 +533,44 @@ class EngineController:
         backend = self.store["tts"].get("backend") or "kokoro"
         cls = BACKENDS.get(backend, BACKENDS["kokoro"])
         reason = cls(cache_dir=self.models_dir / TTS_DIR).unavailable_reason()
+        table = self._slang_table()
+        slang = self._slang_path()
         return {"backend": cls.name, "voice": self.store["tts"].get("voice") or cls.default_voice,
                 "available": reason is None, "reason": reason, "backends": list(BACKENDS),
                 "speaking": self._speaking(), "last": self._tts_last,
-                "history": list(self._history)}
+                "history": list(self._history), **self._tts_settings(),
+                "slang": {"path": str(slang), "exists": slang.is_file(),
+                          "user_entries": table.user_entries, "error": self._slang_error}}
+
+    def _tts_settings(self) -> dict[str, Any]:
+        """Typed-speech delivery settings with their defaults filled in."""
+        from vox.tts.variation import DEFAULT_AMOUNT
+
+        tts = self.store["tts"]
+        return {"variation": float(tts.get("variation", DEFAULT_AMOUNT)),
+                "laughter": tts.get("laughter") or "haha",
+                "contour": float(tts.get("contour", 1.0)),
+                "normalize": bool(tts.get("normalize", True))}
+
+    def _slang_path(self) -> Path:
+        from vox.tts.normalize import USER_FILE
+
+        return self.profile_dir / USER_FILE
+
+    def _slang_table(self):
+        """The shipped slang list merged with the profile's (reloaded when that file
+        changes); a broken profile file is reported once and skipped."""
+        from vox.tts import normalize as norm
+
+        try:
+            table = norm.table_for(self._slang_path())
+            self._slang_error = None
+        except norm.SlangError as err:
+            if self._slang_error != str(err):
+                self._log(f"slang list skipped: {err}")
+            self._slang_error = str(err)
+            table = norm.table_for(None)
+        return table
 
     def _speaking(self) -> bool:
         session = self.session
@@ -1043,22 +1078,73 @@ class EngineController:
 
     # typed speech --------------------------------------------------------------------
 
-    def set_tts(self, voice: str | None = None, backend: str | None = None) -> dict[str, Any]:
+    def set_tts(self, voice: str | None = None, backend: str | None = None,
+                variation: float | None = None, laughter: str | None = None,
+                contour: float | None = None, normalize: bool | None = None) -> dict[str, Any]:
         from vox.tts.backends import BACKENDS
+        from vox.tts.normalize import LAUGHTER_MODES
+        from vox.tts.variation import CONTOUR_MAX
 
+        if variation is not None and not 0.0 <= float(variation) <= 1.0:
+            raise ApiError("variation must be between 0 and 1")
+        if laughter is not None and laughter not in LAUGHTER_MODES:
+            raise ApiError(f"laughter must be one of {', '.join(LAUGHTER_MODES)}")
+        if contour is not None and not 1.0 <= float(contour) <= CONTOUR_MAX:
+            raise ApiError(f"the intonation scale must be between 1 and {CONTOUR_MAX}")
         with self._lock:
+            tts = self.store["tts"]
             if backend is not None:
                 if backend not in BACKENDS:
                     raise ApiError(f"unknown TTS backend {backend!r}")
-                if backend != self.store["tts"].get("backend"):
-                    self.store["tts"] = {"backend": backend}
+                if backend != tts.get("backend"):
+                    tts.pop("voice", None)  # voice names belong to one backend
+                    tts["backend"] = backend
                     self._tts = None
             if voice is not None:
-                self.store["tts"]["voice"] = voice
+                tts["voice"] = voice
                 self._tts = None
+            for key, value in (("variation", variation), ("contour", contour)):
+                if value is not None:
+                    tts[key] = round(float(value), 3)
+            if laughter is not None:
+                tts["laughter"] = laughter
+            if normalize is not None:
+                tts["normalize"] = bool(normalize)
             self._save_store()
         self.publish_state()
         return dict(self.store["tts"])
+
+    def open_slang(self) -> dict[str, Any]:
+        """Open the profile's slang list in the default editor, creating it with two
+        examples the first time. Saved edits apply on the next clip (or press Reload)."""
+        from vox.tts.normalize import write_user_template
+
+        path = self._slang_path()
+        try:
+            created = write_user_template(path)
+            self._open_file(path)
+        except OSError as err:
+            raise ApiError(f"could not open {path}: {err}") from err
+        if created:
+            self.publish_state()
+        return {"path": str(path), "created": created}
+
+    def _open_file(self, path: Path) -> None:
+        import os
+
+        os.startfile(path)  # the user's own file, in their default editor
+
+    def reload_slang(self) -> dict[str, Any]:
+        from vox.tts import normalize as norm
+
+        norm.clear_cache()
+        table = self._slang_table()
+        self.publish_state()
+        if self._slang_error:
+            raise ApiError(f"Slang list not loaded: {self._slang_error}")
+        self.toast(f"Slang list reloaded: {len(table.words)} words, "
+                   f"{table.user_entries} of them yours")
+        return {"words": len(table.words), "user_entries": table.user_entries}
 
     def tts_voices(self) -> list[str]:
         from vox.tts.base import TtsError
@@ -1168,6 +1254,23 @@ class EngineController:
         except (ApiError, TtsError, OSError) as err:
             self._log(f"tts not preloaded: {err}")
 
+    def _prepare(self, text: str, backend, settings: dict[str, Any]):
+        """(text as it will be spoken, this utterance's variation draw)."""
+        from vox.tts import normalize as norm
+        from vox.tts import variation
+        from vox.tts.base import TtsError
+
+        spoken = text
+        if settings["normalize"]:
+            spoken = norm.normalize(text, self._slang_table(), settings["laughter"])
+        voices: list[str] = []
+        if settings["variation"] > 0 and backend.blends:
+            with contextlib.suppress(TtsError, OSError):
+                voices = backend.voices()
+        var = variation.draw(settings["variation"], None, backend.voice, voices,
+                             self.store["tts"].get("blend_voices"))
+        return spoken, var
+
     def _speak(self, text: str, model: str | None) -> None:
         from vox.offline.convert import FullFileConverter
         from vox.tts import speak as tts
@@ -1180,9 +1283,14 @@ class EngineController:
         ring = session.out_ring if session is not None else None
         under_start = ring.underruns if ring else 0
         started = time.perf_counter()
+        settings = self._tts_settings()
+        spoken, var = self._prepare(text, backend, settings)
+        prep_ms = 1000.0 * (time.perf_counter() - started)
         try:
-            pieces = tts.split_pieces(text)
-            rendered = tts.render_tts(backend, pieces)
+            pieces = tts.split_pieces(spoken)
+            if not pieces:
+                raise ApiError("nothing left to say once emoji and laughter were dropped")
+            rendered = tts.render_tts(backend, pieces, var)
         except TtsError as err:
             raise ApiError(str(err)) from err
         tts_s = time.perf_counter() - started
@@ -1201,8 +1309,10 @@ class EngineController:
             with self._beside_live(engine, session is not None):
                 result = tts.convert_rendered(
                     FullFileConverter.from_engine(engine), engine.device,
-                    engine.loaded.model.tgt_sr, rendered, params, None, target, seed=None,
-                    pieces=pieces, polish=tts.DEFAULT_POLISH)
+                    engine.loaded.model.tgt_sr, rendered, params, None, target,
+                    seed=var.rvc_seed, pieces=pieces, pitch_offset=var.pitch_offset,
+                    polish=dataclasses.replace(tts.DEFAULT_POLISH,
+                                               contour_scale=settings["contour"]))
             convert_s = time.perf_counter() - converting
             device_sr = self._shape().device_sr
             clip = resample_array(result.audio, result.sr, device_sr)
@@ -1212,11 +1322,13 @@ class EngineController:
                 clip[:fade] *= ramp
                 clip[-fade:] *= ramp[::-1]
             self._clip_id += 1
-            entry = {"id": self._clip_id, "text": text, "model": model, "voice": backend.voice,
-                     "backend": backend.name, "pitch": result.pitch,
+            entry = {"id": self._clip_id, "text": text, "spoken": spoken, "model": model,
+                     "voice": backend.voice, "backend": backend.name, "pitch": result.pitch,
+                     "pitch_offset": result.pitch_offset, "variation": var.as_dict(),
                      "seconds": len(clip) / device_sr, "at": time.time(),
                      "render_ms": 1000.0 * (time.perf_counter() - started),
-                     "tts_ms": 1000.0 * tts_s, "convert_ms": 1000.0 * convert_s}
+                     "prep_ms": prep_ms, "tts_ms": 1000.0 * tts_s,
+                     "convert_ms": 1000.0 * convert_s}
             if len(self._history) == self._history.maxlen:
                 self._clips.pop(self._history[-1]["id"], None)
             self._history.appendleft(entry)
@@ -1227,8 +1339,9 @@ class EngineController:
             if session is not None:
                 session.worker.hold = False
         if ring is not None:
-            self._log(f"speech: {entry['seconds']:.1f} s clip, tts {1000 * tts_s:.0f} ms, "
-                      f"convert {1000 * convert_s:.0f} ms (live held), underruns during tts "
+            self._log(f"speech: {entry['seconds']:.1f} s clip, prep {prep_ms:.1f} ms, tts "
+                      f"{1000 * tts_s:.0f} ms, convert {1000 * convert_s:.0f} ms (live held), "
+                      f"underruns during tts "
                       f"{under_tts - under_start}, during convert {ring.underruns - under_tts}")
 
     def _play(self, clip: np.ndarray) -> None:
@@ -1378,7 +1491,8 @@ COMMANDS = {
     "set_exclusive": "set_exclusive", "set_device": "set_device",
     "select_model": "select_model", "set_index": "set_index", "import_model": "import_model",
     "add_index": "add_index", "set_tts": "set_tts", "tts_voices": "tts_voices",
-    "speak": "speak", "preview": "preview", "replay": "replay",
+    "speak": "speak", "preview": "preview", "replay": "replay", "open_slang": "open_slang",
+    "reload_slang": "reload_slang",
     "cancel_speech": "cancel_speech", "export_report": "export_report",
     "calibrate": "calibrate", "refresh_devices": "refresh_devices",
 }

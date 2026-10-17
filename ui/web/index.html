@@ -328,6 +328,33 @@
         <div class="grow"></div>
         <div class="info">Changing hop, context or pitch tracker re-captures the engine: a short mute, no restart.</div>
       </section>
+
+      <section class="panel flex1 col" style="gap:14px">
+        <div class="label">Typed speech</div>
+        <label class="col" style="gap:6px">
+          <span class="row between sub">Variation <span class="num strong" id="variation-value">0.35</span></span>
+          <input type="range" id="variation" min="0" max="100" value="35">
+          <span class="hint">How differently the same words come out each time. 0 = identical.</span>
+        </label>
+        <label class="col" style="gap:6px">
+          <span class="sub">Laughter (lol, lmao, 😂)</span>
+          <select id="laughter">
+            <option value="haha">Say “haha”</option>
+            <option value="drop">Leave it out</option>
+          </select>
+        </label>
+        <label class="toggle" title="Spread the pitch contour 15% around the clip's median (experimental)"><span>Livelier intonation <span class="muted small">(try)</span></span><input type="checkbox" id="contour"></label>
+        <div class="col" style="gap:6px">
+          <span class="sub">Slang list</span>
+          <div class="row" style="gap:8px">
+            <button class="btn-outline small flex1" id="slang-edit">Edit slang list</button>
+            <button class="btn-outline small" id="slang-reload">Reload</button>
+          </div>
+          <span class="hint" id="slang-note"></span>
+        </div>
+        <div class="grow"></div>
+        <div class="info">Typed text is cleaned up before it is spoken: “idk wbu” is said as “I don't know, what about you?”. Hover a clip in History to see what was said.</div>
+      </section>
     </div>
   </main>
 </div>

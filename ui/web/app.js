@@ -267,6 +267,17 @@ function render() {
   $("graphs").checked = state.graphs;
   $("graphs").disabled = !state.graphs_available;
 
+  // typed speech column
+  setValue($("variation"), Math.round(tts.variation * 100));
+  if (document.activeElement !== $("variation")) $("variation-value").textContent = fixed(tts.variation, 2);
+  setValue($("laughter"), tts.laughter);
+  $("contour").checked = tts.contour > 1;
+  const slang = tts.slang;
+  $("slang-note").textContent = slang.error ? "Not loaded: " + slang.error
+    : slang.exists ? slang.user_entries + " word" + (slang.user_entries === 1 ? "" : "s") + " of your own, on top of the built-in list"
+    : "Only the built-in list. Edit to add your own words.";
+  $("slang-note").className = slang.error ? "hint warn-text" : "hint";
+
   // settings header
   const when = state.profile.calibrated ? "calibrated " + shortDate(state.profile.calibrated) : "not calibrated yet";
   $("profile-lead").innerHTML = "Profile <b>" + esc(state.profile.name) + "</b> — " + esc(when) + ". Most of this is set for you.";
@@ -493,7 +504,7 @@ function closePopovers() { $("history").hidden = true; $("voices").hidden = true
 function renderHistory() {
   const items = state.tts.history;
   $("history").innerHTML = items.map((h) =>
-    '<button class="pop-item" data-id="' + h.id + '" title="Play again"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'
+    '<button class="pop-item" data-id="' + h.id + '" title="' + esc(h.spoken && h.spoken !== h.text ? "Said as: " + h.spoken + " · click to play again" : "Play again") + '"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'
     + '<span class="pop-text">' + esc(h.text) + '</span><span class="pop-meta">' + fixed(h.seconds) + " s · " + signed(h.pitch) + "</span></button>").join("")
     || '<div class="pop-empty">Nothing spoken yet. Clips you type appear here to replay.</div>';
 }
@@ -566,6 +577,15 @@ function wire() {
   $("mic").addEventListener("change", (e) => cmd("set_device", { kind: "input", name: e.target.value }));
   $("out").addEventListener("change", (e) => cmd("set_device", { kind: "output", name: e.target.value }));
   $("calibrate").addEventListener("click", () => cmd("calibrate"));
+  const sendVariation = throttled((v) => cmd("set_tts", { variation: v }));
+  $("variation").addEventListener("input", (e) => { $("variation-value").textContent = (e.target.value / 100).toFixed(2); sendVariation(e.target.value / 100); });
+  $("laughter").addEventListener("change", (e) => cmd("set_tts", { laughter: e.target.value }));
+  $("contour").addEventListener("change", (e) => cmd("set_tts", { contour: e.target.checked ? 1.15 : 1.0 }));
+  $("slang-edit").addEventListener("click", async () => {
+    const r = await cmd("open_slang");
+    if (r && r.path) toast((r.created ? "Created " : "Opened ") + r.path + ". Save it, then press Reload.");
+  });
+  $("slang-reload").addEventListener("click", () => cmd("reload_slang"));
   $("export").addEventListener("click", () => cmd("export_report"));
 
   // type to speak

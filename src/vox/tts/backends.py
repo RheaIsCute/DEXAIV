@@ -55,6 +55,7 @@ class KokoroBackend(TtsBackend):
 
     name = "kokoro"
     default_voice = "af_heart"
+    blends = True  # kokoro-onnx 0.6.1 create() takes a style array in place of a voice name
 
     def __init__(self, voice: str | None = None, cache_dir: Path | None = None) -> None:
         super().__init__(voice, cache_dir)
@@ -82,6 +83,8 @@ class KokoroBackend(TtsBackend):
         import numpy as np
 
         self._require()
+        if self._kokoro is not None:
+            return sorted(self._kokoro.get_voices())
         with np.load(self._file("voices-v1.0.bin")) as styles:  # only the small file
             return sorted(styles.files)
 
@@ -119,14 +122,34 @@ class KokoroBackend(TtsBackend):
             return parts[0][0]
         return sum(weight * kokoro.get_voice_style(name) for name, weight in parts)
 
-    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
+    def style(self, blend: tuple[tuple[str, float], ...] = ()):
+        """The voice's style array (a ``--voice`` blend included) with ``blend`` mixed in
+        (weights of the other voices; the chosen voice keeps the rest). Unknown voices in
+        ``blend`` and the voice's own names are skipped."""
+        kokoro = self._model()
+        style = self._style(kokoro)
+        if isinstance(style, str):
+            style = kokoro.get_voice_style(style)
+        own = {name for name, _ in parse_voice_blend(self.voice)}
+        known = set(kokoro.get_voices())
+        mix = [(v, float(w)) for v, w in blend if v in known and v not in own and w > 0]
+        if not mix:
+            return style
+        out = style * (1.0 - sum(w for _, w in mix))
+        for other, weight in mix:
+            out = out + kokoro.get_voice_style(other) * weight
+        return out.astype(style.dtype)
+
+    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0,
+                   blend: tuple[tuple[str, float], ...] = ()) -> int:
         from vox.audio.resample import save_audio
 
         self._require()
         kokoro = self._model()
-        style = self._style(kokoro)
         lang = KOKORO_LANGS.get(self.voice[0], "en-us")
-        samples, sr = kokoro.create(text, voice=style, speed=float(speed), lang=lang)
+        # A plain render passes the voice (name or blend), as before variation existed.
+        voice = self.style(blend) if blend else self._style(kokoro)
+        samples, sr = kokoro.create(text, voice=voice, speed=float(speed), lang=lang)
         save_audio(out_wav_path, samples, sr)
         return sr
 
@@ -184,10 +207,11 @@ class EdgeBackend(TtsBackend):
         edge_tts = self._edge()
         return sorted(v["ShortName"] for v in self._run(edge_tts.list_voices()))
 
-    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
+    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0,
+                   blend: tuple[tuple[str, float], ...] = ()) -> int:
         from vox.audio.resample import load_audio, save_audio
 
-        edge_tts = self._edge()
+        edge_tts = self._edge()  # blend is ignored: Edge voices are fixed
         out_wav_path = Path(out_wav_path)
         mp3 = out_wav_path.with_suffix(".mp3")  # the service streams MP3
         # The rate is only sent when it differs from normal, so speed 1.0 is the old request.

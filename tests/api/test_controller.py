@@ -520,6 +520,60 @@ def test_speaking_state_follows_the_override(env):
     assert c.state()["tts"]["speaking"] is False
 
 
+def test_typed_speech_settings_persist_and_are_checked(env):
+    c = env.make()
+    tts = c.state()["tts"]
+    assert (tts["variation"], tts["laughter"], tts["contour"], tts["normalize"]) == \
+        (0.35, "haha", 1.0, True)
+    assert not tts["slang"]["exists"] and tts["slang"]["user_entries"] == 0
+    c.set_tts(voice="af_bella")
+    c.set_tts(variation=0.6, laughter="drop", contour=1.15)
+    c.set_tts(backend="edge")  # keeps the delivery settings, drops the kokoro voice name
+    for bad, match in (({"variation": 2}, "between 0 and 1"), ({"laughter": "loud"}, "laughter"),
+                       ({"contour": 3}, "intonation")):
+        with pytest.raises(ApiError, match=match):
+            c.command("set_tts", bad)
+    c.shutdown()
+    tts = env.make().state()["tts"]
+    assert (tts["variation"], tts["laughter"], tts["contour"]) == (0.6, "drop", 1.15)
+    assert (tts["backend"], tts["voice"]) == ("edge", "en-US-AriaNeural")
+
+
+def test_prepare_normalises_and_draws_once_per_clip(env):
+    c = env.make()
+    kokoro = SimpleNamespace(voice="af_heart", blends=True,
+                             voices=lambda: ["af_heart", "af_bella", "am_adam"])
+    spoken, var = c._prepare("idk wbu lol", kokoro, c._tts_settings())
+    assert spoken == "I don't know, what about you? Haha."
+    assert var.amount == 0.35 and {n for n, _ in var.blend} <= {"af_bella"}
+    c.set_tts(variation=0.0, laughter="drop")
+    spoken, var = c._prepare("idk wbu lol", kokoro, c._tts_settings())
+    assert spoken == "I don't know, what about you?"
+    assert var.neutral and var.rvc_seed is None  # the GUI's pre-variation behaviour
+    c.set_tts(normalize=False)
+    assert c._prepare("idk", kokoro, c._tts_settings())[0] == "idk"
+
+
+def test_slang_list_is_created_opened_and_reloaded(env, monkeypatch):
+    opened = []
+    monkeypatch.setattr(EngineController, "_open_file", lambda self, path: opened.append(path))
+    c = env.make()
+    plain = SimpleNamespace(voice="x", blends=False)
+    path = env.profile / "slang.json"
+    assert c.command("open_slang")["created"] is True
+    assert opened == [path] and c.state()["tts"]["slang"]["exists"]
+    assert c.open_slang()["created"] is False and path.is_file()
+    path.write_text(json.dumps({"words": {"wbu": "and you?"}}))
+    assert c.command("reload_slang")["user_entries"] == 1
+    assert c._prepare("idk wbu", plain, c._tts_settings())[0] == "I don't know, and you?"
+    path.write_text("{broken")
+    with pytest.raises(ApiError, match="not loaded"):
+        c.reload_slang()
+    assert "slang.json" in c.state()["tts"]["slang"]["error"]
+    # the shipped list still applies while the profile's file is broken
+    assert c._prepare("idk wbu", plain, c._tts_settings())[0] == "I don't know, what about you?"
+
+
 def test_clean_replaces_non_finite_numbers():
     assert ctl._clean({"a": float("nan"), "b": [1.0, float("inf")], "c": "x"}) == \
         {"a": None, "b": [1.0, None], "c": "x"}

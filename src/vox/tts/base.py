@@ -17,6 +17,7 @@ class TtsError(RuntimeError):
 class TtsBackend(ABC):
     name: str
     default_voice: str
+    blends = False  # can ``synthesize`` mix other voices' styles in (``blend=``)?
 
     def __init__(self, voice: str | None = None, cache_dir: Path | None = None) -> None:
         self.voice = voice or self.default_voice
@@ -41,10 +42,14 @@ class TtsBackend(ABC):
         """Names accepted as ``voice``."""
 
     @abstractmethod
-    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0) -> int:
+    def synthesize(self, text: str, out_wav_path: Path, speed: float = 1.0,
+                   blend: tuple[tuple[str, float], ...] = ()) -> int:
         """Render ``text`` in ``self.voice`` to a mono WAV. Returns its sample rate.
 
         ``speed`` is the render rate relative to the voice's normal pace (1.0); the
-        expressive layer passes values in roughly 0.78 .. 1.05. A backend must render
-        ``speed=1.0`` exactly as it did before the parameter existed.
+        expressive layer passes values in roughly 0.78 .. 1.05 and variation scales them by
+        a few percent. A backend must render ``speed=1.0`` exactly as it did before the
+        parameter existed. ``blend`` is ``(other voice, weight)`` pairs to mix into the
+        voice's style (``vox.tts.variation``); a backend with ``blends = False`` ignores it.
+        Callers pass it only when it is not empty.
         """

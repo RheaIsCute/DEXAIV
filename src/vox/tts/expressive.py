@@ -40,7 +40,8 @@ ACRONYMS = frozenset((
     "TTS", "GPU", "CPU", "OK", "LOL", "AI", "RVC", "USB", "VAC", "PC", "TV", "DJ", "ASAP",
     "FYI", "OMG", "WTF", "BRB", "IDK", "TBH", "IMO", "NSFW", "FPS", "RAM", "VRAM", "API",
     "URL", "HTTP", "ID", "US", "UK", "USA", "EU", "NYC", "VIP", "CEO", "DIY", "FAQ", "HD",
-    "UI", "GUI", "CLI", "OS", "IO", "IP"))
+    "UI", "GUI", "CLI", "OS", "IO", "IP",
+    "AM", "PM", "AFK"))  # what vox.tts.normalize writes for "3pm" / "afk": spelled, not stressed
 
 _SENTENCE_END = re.compile(  # after the terminator, or after one closing quote / bracket
     r"(?<=[.!?…。！？][\"'”’)\]])\s+|(?<=[.!?…。！？])\s+|\n+")
