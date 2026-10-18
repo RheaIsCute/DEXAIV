@@ -3,7 +3,6 @@ renders keep the pitch and move the resonances by the factor, the seams stay as 
 and the per-step synth-graph cache swaps steps without a capture and replays like eager."""
 
 import dataclasses
-import math
 
 import numpy as np
 import pytest
@@ -36,12 +35,22 @@ def engine(device, cache):
     eng.graphs.release()
 
 
-def f0_median(engine, audio: np.ndarray, sr: int) -> float:
+def f0_track(engine, audio: np.ndarray, sr: int) -> np.ndarray:
     y = resample_array(audio, sr, 16000)
     with torch.inference_mode():
         f0 = engine.pipeline.extractor.extract(torch.from_numpy(y).to(engine.device))
-    f0 = f0.cpu().numpy()
-    return float(np.median(f0[f0 > 0]))
+    return f0.cpu().numpy()
+
+
+def pitch_offset_cents(engine, test: np.ndarray, ref: np.ndarray, sr: int) -> float:
+    """Median per-frame cents of ``test`` against ``ref`` (same timeline) over frames voiced
+    in both; octave errors excluded. A whole-file median also moves when different frames
+    happen to be voiced, which is not a pitch change."""
+    a, b = f0_track(engine, ref, sr), f0_track(engine, test, sr)
+    n = min(len(a), len(b))
+    both = (a[:n] > 0) & (b[:n] > 0)
+    d = 1200 * np.log2(b[:n][both] / a[:n][both])
+    return float(np.median(d[np.abs(d) < 600]))
 
 
 def formants(audio: np.ndarray, sr: int) -> tuple[float, float]:
@@ -87,9 +96,8 @@ def streams(engine, clip_48k):
 @pytest.mark.parametrize("st", [-2.0, 2.0])
 def test_streamed_formant_keeps_the_pitch(engine, streams, clip_48k, st):
     n = len(clip_48k)
-    base = f0_median(engine, streams[0.0].aligned[:n], SR)
-    shifted = f0_median(engine, streams[st].aligned[:n], SR)
-    assert abs(1200 * math.log2(shifted / base)) <= 10.0
+    cents = pitch_offset_cents(engine, streams[st].aligned[:n], streams[0.0].aligned[:n], SR)
+    assert abs(cents) <= 10.0
 
 
 @pytest.mark.parametrize("st", [-2.0, 2.0])
@@ -119,9 +127,7 @@ def test_full_file_formant_keeps_pitch_and_moves_formants(engine, clip_48k):
         torch.manual_seed(0)
         renders[st] = conv.convert(audio, dataclasses.replace(engine.params, formant_st=st))
     assert len(renders[2.0]) == len(renders[0.0])
-    cents = 1200 * math.log2(f0_median(engine, renders[2.0], sr) /
-                             f0_median(engine, renders[0.0], sr))
-    assert abs(cents) <= 10.0
+    assert abs(pitch_offset_cents(engine, renders[2.0], renders[0.0], sr)) <= 10.0
     assert formants(renders[2.0], sr)[1] / formants(renders[0.0], sr)[1] == \
         pytest.approx(2 ** (2 / 12), rel=0.15)
 

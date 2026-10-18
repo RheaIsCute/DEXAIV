@@ -157,6 +157,9 @@ class HopPipeline:
         self.formant_inv_t = torch.ones((), device=dev)
         self._warps = {}  # built for the previous plan's frame count
         self.warp = None
+        # Hops since the stream started (open or gated): the formant warp's absolute-time
+        # phase (synthesis.formant). Host int, advanced with the 16 kHz ring.
+        self.hop_index = 0
         self.register = RegisterTracker(dev)  # auto pitch (set_params)
         self.register.fresh = p.shift_frames
         # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
@@ -225,6 +228,11 @@ class HopPipeline:
         self._phase_carry = carry
         return changed
 
+    def formant_is_built(self, st: float) -> bool:
+        """Whether switching to ``st`` is free on the pipeline side (no warp to build)."""
+        st = snap_formant(st)
+        return st == 0.0 or st in self._warps
+
     def set_formant(self, st: float) -> bool:
         """Select the formant step (snapped to 0.5 st, clamped to +-4). Returns True when
         the step changed: the synth stage then has a new shape, which ``StageGraphs``
@@ -240,7 +248,8 @@ class HopPipeline:
         if warp is None:
             if len(self._warps) >= FORMANT_WARPS_KEPT:
                 self._warps.pop(next(iter(self._warps)))
-            warp = FormantWarp(st, self.plan.decode_frames, self.model.upp, self.device)
+            warp = FormantWarp(st, self.plan.decode_frames, self.model.upp, self.device,
+                               shift_frames=self.plan.shift_frames)
             self._warps[st] = warp
         self.warp = warp
         self.formant_inv_t.fill_(1.0 / warp.factor)
@@ -262,6 +271,7 @@ class HopPipeline:
         self.audio_model.zero_()
         self.sine_phase.zero_()
         self.register.reset()
+        self.hop_index = 0
         # Fresh decoder noise: with ``noise_roll`` the window would otherwise start on the
         # previous stream's draws (and a seeded run would not be reproducible).
         self.noise_z.normal_()
@@ -425,9 +435,12 @@ class HopPipeline:
             impl["index"]()
         with timers.stage("synth"):
             self.fill_noise()
+            if self.warp is not None:
+                self.warp.select(self.hop_index)  # outside the graph, like the noise
             impl["synth"]()
         with timers.stage("post"):
             impl["post"]()
+        self.hop_index += 1
         return self.out
 
     @torch.inference_mode()
@@ -442,6 +455,7 @@ class HopPipeline:
         with self.timers.stage("resample_in"):
             self.stage_impl["resample_in"]()
             self.pitch_cache.advance_silent()
+        self.hop_index += 1
 
     def forget_speech(self) -> None:
         """Gate closed: drop the rendered output of the audio that just ended.

@@ -254,3 +254,60 @@ def test_auto_pitch_readout_never_syncs_during_a_live_rebuild(engine, clip_48k):
                                                        pitch_mode="fixed"))
         engine.graphs.capture()
 
+
+
+def test_formant_steps_switch_live_without_underruns_once_cached(engine, clip_48k):
+    """Formant (docs/DEVIATIONS.md §12): steps already in the synth-graph cache switch
+    between hops with no capture and no underrun; a first visit captures once and the voice
+    resumes."""
+    if not engine.graphs.active:
+        pytest.skip("graphs are not active")
+    base = engine.params
+    pipe, graphs = engine.pipeline, engine.graphs
+    for st in (1.0, -1.0, 0.0):  # pre-visit two steps, end on 0
+        pipe.set_params(dataclasses.replace(base, formant_st=st))
+        graphs.sync_formant()
+    captures = graphs.formant_captures
+    audio = np.tile(clip_48k[: 4 * SR], 2)
+    plan = engine.plan
+    in_ring = SPSCRing(2 * SR, guard=4 * CALLBACK)
+    out_ring = SPSCRing(SR, guard=2 * plan.block)
+    hop_event = threading.Event()
+    torch.manual_seed(0)
+    pipe.reset()
+    engine.sola.reset()
+    engine.gate.set_config(dataclasses.replace(engine.gate.config, enabled=False))
+    engine.gate.reset()
+    engine.conditioner.reset()
+    logs = []
+    worker = InferenceWorker(pipe, engine.sola, engine.gate, graphs, engine.timers, in_ring,
+                             out_ring, hop_event, int(SR * 0.05), log=logs.append,
+                             conditioner=engine.conditioner)
+    seconds = len(audio) / SR + 0.5
+    feeder = FileInput(audio, SR, CALLBACK, in_ring, plan.block, hop_event)
+    reader = OutputReader(out_ring, seconds)
+    worker.start()
+    worker.ready.wait(5.0)
+    feeder.start()
+    worker.first_hop.wait(5.0)
+    reader.start()
+    try:
+        for st in (1.0, -1.0, 0.0, 1.0, 0.0, -1.0):  # cached steps only
+            time.sleep(0.5)
+            worker.apply_params(dataclasses.replace(base, formant_st=st))
+        time.sleep(0.5)
+        cached_underruns = out_ring.underruns
+        worker.apply_params(dataclasses.replace(base, formant_st=2.5))  # a first visit
+        time.sleep(2.0)
+    finally:
+        reader.join()
+        feeder.stop()
+        worker.stop()
+    assert worker.stats.errors == []
+    assert cached_underruns == 0
+    assert graphs.formant_captures == captures + 1
+    assert any("formant +2.5 st: synth graph captured" in line for line in logs)
+    live = np.concatenate(reader.chunks)
+    assert np.abs(live[-SR:]).max() > 0.01  # the voice came back after the capture
+    pipe.set_params(base)
+    graphs.sync_formant()

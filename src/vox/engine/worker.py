@@ -40,6 +40,7 @@ from vox.engine.pipeline import HopPipeline
 from vox.engine.sola import Sola
 from vox.pitch.base import PitchExtractor
 from vox.profiling.timers import StageTimers
+from vox.synthesis.formant import snap_formant
 
 HOLD_CUSHION_S = 0.5  # silence queued while a hold shares the GPU with a clip render
 
@@ -226,9 +227,21 @@ class InferenceWorker(threading.Thread):
         if params is not None:
             self._pending_params = None
             self.params = params
+            # A first visit to a formant step builds its warp (tens of ms) and captures its
+            # synth graph (~250 ms): fade the voice out first so neither is heard as a stall.
+            st = snap_formant(params.formant_st)
+            heavy = st != self.pipeline.formant_st and (
+                not self.pipeline.formant_is_built(st) or self.graphs.would_capture(st))
+            start = time.perf_counter()
+            if heavy:
+                self._fade_out()
             if self.pipeline.set_params(params):
                 self._recapture("f0_unvoiced changed")
-            self._sync_formant()
+            outcome = self.graphs.sync_formant()
+            if heavy:
+                self._resume()
+                self.log(f"worker: formant {st:+g} st: synth graph {outcome} in "
+                         f"{(time.perf_counter() - start) * 1000:.0f} ms")
         gate = self._pending_gate
         if gate is not None:
             self._pending_gate = None
@@ -373,20 +386,6 @@ class InferenceWorker(threading.Thread):
         self.pipeline.on_onset()  # carried sine phase restarts with the new graphs
         self.log(f"worker: recaptured graphs ({why}) in "
                  f"{(time.perf_counter() - start) * 1000:.0f} ms")
-
-    def _sync_formant(self) -> None:
-        """A new formant step: swap to its cached synth graph between hops (silent), or
-        on a first visit capture it with the voice faded out around the capture, the way a
-        hop change does (docs/DEVIATIONS.md §12)."""
-        if not self.graphs.formant_needs_capture():
-            self.graphs.sync_formant()
-            return
-        start = time.perf_counter()
-        self._fade_out()
-        outcome = self.graphs.sync_formant()
-        self._resume()
-        self.log(f"worker: formant {self.pipeline.formant_st:+g} st: synth graph {outcome} "
-                 f"in {(time.perf_counter() - start) * 1000:.0f} ms")
 
     def _fade_out(self) -> None:
         """Close the voice cleanly: fade the SOLA tail into the output ring, reset the gate

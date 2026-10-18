@@ -30,6 +30,10 @@ the stream simulator; there is no separate batch path.
                                       fixed script rendered through each model (Q13)
     vox bench take --matrix           raw-mic take protocol: input x gate x AGC x hop, the
                                       user reads the script, files labelled, metrics + pairs
+    vox bench formant                 formant steps on a raw-mic take and a typed line:
+                                      pitch kept, F1/F2 moved, seams, synth cost -> out/ab/formant
+    vox bench index                   index_rate 0/0.3/0.6/1.0 on a raw-mic take (same seed,
+                                      seed floor): does the index change anything? -> out/ab/index
 
 Results are appended to benchmarks/results/<name>.jsonl with the environment fingerprint.
 """
@@ -38,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 import sys
 import time
 from pathlib import Path
@@ -50,6 +55,7 @@ RESULTS = ROOT / "benchmarks" / "results"
 if str(ROOT / "benchmarks") not in sys.path:  # quality.py, target_f0.py, matrix.py
     sys.path.insert(0, str(ROOT / "benchmarks"))
 SCRIPT = ROOT / "benchmarks" / "corpus" / "speech_script.txt"
+DEFAULT_AUDIO = ROOT / "benchmarks" / "corpus" / "libri_1272.wav"
 SKIP = 50  # warmup hops discarded before statistics (docs/research/10 §3.2)
 
 
@@ -1384,6 +1390,195 @@ def cmd_take(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ formant / index
+
+
+def _take_audio(args):
+    """``--audio`` if given, else the raw-Shure matrix take (gate off, auto level off)."""
+    import formant_index as fi
+    from vox.audio.resample import load_audio
+
+    path = args.audio if args.audio != DEFAULT_AUDIO else fi.DEFAULT_TAKE
+    audio, _ = load_audio(path, 48000)
+    start = int(args.start * 48000)
+    return path, audio[start:start + int(args.seconds * 48000)]
+
+
+def cmd_formant(args) -> int:
+    import formant_index as fi
+    from vox.audio.resample import resample_array, save_audio
+    from vox.models.registry import ModelRegistry
+    from vox.offline.convert import FullFileConverter
+    from vox.offline.metrics import boundary_click_ratio
+    from vox.offline.simulate import StreamSimulator
+    from vox.profiling.report import stage_table
+    from vox.synthesis.formant import effective_factor
+    from vox.tts.backends import KokoroBackend
+    from vox.tts.cli import TTS_DIR
+    from vox.tts.speak import DEFAULT_POLISH, convert_rendered, render_tts, split_pieces
+
+    path, audio = _take_audio(args)
+    registry, cache = ModelRegistry(args.models_dir), {}
+    engine = _engine(args, registry, cache)
+    pipe, graphs, sr = engine.pipeline, engine.graphs, engine.plan.device_sr
+    out = ROOT / "out" / "ab" / "formant"
+    steps = [float(x) for x in args.formants.split(",")]
+    sim = StreamSimulator(engine)
+    rows = {}
+    print(f"input: {path} ({len(audio) / sr:.1f} s), model {args.model} pitch {args.pitch:+g}, "
+          f"mode {engine.mode}")
+    for st in steps:
+        pipe.set_params(dataclasses.replace(engine.params, formant_st=st))
+        t = time.perf_counter()
+        outcome = graphs.sync_formant()
+        capture_ms = (time.perf_counter() - t) * 1000
+        result = sim.run(audio, seed=0)
+        stream = result.aligned[:len(audio)]
+        table = stage_table(engine.timers, SKIP)
+        f0 = _f0_100hz(engine, stream)
+        f1, f2 = fi.lpc_formants(stream, sr)
+        rows[st] = {"factor": effective_factor(st, engine.pipeline.model.upp),
+                    "f0_median": float(np.median(f0[f0 > 0])), "f1": f1, "f2": f2,
+                    "click": boundary_click_ratio(result.audio, engine.plan.block),
+                    "synth_gpu_p50": table["synth"].get("gpu", {}).get("p50", float("nan")),
+                    "hop_p50": table["total"]["host"]["p50"],
+                    "hop_p99": table["total"]["host"]["p99"],
+                    "graph": outcome, "capture_ms": capture_ms}
+        if abs(st) <= 2.0:
+            save_audio(out / f"live_{st:+.1f}.wav", stream, sr)
+        print(f"[live {st:+.1f} st] F0 {rows[st]['f0_median']:.1f} Hz F1 {f1:.0f} F2 {f2:.0f} "
+              f"click {rows[st]['click']:.2f} synth GPU p50 {rows[st]['synth_gpu_p50']:.2f} ms "
+              f"hop p50/p99 {rows[st]['hop_p50']:.1f}/{rows[st]['hop_p99']:.1f} ms "
+              f"({outcome}, {capture_ms:.0f} ms)", flush=True)
+    pipe.set_params(engine.params)
+    graphs.sync_formant()
+
+    text = args.tts_text or ("This is a test of the voice changer, so I will speak the way I "
+                             "usually do. She sells seashells by the seashore.")
+    backend = KokoroBackend("af_heart", args.models_dir / TTS_DIR)
+    backend.load()
+    pieces = split_pieces(text)
+    rendered = render_tts(backend, pieces)
+    converter = FullFileConverter.from_engine(engine)
+    msr = engine.loaded.model.tgt_sr
+    from vox.tts.speak import target_f0_hint
+
+    target = target_f0_hint(None, engine.loaded.config)
+    typed = {}
+    for st in [x for x in steps if abs(x) <= 2.0]:
+        said = convert_rendered(converter, engine.device, msr, rendered,
+                                dataclasses.replace(engine.params, formant_st=st), None,
+                                target, seed=0, pieces=pieces, polish=DEFAULT_POLISH)
+        save_audio(out / f"typed_{st:+.1f}.wav", said.audio, msr)
+        y = resample_array(said.audio, msr, sr)
+        f0 = _f0_100hz(engine, y)
+        f1, f2 = fi.lpc_formants(y, sr)
+        typed[st] = {"f0_median": float(np.median(f0[f0 > 0])), "f1": f1, "f2": f2}
+        print(f"[typed {st:+.1f} st] F0 {typed[st]['f0_median']:.1f} Hz F1 {f1:.0f} F2 {f2:.0f}",
+              flush=True)
+
+    base, tbase = rows.get(0.0), typed.get(0.0)
+    print("\n| step | factor | live F0 cents | live F1 x | live F2 x | click | synth GPU p50 ms "
+          f"| hop p99 ms | typed F0 cents | typed F2 x |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for st in steps:
+        r = rows[st]
+        t = typed.get(st)
+        cents = 1200 * math.log2(r["f0_median"] / base["f0_median"]) if base else float("nan")
+        tc = (1200 * math.log2(t["f0_median"] / tbase["f0_median"]) if t and tbase
+              else float("nan"))
+        t2 = t["f2"] / tbase["f2"] if t and tbase else float("nan")
+        print(f"| {st:+.1f} | {r['factor']:.3f} | {cents:+.1f} | {r['f1'] / base['f1']:.3f} | "
+              f"{r['f2'] / base['f2']:.3f} | {r['click']:.2f} | {r['synth_gpu_p50']:.2f} | "
+              f"{r['hop_p99']:.1f} | {tc:+.1f} | {t2:.3f} |")
+    _record("formant", {"model": args.model, "audio": str(path), "pitch": args.pitch,
+                        "live": {f"{k:g}": v for k, v in rows.items()},
+                        "typed": {f"{k:g}": v for k, v in typed.items()}})
+    print(f"\nwavs: {out}\\live_<step>.wav, typed_<step>.wav")
+    engine.graphs.release()
+    return 0
+
+
+def cmd_index(args) -> int:
+    import formant_index as fi
+    from vox.audio.resample import save_audio
+    from vox.models.registry import ModelRegistry
+    from vox.offline.metrics import active_frames, compare
+
+    path, audio = _take_audio(args)
+    registry, cache = ModelRegistry(args.models_dir), {}
+    engine = _engine(args, registry, cache, index_rate=fi.INDEX_PRIME)
+    pipe, sr = engine.pipeline, engine.plan.device_sr
+    if pipe.index is None:
+        print(f"{args.model}: no index loaded (the model has none): nothing to measure")
+        return 1
+    idx = pipe.index
+    print(f"input: {path} ({len(audio) / sr:.1f} s); model {args.model} pitch {args.pitch:+g}; "
+          f"index {engine.loaded.index_path.name}: {idx.ntotal} x {idx.dim}, protect "
+          f"{engine.params.protect}; mode {engine.mode}")
+    out = ROOT / "out" / "ab" / "index"
+    renders, probe = {}, {}
+    for rate in fi.INDEX_RATES:
+        pipe.set_params(dataclasses.replace(engine.params, index_rate=rate))
+        renders[rate], probe[rate] = fi.stream_with_feature_probe(engine, audio, seed=0)
+        save_audio(out / f"index_{rate:g}.wav", renders[rate], sr)
+        print(f"[index {rate:g}] feature cosine distance {probe[rate]:.4f}", flush=True)
+    pipe.set_params(dataclasses.replace(engine.params, index_rate=0.0))
+    floor_render, _ = fi.stream_with_feature_probe(engine, audio, seed=1)
+    save_audio(out / "index_0_seed1.wav", floor_render, sr)
+    settle = _settle_s(engine.plan)
+    floor = compare(renders[0.0], floor_render, sr, start_s=settle)["l1_speech"]
+
+    kit = _quality_kit(args, engine)
+    script = _script_text(args)
+    targets = _targets(args, kit, registry, cache) if "speaker" in kit.enable else None
+    mic_wer = float("nan")
+    if script is not None and "wer" in kit.enable:
+        import quality as q
+
+        mic_wer = q.wer(script, kit.transcript_of(audio, sr))
+    rows = {}
+    for rate, render in [*renders.items(), ("0 seed 1", floor_render)]:
+        change = (compare(renders[0.0], render, sr, start_s=settle)["l1_speech"]
+                  if rate != 0.0 else 0.0)
+        s = kit.score(render, sr, reference_text=script, mic_wer=mic_wer, targets=targets,
+                      mask=active_frames(render, sr))
+        rows[rate] = {"feature_dist": probe.get(rate, float("nan")), "l1_vs_0": change,
+                      "wer": s.wer, "spk": s.speaker_cos, "utmos": s.utmos,
+                      "sibilant_hz": fi.sibilant_centroid(render, sr),
+                      "dbfs": fi.active_dbfs(render, sr), "target": s.target_source}
+        print(f"[{rate}] L1 vs 0 {change:.3f} WER {s.wer:.1%} spk {s.speaker_cos:.3f} "
+              f"sibilant {rows[rate]['sibilant_hz']:.0f} Hz level {rows[rate]['dbfs']:.1f} dBFS",
+              flush=True)
+    change06 = rows[0.6]["l1_vs_0"]
+    result = fi.verdict(change06, floor)
+    print(f"\nseed floor (index 0, seed 1 vs seed 0): log-mel L1 {floor:.3f}; index 0.6 vs 0: "
+          f"{change06:.3f} -> {result}")
+    print("\n| index_rate | feature cos dist | log-mel L1 vs 0 | WER | speaker cos | sibilant Hz "
+          "| active dBFS |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
+    for rate, r in rows.items():
+        print(f"| {rate} | {r['feature_dist']:.4f} | {r['l1_vs_0']:.3f} | {r['wer']:.1%} | "
+              f"{r['spk']:.3f} | {r['sibilant_hz']:.0f} | {r['dbfs']:.1f} |")
+    print(f"\nmicrophone WER {mic_wer:.1%}; speaker cosine against {rows[0.0]['target']}")
+    abx = None
+    if result != "inert":
+        start, length = int(5 * sr), int(12 * sr)
+        clip_dir = out / "abx_clips"
+        a, b = clip_dir / "index_0.wav", clip_dir / "index_0.6.wav"
+        save_audio(a, renders[0.0][start:start + length], sr)
+        save_audio(b, renders[0.6][start:start + length], sr)
+        abx = fi.write_abx(a, b, out / "abx", title=f"index 0 vs 0.6, {args.model}")
+        print(f"ABX (16 trials, 12 s excerpt): {out / 'abx'} (abx.md; answer_key.json after)")
+    _record("index", {"model": args.model, "audio": str(path), "pitch": args.pitch,
+                      "index": {"file": engine.loaded.index_path.name, "vectors": idx.ntotal,
+                                "dim": idx.dim}, "protect": engine.params.protect,
+                      "seed_floor": floor, "rows": {str(k): v for k, v in rows.items()},
+                      "verdict": result, "abx": abx is not None})
+    engine.graphs.release()
+    return 0
+
+
 # --------------------------------------------------------------------------------- perf
 
 
@@ -1687,11 +1882,11 @@ def main() -> int:
     parser.add_argument("command", choices=("accept", "ab", "typed", "perf", "extra", "sola",
                                             "block", "decctx", "envelope", "gate",
                                             "graph-probe", "sing", "onset", "suppress",
-                                            "underrun", "quality", "target-f0", "take"))
+                                            "underrun", "quality", "target-f0", "take",
+                                            "formant", "index"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
-    parser.add_argument("--audio", type=Path,
-                        default=ROOT / "benchmarks" / "corpus" / "libri_1272.wav")
+    parser.add_argument("--audio", type=Path, default=DEFAULT_AUDIO)
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--start", type=float, default=0.0,
                         help="seconds into --audio where the excerpt starts")
@@ -1765,6 +1960,8 @@ def main() -> int:
                         help="target-f0: transposition sweep in semitones")
     parser.add_argument("--utmos", action="store_true", help="target-f0: UTMOS per shift")
     parser.add_argument("--dry-run", action="store_true", help="target-f0: write nothing")
+    parser.add_argument("--formants", default="-2,-1,0,1,2,4",
+                        help="formant: steps in semitones (wavs for |step| <= 2)")
     parser.add_argument("--matrix", action="store_true", help="take: record every cell")
     parser.add_argument("--plan", action="store_true", help="take: print the cells and exit")
     parser.add_argument("--analyze", type=Path, default=None,
@@ -1792,6 +1989,13 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=None,
                         help="take: where the matrix folder goes (default recordings/matrix_*)")
     args = parser.parse_args()
+    if args.command in ("formant", "index"):
+        if args.model == "base_f0_48k_v2":
+            args.model = "Mom"
+            if args.pitch == 0.0:
+                args.pitch = 12.0  # the user's setting for Mom
+        if args.seconds == 20.0:
+            args.seconds = 45.0
     if args.command == "take" and args.monitor:
         args.output = args.monitor
     if args.command == "take" and args.hops == "60,20":
@@ -1808,7 +2012,7 @@ def main() -> int:
                "gate": cmd_gate, "graph-probe": cmd_graph_probe, "sing": cmd_sing,
                "onset": cmd_onset, "suppress": cmd_suppress,
                "underrun": cmd_underrun, "quality": cmd_quality, "target-f0": cmd_target_f0,
-               "take": cmd_take}[args.command]
+               "take": cmd_take, "formant": cmd_formant, "index": cmd_index}[args.command]
     return handler(args)
 
 

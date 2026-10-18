@@ -15,12 +15,22 @@ Where this departs from rtrvc (docs/DEVIATIONS.md §12):
   our 20 ms hop (5 frames). Here one rational ratio ``f_e = upp_res / upp`` (``upp_res`` the
   nearest integer to ``f * upp``) drives both the stretch and the resample, so the pitch
   and the length come back exact; ``f_e`` is within 1/(2 upp) of ``f`` (< 0.03 st).
-* The stretch is linear interpolation with precomputed indices and weights (static shapes,
-  graph-safe), at the same sample positions ``F.interpolate(align_corners=False)`` uses.
+* **The stretch is anchored to absolute time, not to the hop's window.** The window moves
+  ``shift`` frames per hop, i.e. ``shift * f_e`` frames of the stretched latent: not a whole
+  number, so a window-anchored stretch puts the decoder's frame grid somewhere else every
+  hop. Consecutive renders of the same audio then stop agreeing and SOLA's alignment drifts
+  one way (measured: +28 cents at -2 st on a steady tone at hop 20, docs/DEVIATIONS.md §12).
+  Here the decoded stretched span always starts on an absolute frame boundary: one extra
+  frame is decoded and the hop's window starts ``r_n = (n * shift * upp_res) mod upp``
+  stretched samples into it. ``r_n`` cycles with period ``upp / gcd(shift * upp_res, upp)``
+  hops; the interpolation plans and the crop for every phase are precomputed, and the hop's
+  are copied into static buffers before the synth stage (outside any graph, like the noise).
+* The stretch is linear interpolation with precomputed indices and weights (graph-safe).
+  Positions outside the decoded window read zero, as the convolutions' padding does at an
+  unstretched edge; holding the last frame instead skewed every hop's right edge, which is
+  what the next hop's SOLA aligns to (-6.6 samples of hop-to-hop lag at -2 st, +28 cents
+  of drift; zero-padded: -0.35 samples, within 9 cents of formant 0).
 * The decoder context frames (``dec_context``) are stretched and dropped with the tail.
-
-``FormantWarp`` is built once per (frames, step) on the control path; the hot path only
-gathers, lerps and convolves.
 """
 
 from __future__ import annotations
@@ -51,26 +61,50 @@ def effective_factor(st: float, upp: int) -> float:
     return resample_units(st, upp) / upp
 
 
-def stretched_frames(frames: int, st: float, upp: int) -> int:
-    """Frames the decoder renders for ``frames`` output frames (>= frames * f_e)."""
-    return math.ceil(frames * resample_units(st, upp) / upp)
+def stretched_frames(frames: int, st: float, upp: int, streaming: bool = False) -> int:
+    """Frames the decoder renders for ``frames`` output frames: enough to hold the
+    ``frames * upp_res`` stretched samples, plus up to one frame of phase offset when
+    streaming (the absolute-time anchor)."""
+    upp_res = resample_units(st, upp)
+    return math.ceil((frames * upp_res + (upp - 1 if streaming else 0)) / upp)
 
 
-def _lerp_plan(n_in: int, n_out: int, factor: float, device) -> tuple[Tensor, Tensor, Tensor]:
-    """Indices and weights stretching ``n_in`` points by ``factor`` onto ``n_out`` points:
-    output ``m`` reads input position ``(m + 0.5) / factor - 0.5``, clamped to the input."""
-    pos = (torch.arange(n_out, dtype=torch.float64) + 0.5) / factor - 0.5
-    pos = pos.clamp(0.0, n_in - 1)
-    lo = pos.floor().long().clamp(max=max(n_in - 2, 0))
+def phase_period(shift_frames: int, st: float, upp: int) -> int:
+    """Hops after which the stretched grid's offset ``r_n`` repeats."""
+    return upp // math.gcd(shift_frames * resample_units(st, upp), upp)
+
+
+def _plan(n_in: int, n_out: int, factor: float, offset: float) -> tuple[Tensor, Tensor, Tensor]:
+    """Indices and weights: output ``m`` reads input position
+    ``(m - offset + 0.5) / factor - 0.5`` (``F.interpolate(align_corners=False)`` at an
+    exact factor when ``offset == 0``), clamped to the input."""
+    pos = (torch.arange(n_out, dtype=torch.float64) - offset + 0.5) / factor - 0.5
+    return _lerp(pos, n_in)
+
+
+def _lerp(pos: Tensor, n_in: int) -> tuple[Tensor, Tensor, Tensor]:
+    """``(lo, hi, w)`` reading ``pos`` (float64) from ``n_in`` points; positions more than
+    half a step outside the input read zero (both weights 0), like the convolutions' zero
+    padding at an unstretched edge. Holding the edge value there instead biased the right
+    edge of every hop and with it SOLA's alignment (docs/DEVIATIONS.md §12)."""
+    inside = (pos >= -0.5) & (pos <= n_in - 0.5)
+    clamped = pos.clamp(0.0, n_in - 1)
+    lo = clamped.floor().long().clamp(max=max(n_in - 2, 0))
     hi = (lo + 1).clamp(max=n_in - 1)
-    w = (pos - lo).float()
-    return lo.to(device), hi.to(device), w.to(device)
+    # second row: 1 inside, 0 outside (a gain on the interpolated value)
+    return lo, hi, torch.stack(((clamped - lo).float(), inside.float()))
 
 
 class FormantWarp:
-    """The stretch and the resample for ``frames`` decoded frames at one step."""
+    """The stretch and the resample for ``frames`` decoded frames at one step.
 
-    def __init__(self, st: float, frames: int, upp: int, device: torch.device | str) -> None:
+    ``shift_frames`` > 0 (the streaming engine): the stretched grid is anchored to absolute
+    time; call ``select(hop)`` before each hop's decode (outside a graph). 0 (a whole file,
+    typed speech): one fixed plan anchored at the start.
+    """
+
+    def __init__(self, st: float, frames: int, upp: int, device: torch.device | str,
+                 shift_frames: int = 0) -> None:
         import torchaudio
 
         self.st = float(st)
@@ -78,28 +112,60 @@ class FormantWarp:
         self.upp = upp
         self.upp_res = resample_units(st, upp)
         self.factor = self.upp_res / upp
-        self.frames2 = stretched_frames(frames, st, upp)
-        self._f = _lerp_plan(frames, self.frames2, self.factor, device)
-        self._s = _lerp_plan(frames * upp, self.frames2 * upp, self.factor, device)
+        self.shift_frames = shift_frames
+        streaming = shift_frames > 0
+        self.frames2 = stretched_frames(frames, st, upp, streaming)
         self.keep = frames * self.upp_res  # stretched samples covering the D frames
+        self.period = phase_period(shift_frames, st, upp) if streaming else 1
+        n_src, n_out = frames * upp, self.frames2 * upp
+        frame_lo, frame_hi, frame_w, src_lo, src_hi, src_w, crop = ([] for _ in range(7))
+        for k in range(self.period):
+            r = (k * shift_frames * self.upp_res) % upp
+            lo, hi, w = _plan(n_src, n_out, self.factor, r)
+            src_lo.append(lo)
+            src_hi.append(hi)
+            src_w.append(w)
+            # latent frame j: the source position of its centre sample, in frames
+            centre = torch.arange(self.frames2, dtype=torch.float64) * upp + (upp - 1) / 2
+            pos = ((centre - r + 0.5) / self.factor - 0.5 - (upp - 1) / 2) / upp
+            flo, fhi, fw = _lerp(pos, frames)
+            frame_lo.append(flo)
+            frame_hi.append(fhi)
+            frame_w.append(fw)
+            crop.append(torch.arange(self.keep) + r)
+        dev = torch.device(device)
+        self._table = [torch.stack(t).to(dev) for t in
+                       (frame_lo, frame_hi, frame_w, src_lo, src_hi, src_w, crop)]
+        # the static buffers the decoder reads (and a captured graph records)
+        self._live = [t[0].clone() for t in self._table]
         self.resampler = torchaudio.transforms.Resample(
-            self.upp_res, upp, dtype=torch.float32).to(device)
+            self.upp_res, upp, dtype=torch.float32).to(dev)
+
+    def phase(self, hop: int) -> int:
+        """Index of hop ``hop``'s plan (``r_n``'s position in the cycle)."""
+        return hop % self.period
+
+    def select(self, hop: int) -> None:
+        """Before hop ``hop``'s decode, outside any graph: load its plan into the static
+        buffers (seven small device copies, no sync)."""
+        k = self.phase(hop)
+        for live, table in zip(self._live, self._table):
+            live.copy_(table[k])
 
     @staticmethod
-    def _apply(x: Tensor, plan: tuple[Tensor, Tensor, Tensor]) -> Tensor:
-        lo, hi, w = plan
-        a, b = x.index_select(-1, lo), x.index_select(-1, hi)
-        return torch.lerp(a, b, w.to(x.dtype))
+    def _apply(x: Tensor, lo: Tensor, hi: Tensor, wg: Tensor) -> Tensor:
+        w, gain = wg[0].to(x.dtype), wg[1].to(x.dtype)
+        return torch.lerp(x.index_select(-1, lo), x.index_select(-1, hi), w) * gain
 
     def stretch_frames(self, x: Tensor) -> Tensor:
         """``[b, c, frames]`` -> ``[b, c, frames2]``."""
-        return self._apply(x, self._f)
+        return self._apply(x, *self._live[0:3])
 
     def stretch_source(self, source: Tensor) -> Tensor:
         """``[b, 1, frames * upp]`` excitation -> ``[b, 1, frames2 * upp]``."""
-        return self._apply(source, self._s)
+        return self._apply(source, *self._live[3:6])
 
     def compress(self, audio: Tensor) -> Tensor:
         """``[b, 1, frames2 * upp]`` decoded audio -> ``[b, 1, frames * upp]``."""
-        y = self.resampler(audio[..., :self.keep].float())
+        y = self.resampler(audio.index_select(-1, self._live[6]).float())
         return y[..., :self.frames * self.upp].to(audio.dtype)

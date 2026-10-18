@@ -69,5 +69,49 @@ def test_latent_stretch_maps_frame_centres_like_interpolate():
     warp = FormantWarp(2.0, 13, 320, "cpu")
     x = torch.arange(13, dtype=torch.float32).reshape(1, 1, 13)
     y = warp.stretch_frames(x)[0, 0]
-    expected = ((torch.arange(warp.frames2) + 0.5) / warp.factor - 0.5).clamp(0, 12)
-    torch.testing.assert_close(y, expected.float())
+    pos = (torch.arange(warp.frames2) + 0.5) / warp.factor - 0.5
+    inside = (pos >= -0.5) & (pos <= 12.5)
+    expected = torch.where(inside, pos.clamp(0, 12), torch.zeros_like(pos))
+    torch.testing.assert_close(y, expected.float())  # zero past the window, like padding
+
+
+@pytest.mark.parametrize("st", [-2.0, 2.0, 3.5])
+def test_streaming_warp_renders_consecutive_hops_coherently(st):
+    """Two hops one shift apart, each stretched and compressed with its own phase, must
+    agree where their windows overlap: the stretched grid is anchored to absolute time,
+    so consecutive renders of the same audio line up (otherwise SOLA drifts, §12)."""
+    upp, frames, shift, sr = 320, 13, 2, 32000
+    warp = FormantWarp(st, frames, upp, "cpu", shift_frames=shift)
+    assert warp.frames2 * upp >= warp.keep + upp - 1
+    t = torch.arange((frames + 40) * upp) / sr
+    signal = (torch.sin(2 * math.pi * 230 * t) + 0.5 * torch.sin(2 * math.pi * 610 * t))
+    outs = []
+    for n in (7, 8):
+        window = signal[n * shift * upp:n * shift * upp + frames * upp][None, None]
+        warp.select(n)
+        outs.append(warp.compress(warp.stretch_source(window))[0, 0])
+    a = outs[0][shift * upp:]  # hop 7 from where hop 8 starts
+    b = outs[1][:len(a)]
+    core = slice(upp, len(a) - 2 * upp)  # away from the resampler's edges
+    assert torch.max(torch.abs(a[core] - b[core])) < 0.02
+    assert warp.period == upp // math.gcd(shift * warp.upp_res, upp)
+
+
+@pytest.mark.parametrize("st", [-2.0, 2.0])
+def test_streaming_latent_grid_is_the_same_absolute_grid_every_hop(st):
+    """The stretched latent frames of consecutive hops are samples of one absolute grid:
+    hop n+1's frame j equals hop n's frame j + (whole number of frames). With a
+    window-anchored stretch they fall between each other (the cause of the SOLA drift)."""
+    upp, frames, shift = 320, 13, 2
+    warp = FormantWarp(st, frames, upp, "cpu", shift_frames=shift)
+    absolute = torch.linspace(0.0, 1.0, 200, dtype=torch.float64) ** 2  # smooth, monotone
+    stretched = []
+    for n in (5, 6):
+        window = absolute[n * shift:n * shift + frames].float()[None, None]
+        warp.select(n)
+        stretched.append(warp.stretch_frames(window)[0, 0])
+    k0 = [(n * shift * warp.upp_res) // upp for n in (5, 6)]  # absolute first frame
+    step = k0[1] - k0[0]
+    a, b = stretched[0][step:], stretched[1][:warp.frames2 - step]
+    inner = slice(1, len(a) - 3)  # clamped edges aside
+    torch.testing.assert_close(a[inner], b[inner], atol=1e-4, rtol=0)

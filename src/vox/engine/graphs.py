@@ -226,6 +226,12 @@ class StageGraphs:
         graph = self.graphs.get(SYNTH)
         return next((st for st, g in self._synth_cache.items() if g is graph), None)
 
+    def would_capture(self, st: float) -> bool:
+        """Whether switching the synth stage to step ``st`` means capturing a graph."""
+        if not self.active or SYNTH not in self.graphs:
+            return False
+        return st != self.synth_step and st not in self._synth_cache
+
     def formant_needs_capture(self) -> bool:
         """True when switching to the pipeline's formant step means capturing a graph
         (a first visit, or one evicted from the cache): the caller mutes around it."""
