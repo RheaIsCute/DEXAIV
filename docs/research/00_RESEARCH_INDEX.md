@@ -33,6 +33,7 @@ PROVEN / LIKELY / EXPERIMENTAL and cited to file+line throughout docs 01–11.
 | 13 | Implementation roadmap | 10 phases from skeleton to packaging, each with acceptance + benchmark gates |
 | 14 | Open questions | 13 unresolved items, each with a concrete test and a decision deadline |
 | 15 | Modernization report | 2026-10 audit of main@2b2cf93 plus ~100 external sources: what to keep, a three-phase plan (measure, inference-time fixes, retrain, distil) |
+| 16 | Audio analysis brief | 2026-10-17 status of the stutter hunt (raw-mic matrix results) and a research brief: tools that let an AI locate artifacts in the audio |
 
 ---
 
