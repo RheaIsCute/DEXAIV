@@ -1024,3 +1024,98 @@ conditional on those verdicts and nothing in Phase 1 was started.
 - Whether the matrix's gate thresholds (-40 / -55 dBFS) suit the Shure at the user's
   distance and the Broadcast mic's level; the meter line during each cell shows the level.
 - UTMOS on 48 kHz RVC output at these levels: a proxy, calibrated on TTS at 16 kHz.
+
+## 12. Formant control, and whether the index does anything (2026-10-17/18)
+
+Branch `feature/formant` (off `feature/modernize-p1`). Same machine. The DEXAIV GUI was
+running on the GPU during the formant renders and the worker tests (~13-16% load), so the
+timings in 12.2 are on a shared GPU; render quality is unaffected.
+
+### 12.1 Deviations
+
+| # | Prompt said | What was built | Why |
+|---|---|---|---|
+| F1 | rtrvc's math: decode `ceil(return_length * f)` frames, resample by `floor(f * upp) / upp` | One rational factor `f_e = round(f * upp) / upp` drives both the stretch and the resample (`synthesis/formant.py`) | rtrvc's two ratios differ; at our 5-frame tail that is up to a quarter semitone of pitch and timing error. `f_e` is within 0.03 st of `f` |
+| F2 | (not in the prompt) | The stretch is anchored to absolute time: one extra frame is decoded and each hop picks its phase `r_n = (n * shift * upp_res) mod upp` from a precomputed table, copied into static buffers before the synth stage (outside the graph, like the noise) | The first version drifted sharp when streamed (+28 cents at -2 st on a steady tone; per-hop chunks and the full-file render were exact). The window moves `shift * f_e` stretched frames per hop, not a whole number, so a window-anchored stretch put the decoder's grid elsewhere every hop |
+| F3 | (not in the prompt) | Positions past the decoded window read **zero**, not the edge frame | Holding the last frame rendered every hop's right edge (the region the next hop's SOLA aligns to) differently from the interior: -6.6 samples of hop-to-hop lag at -2 st, which SOLA turned into a steady pitch rise. Zero, like the convolutions' own padding at an unstretched edge: -0.35 samples. (At formant 0 the engine already shows +3.1 samples of edge lag: the stitched stream reads ~11 cents flat of the requested pitch on a steady tone. Unchanged here; worth a look under Q7) |
+| F4 | "Chunker owns the scaled decode length (`decoder_out` grows)" | `ChunkPlan.decode_frames` (tail + decoder context) is the chunker's; the stretched count and the phase table live in `synthesis/formant.py`; `decoder_out` is unchanged because the audio is resampled back inside the synth stage | Formant is a hot parameter, not a shape: the plan, buffers and every other graph stay as they are |
+| F5 | Graph cache per 0.5 st step, LRU ~4, a cached step switches with no mute | As specified (`StageGraphs.sync_formant`, `FORMANT_GRAPHS_KEPT = 4`); only the synth graph is per step. A first visit builds the step's phase table (20-105 ms) and captures its synth graph (~250 ms) with the voice faded out around both, as a hop change does | |
+| F6 | Pitch pre-compensation: synthesize with F0 / factor (`f0_up_key - formant_st`) | The excitation keeps the requested pitch (slowed by the stretch, restored by the resample); only the coarse pitch the text encoder sees is `pitch / f_e` (a hot device scalar in the f0 stage) | rtrvc does exactly this once its `pitchf * return_length2 / return_length` is unfolded; transposing both by `-formant_st` would put the output pitch off by the factor |
+| F7 | GUI slider sends live | The value is shown while dragging and sent on release (and on the double-click reset) | Every 0.5 st the slider passes is its own engine shape: sending each would capture up to 16 graphs in one drag |
+| F8 | F1/F2 via Parselmouth or LPC within 15% | LPC F1/F2 on the 48 kHz test model (male, ~114 Hz) within 15%: passes. On Mom +12 (~208 Hz) LPC picks harmonics (its "F1" is the fundamental), so the bench uses the cepstral long-term envelope (`benchmarks/formant_check.py`) | Parselmouth is not installed; LPC formant tracking is unreliable on high voices |
+| F9 | Pitch within +-10 cents of formant 0, by output median F0 | By the per-frame median over frames voiced in both renders | A whole-file median also moves when different frames happen to be voiced (it read 10.02 cents on a render whose per-frame offset is 2-5) |
+| F10 | v2 `formant_mode="envelope"` | Not built | The prompt gates it on v1 shipping and a blind A/B |
+
+### 12.2 Formant measurements (`vox bench formant`, `benchmarks/formant_check.py`)
+
+Live = the raw-Shure matrix take (`shure_gateoff_agcoff_hop20_mic_raw`, first 45 s) through
+Mom +12 with the input chain (stream simulator, graphs); typed = two lines of the script
+through Kokoro and the full-file converter at Mom's auto pitch.
+
+| step | factor | live envelope shift | live pitch vs 0 | typed envelope shift | typed pitch vs 0 | synth GPU p50 | hop p99 (shared GPU) |
+|---|---|---|---|---|---|---|---|
+| -2 | 0.891 | 0.912 | +2.1 c | 0.911 | -3.1 c | 5.37 ms | 24.3 ms |
+| -1 | 0.944 | 0.951 | +4.0 c | 0.958 | -2.7 c | 6.43 | 24.4 |
+| 0 | 1 | 1 | 0 | 1 | 0 | 5.44 | 24.5 |
+| +1 | 1.059 | 1.058 | +3.8 c | 1.057 | +0.6 c | 5.93 | 24.1 |
+| +2 | 1.122 | 1.101 | +5.0 c | 1.087 | +1.7 c | 5.54 | 27.8 |
+| +4 | 1.259 | | | | | 5.94 | 25.7 |
+
+Envelope shift = the factor that best aligns the cepstrally smoothed long-term spectra; it
+reads 80-100% of the nominal factor because breath, sibilants and room noise are in the
+average too. Pitch = per-frame median cents against step 0. The synth stage costs ~0.5 ms
+more at +4 st than at 0 (the decoder renders up to 26% more samples); the hop p99 of
+24-28 ms was measured with the GUI on the GPU and is not comparable with the 17-20 ms of
+§8. Seam click ratio 1.32 at 0, 1.33-1.38 at the other steps. Live switching (worker test):
+six switches between cached steps, no underrun; a first visit captured once and the voice
+came back.
+
+Wavs: `out/ab/formant/live_{-2.0,-1.0,+0.0,+1.0,+2.0}.wav` and `typed_{...}.wav`.
+
+### 12.3 Does the index do anything? (`vox bench index`)
+
+The live session line and the take JSON now name the index in use (file, vectors, dim,
+rate) or say it is not loaded. Mom's index: `model.index`, 43,857 x 768, loaded; protect
+0.33. The same raw-Shure take (45 s), Mom +12, one engine with the index loaded throughout,
+open stream, seed 0; a second seed at rate 0 is the noise floor.
+
+| index_rate | feature cosine distance (decoded frames) | log-mel L1 vs rate 0 | WER | speaker cos (proxy) | sibilant centroid | active level |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 0 | 34.7% | 0.798 | 5428 Hz | -14.7 dBFS |
+| 0.3 | 0.0027 | 0.172 | 33.3% | 0.805 | 5417 | -15.0 |
+| 0.6 | 0.0136 | 0.275 | 33.3% | 0.808 | 5437 | -15.6 |
+| 1.0 | 0.0471 | 0.520 | 40.7% | 0.765 | 5411 | -17.9 |
+| 0, seed 1 | | **0.336** (the floor) | 33.3% | 0.798 | 5412 | -14.7 |
+
+WER is against the whole script while the take is its first 45 s, so every row carries the
+same missing tail (the microphone itself reads 24.7%): compare rows, not absolutes.
+
+**Verdict: inert for Mom.** At 0.6 the index changes the output less than a different random
+seed does (0.275 < 0.336), and the features the decoder sees move by 1.4% in cosine: this
+voice's ContentVec frames already sit close to their nearest training vectors, and protect
+pulls the unvoiced ones back. Only at 1.0 does it pass the floor, and then it is 3 dB
+quieter, loses words and moves away from the proxy. That matches the user's "no difference
+at any setting". Applied per the rule: the verdict is stored in `models/Mom/config.json`
+and `profiles/default/model_overrides.json` (`index_effect`, tied to the index file
+measured). For an inert model the GUI does not load the index (the index stage then only
+upsamples), keeps the rate at 0, refuses a new rate and greys the slider with "No audible
+effect measured for this model". Another index file for the same model is not covered. No
+ABX was written: the rule calls for one only when the output changes. Wavs:
+`out/ab/index/index_{0,0.3,0.6,1}.wav` and `index_0_seed1.wav`.
+
+### 12.4 Tests
+
+`tests/unit/test_formant_math.py` (factor, decode length, stretch+compress identity,
+hop-to-hop coherence of excitation and latent grid), `tests/unit/test_formant_index_bench.py`
+(verdict, ABX writer, envelope estimator), `tests/engine/test_formant.py` (streamed and
+full-file pitch within 10 cents, F1/F2 moved within 15%, seams, graph cache and LRU,
+replay vs eager), `tests/engine/test_worker.py` (live switching), `tests/api` (presets,
+persistence, inert index). Under the GUI's GPU load four pre-existing worker tests also
+failed on the pre-formant commit (underruns): not a regression; they need a quiet GPU.
+
+### 12.5 Not verified
+
+- Listening: none of the wavs above was heard. Whether +-2 st sounds natural on Mom, and
+  whether the typed and live formants match by ear, is the user's call.
+- The index verdict on GoatMommy (124,683 vectors) and on other takes: only Mom was measured.
+- Hop timings on a quiet GPU.

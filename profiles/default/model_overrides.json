@@ -8,7 +8,17 @@
       "target_f0_median_hz": 192.1
     },
     "Mom": {
-      "target_f0_median_hz": 194.5
+      "target_f0_median_hz": 194.5,
+      "index_effect": {
+        "verdict": "inert",
+        "index": "model.index",
+        "change_06": 0.275,
+        "seed_floor": 0.336,
+        "protect": 0.33,
+        "when": "2026-10-18 (vox bench index)",
+        "take": "shure_gateoff_agcoff_hop20_mic_raw.wav",
+        "pitch": 12.0
+      }
     },
     "GoatMommy": {
       "target_f0_median_hz": 193.8

@@ -167,8 +167,9 @@ def write_abx(a: Path, b: Path, out_dir: Path, trials: int = 16, seed: int = 202
     return key
 
 
-def abx_threshold(trials: int = 16, alpha: float = 0.05) -> int:
-    """Smallest number correct with a one-sided binomial p below ``alpha``."""
+def abx_threshold(trials: int = 16, alpha: float = 0.02) -> int:
+    """Smallest number correct with a one-sided binomial p below ``alpha``. The feature
+    prompt's bar is 13 of 16 (p = 0.011); 12 of 16 would already pass at 5% (p = 0.038)."""
     for k in range(trials + 1):
         p = sum(math.comb(trials, j) for j in range(k, trials + 1)) / 2 ** trials
         if p < alpha:
@@ -197,3 +198,22 @@ def report_json(path: Path, record: dict) -> None:
 
 def replace(params, **kw):
     return dataclasses.replace(params, **kw)
+
+
+INDEX_EFFECT_KEY = "index_effect"  # model config defaults / profile model_overrides
+
+
+def save_index_verdict(models_dir: Path, profile_dir: Path, model: str, record: dict) -> None:
+    """Store the verdict where the controller reads it: the model's config.json defaults and
+    the profile's model_overrides.json (the committed copy). ``record`` holds ``verdict``,
+    ``index`` (the file measured), ``change_06``, ``seed_floor`` and ``when``."""
+    from vox.config.store import load_json, save_json
+
+    path = Path(models_dir) / model / "config.json"
+    data = load_json(path)
+    data.setdefault("defaults", {})[INDEX_EFFECT_KEY] = record
+    save_json(path, data)
+    over = Path(profile_dir) / "model_overrides.json"
+    overrides = load_json(over) if over.is_file() else {"schema": 1}
+    overrides.setdefault("models", {}).setdefault(model, {})[INDEX_EFFECT_KEY] = record
+    save_json(over, overrides)

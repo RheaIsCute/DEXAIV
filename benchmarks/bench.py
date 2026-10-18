@@ -1561,6 +1561,13 @@ def cmd_index(args) -> int:
         print(f"| {rate} | {r['feature_dist']:.4f} | {r['l1_vs_0']:.3f} | {r['wer']:.1%} | "
               f"{r['spk']:.3f} | {r['sibilant_hz']:.0f} | {r['dbfs']:.1f} |")
     print(f"\nmicrophone WER {mic_wer:.1%}; speaker cosine against {rows[0.0]['target']}")
+    record = {"verdict": result, "index": engine.loaded.index_path.name,
+              "change_06": round(change06, 4), "seed_floor": round(floor, 4),
+              "protect": engine.params.protect, "when": fi.now(),
+              "take": path.name, "pitch": args.pitch}
+    if not args.dry_run:
+        fi.save_index_verdict(args.models_dir, args.profile, args.model, record)
+        print(f"verdict stored for {args.model} (config.json defaults and model_overrides.json)")
     abx = None
     if result != "inert":
         start, length = int(5 * sr), int(12 * sr)

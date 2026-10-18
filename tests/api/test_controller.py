@@ -283,6 +283,30 @@ def test_start_stop_and_what_the_session_is_given(env):
     assert session.stopped and c.state()["engine"]["status"] == "stopped"
 
 
+def test_an_index_measured_inert_is_off_and_greyed(env):
+    """vox bench index stored "inert" for Alpha's model.index (docs/DEVIATIONS.md §12): the
+    index is not loaded, the rate is 0 and cannot be set, the GUI is told why. Another
+    index file for the same model is not covered by that measurement."""
+    (env.profile / "model_overrides.json").write_text(json.dumps(
+        {"models": {"Alpha": {"index_effect": {"verdict": "inert", "index": "model.index"}}}}))
+    c = env.make(model="Alpha")
+    p = c.state()["params"]
+    assert p["index_inert"] is True and p["index_note"] == ctl.INDEX_INERT_NOTE
+    assert p["index_rate"] == 0.0
+    with pytest.raises(ApiError, match="No audible effect"):
+        c.set_param("index_rate", 0.6)
+    c.start()
+    settle(c)
+    assert FakeSession.created[-1].cfg.params.index_rate == 0.0  # not primed: not loaded
+    c.stop()
+    settle(c)
+    write_index(env.models / "Alpha" / "added_other.index", 768)
+    c.set_index("Alpha", "added_other.index")
+    settle(c)
+    assert c.state()["params"]["index_inert"] is False
+    c.shutdown()
+
+
 def test_no_index_means_no_priming(env):
     c = env.make(model="Beta")
     c.start()

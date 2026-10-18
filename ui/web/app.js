@@ -188,7 +188,10 @@ function render() {
     setValue($("formant"), params.formant || 0);
     if (document.activeElement !== $("formant")) $("formant-value").textContent = formantText(params.formant || 0);
     setValue($("index-rate"), Math.round(params.index_rate * 100));
-    $("index-rate-value").textContent = fixed(params.index_rate, 2);
+    $("index-rate-value").textContent = params.index_inert ? "no effect" : fixed(params.index_rate, 2);
+    $("index-rate").disabled = !!params.index_inert;
+    $("index-rate").closest("label").title = params.index_note || "";
+    $("index-rate").closest("label").classList.toggle("off", !!params.index_inert);
     setValue($("protect"), Math.round(params.protect * 100));
     $("protect-value").textContent = fixed(params.protect, 2);
     $("auto-pitch").checked = !!params.auto_pitch;

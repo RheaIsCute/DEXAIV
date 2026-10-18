@@ -59,6 +59,10 @@ HOLD_SETTLE_HOPS = 4  # hops between closing the live voice and starting a clip'
 METER_FLOOR_DB = -120.0
 INDEX_PRIME = 1e-6  # see _start: keeps the index loaded so its rate stays a hot parameter
 PREVIEW_TEXT = "Hi, this is a quick preview of this voice."
+# `vox bench index` (docs/DEVIATIONS.md §12): a model whose index changed the output less
+# than a new random seed does is "inert": its index is not loaded and the slider is greyed.
+INDEX_EFFECT_KEY = "index_effect"
+INDEX_INERT_NOTE = "No audible effect measured for this model"
 STAGE_LABELS = {"f0": "F0", "embed": "ContentVec", "index": "Index kNN", "synth": "Synth",
                 "sola": "SOLA"}
 HOT_PARAMS = {"pitch": "f0_up_key", "index_rate": "index_rate", "protect": "protect",
@@ -283,6 +287,8 @@ class EngineController:
         if not calibrated:
             overrides.update({field: entry.get(key) for key, field in HOT_PARAMS.items()})
         params = resolve_runtime_params(self.profile, config, overrides)
+        if self._index_inert(config):
+            params = dataclasses.replace(params, index_rate=0.0)  # measured: no effect
         if entry.get("target_hz") is None:  # the model's register, as vox say measures it
             from vox.tts.speak import target_f0_hint
 
@@ -488,6 +494,17 @@ class EngineController:
                 self._index_meta[key] = None
         return self._index_meta[key]
 
+    def _index_inert(self, config) -> bool:
+        """The measured verdict for the model's index in use (profile first, then the
+        model config); only valid for the index file that was measured."""
+        layers = (self.profile.model_overrides.models.get(config.name, {}), config.defaults)
+        record = next((layer.get(INDEX_EFFECT_KEY) for layer in layers
+                       if layer.get(INDEX_EFFECT_KEY)), None)
+        if not record or record.get("verdict") != "inert":
+            return False
+        path = self.registry.index_path(config.name)
+        return path is not None and path.name == record.get("index")
+
     def _index_options(self, name: str, config) -> list[dict[str, Any]]:
         directory = self.models_dir / name
         paired = config.index.file
@@ -616,6 +633,9 @@ class EngineController:
                     "auto_pitch": params.pitch_mode == "auto",
                     "target_hz": params.target_f0_hz, "pitch_range": params.pitch_range,
                     "formant": params.formant_st,
+                    "index_inert": self._index_inert(self._config()),
+                    "index_note": (INDEX_INERT_NOTE if self._index_inert(self._config())
+                                   else ""),
                     "preset": preset, "presets": list(PRESETS),
                     "calibrated_pitch": default_pitch,
                     "pitch_is_calibrated": params.f0_up_key == default_pitch,
@@ -709,7 +729,8 @@ class EngineController:
         config = self._config()
         params = self._params()
         start_params = params
-        if self.registry.index_path(config.name) is not None and params.index_rate <= 0:
+        if (self.registry.index_path(config.name) is not None and params.index_rate <= 0
+                and not self._index_inert(config)):
             # The engine only loads an index when the rate is above zero at start. Loading
             # it anyway keeps "index rate" a hot parameter instead of a restart.
             start_params = dataclasses.replace(params, index_rate=INDEX_PRIME)
@@ -809,6 +830,8 @@ class EngineController:
     def set_param(self, name: str, value: float) -> dict[str, Any]:
         if name not in HOT_PARAMS:
             raise ApiError(f"unknown parameter {name!r}")
+        if name == "index_rate" and self._index_inert(self._config()):
+            raise ApiError(f"{INDEX_INERT_NOTE}: the index stays off")
         low, high = PARAM_RANGES[name]
         value = min(high, max(low, float(value)))
         if name == "formant":
