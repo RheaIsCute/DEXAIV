@@ -90,6 +90,11 @@
           <span class="sub">Pitch offset</span>
           <input type="range" id="pitch" min="-12" max="24" step="1" value="0" style="margin-top:6px">
         </label>
+        <label class="field" title="Moves the voice's resonances while the pitch stays where it is: left sounds bigger and heavier, right smaller and lighter. Best between -2 and +2; beyond about ±3 it sounds processed, and positive values on an already feminine voice can sound childlike. Double-click to reset. The first time you use a value the voice pauses for a moment while it is prepared.">
+          <span class="row between sub">Formant <span class="num strong" id="formant-value">0 st</span></span>
+          <input type="range" id="formant" min="-4" max="4" step="0.5" value="0" style="margin-top:6px">
+          <span class="row between muted small"><span>Deeper</span><span>Lighter</span></span>
+        </label>
         <label class="toggle" title="Measures how high you are actually speaking and transposes that onto the voice's own pitch, whatever register you drift into. Your intonation is kept. The fixed offset applies until half a second of voice was heard."><span>Auto pitch <span class="muted small num" id="auto-pitch-now"></span></span><input type="checkbox" id="auto-pitch"></label>
       </section>
     </div>

@@ -63,10 +63,11 @@ STAGE_LABELS = {"f0": "F0", "embed": "ContentVec", "index": "Index kNN", "synth"
                 "sola": "SOLA"}
 HOT_PARAMS = {"pitch": "f0_up_key", "index_rate": "index_rate", "protect": "protect",
               "ceiling": "f0_ceiling_hz", "target_hz": "target_f0_hz",
-              "pitch_range": "pitch_range"}
+              "pitch_range": "pitch_range", "formant": "formant_st"}
 PARAM_RANGES = {"pitch": (-24.0, 24.0), "index_rate": (0.0, 1.0), "protect": (0.0, 0.5),
                 "ceiling": (0.0, 1100.0),  # ceiling 0 = off
-                "target_hz": (60.0, 600.0), "pitch_range": (0.0, 1.5)}
+                "target_hz": (60.0, 600.0), "pitch_range": (0.0, 1.5),
+                "formant": (-4.0, 4.0)}  # semitones, snapped to 0.5 (synthesis/formant.py)
 INPUT_GAIN_RANGE = (-12.0, 24.0)  # the input-gain trim slider, dB
 # Speak / Sing presets, per model (docs/DEVIATIONS.md §8). Each keeps its own pitch, index
 # rate, protect and F0 ceiling; Speak is what the model entry always held. Sing starts from
@@ -292,6 +293,7 @@ class EngineController:
             return params
         sing = {**SING_DEFAULTS, "pitch": self._sing_pitch(params.f0_up_key),
                 "target_hz": params.target_f0_hz, "pitch_range": params.pitch_range,
+                "formant": params.formant_st,  # Sing starts from the Speak formant
                 **entry.get("sing", {})}
         return dataclasses.replace(params, **{field: float(sing[key])
                                               for key, field in HOT_PARAMS.items()})
@@ -613,6 +615,7 @@ class EngineController:
                     "ceiling_hz": params.f0_ceiling_hz,
                     "auto_pitch": params.pitch_mode == "auto",
                     "target_hz": params.target_f0_hz, "pitch_range": params.pitch_range,
+                    "formant": params.formant_st,
                     "preset": preset, "presets": list(PRESETS),
                     "calibrated_pitch": default_pitch,
                     "pitch_is_calibrated": params.f0_up_key == default_pitch,
@@ -808,6 +811,10 @@ class EngineController:
             raise ApiError(f"unknown parameter {name!r}")
         low, high = PARAM_RANGES[name]
         value = min(high, max(low, float(value)))
+        if name == "formant":
+            from vox.synthesis.formant import snap_formant
+
+            value = snap_formant(value)
         with self._lock:
             self._preset_store(self._config().name)[name] = value  # the active preset's
             session = self.session

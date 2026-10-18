@@ -38,6 +38,7 @@ from vox.pitch.base import (
     COARSE_F0_MIN,
     PitchExtractor,
     RegisterTracker,
+    f0_to_coarse,
     postprocess_f0,
     semitones_to_ratio,
 )
@@ -45,7 +46,10 @@ from vox.pitch.pitch_cache import PitchCache
 from vox.profiling.timers import StageTimers
 from vox.retrieval import gpu_knn
 from vox.retrieval.gpu_knn import GpuIndex
+from vox.synthesis.formant import FormantWarp, snap_formant
 from vox.synthesis.rvc_model import RvcModel
+
+FORMANT_WARPS_KEPT = 8  # built FormantWarp objects per plan (cheap: indices + a FIR kernel)
 
 # Stage names shared by the pipeline and whoever drives it (worker or stream simulator).
 STAGES = ("upload", "gate", "resample_in", "f0", "embed", "index", "synth", "post", "sola",
@@ -99,6 +103,9 @@ class HopPipeline:
         self._bridge = round(params.f0_bridge_ms / 10.0)  # F0 frames (10 ms each)
         self._trim_tail = params.f0_trim_tail
         self._phase_carry = params.sine_phase_carry
+        self.formant_st = 0.0  # applied step (snapped); 0 = no warp
+        self.warp: FormantWarp | None = None
+        self._warps: dict[float, FormantWarp] = {}
         self.set_plan(plan)
         self.set_params(params)
 
@@ -145,6 +152,11 @@ class HopPipeline:
         self.f0_min_t = torch.zeros((), device=dev)
         self.f0_max_t = torch.full((), math.inf, device=dev)
         self.f0_ceiling_t = torch.full((), math.inf, device=dev)  # inf = no soft ceiling
+        # Formant: the coarse pitch is built from pitchf * this (1 / factor), as rtrvc does;
+        # a hot value inside the f0 stage (1.0 = no shift, same op sequence).
+        self.formant_inv_t = torch.ones((), device=dev)
+        self._warps = {}  # built for the previous plan's frame count
+        self.warp = None
         self.register = RegisterTracker(dev)  # auto pitch (set_params)
         self.register.fresh = p.shift_frames
         # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
@@ -200,6 +212,7 @@ class HopPipeline:
                           params.pitch_follow_s, params.pitch_range)
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
+        self.set_formant(params.formant_st)
         interp = params.f0_unvoiced == "interp"
         bridge = round(params.f0_bridge_ms / 10.0)
         trim, carry = params.f0_trim_tail, params.sine_phase_carry
@@ -210,6 +223,27 @@ class HopPipeline:
         if carry != self._phase_carry:
             self.sine_phase.zero_()
         self._phase_carry = carry
+        return changed
+
+    def set_formant(self, st: float) -> bool:
+        """Select the formant step (snapped to 0.5 st, clamped to +-4). Returns True when
+        the step changed: the synth stage then has a new shape, which ``StageGraphs``
+        handles with its per-step graph cache (``sync_formant``), never a full recapture."""
+        st = snap_formant(st)
+        changed = st != self.formant_st or (st != 0.0 and self.warp is None)
+        self.formant_st = st
+        if st == 0.0:
+            self.warp = None
+            self.formant_inv_t.fill_(1.0)
+            return changed
+        warp = self._warps.get(st)
+        if warp is None:
+            if len(self._warps) >= FORMANT_WARPS_KEPT:
+                self._warps.pop(next(iter(self._warps)))
+            warp = FormantWarp(st, self.plan.decode_frames, self.model.upp, self.device)
+            self._warps[st] = warp
+        self.warp = warp
+        self.formant_inv_t.fill_(1.0 / warp.factor)
         return changed
 
     def set_index(self, index: GpuIndex | None) -> None:
@@ -334,8 +368,11 @@ class HopPipeline:
     def _stage_f0(self) -> None:
         f0 = self.extractor.extract(self.f0_tail)
         ratio = self.register.ratio(f0, self.ratio_t)  # per frame; the fixed ratio unless auto
-        coarse, cont = postprocess_f0(f0, ratio, self.f0_min_t, self.f0_max_t,
-                                      self._interp, self._bridge, self.f0_ceiling_t)
+        _, cont = postprocess_f0(f0, ratio, self.f0_min_t, self.f0_max_t,
+                                 self._interp, self._bridge, self.f0_ceiling_t)
+        # The excitation keeps the requested pitch; the coarse pitch is that over the
+        # formant factor (1 without a shift: the same buckets postprocess_f0 makes).
+        coarse = f0_to_coarse(cont * self.formant_inv_t)
         self.pitch_cache.roll_and_write(coarse, cont)
 
     def _stage_embed(self) -> None:
@@ -366,7 +403,8 @@ class HopPipeline:
         phase = self.sine_phase if self._phase_carry and pitch is not None else None
         audio = self.model.infer(self.feats, self.p_len_t, pitch, pitchf, self.sid_t,
                                  p.skip_head, p.return_length, p.dec_context,
-                                 self.noise_z, self.noise_src, phase, p.shift_frames)
+                                 self.noise_z, self.noise_src, phase, p.shift_frames,
+                                 self.warp)
         self.audio_model.copy_(audio)
 
     def _stage_post(self) -> None:

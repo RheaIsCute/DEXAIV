@@ -88,6 +88,10 @@ class RuntimeParams:
     target_f0_hz: float = 200.0  # the model's register (vox say's target_f0_hint)
     pitch_follow_s: float = 2.0
     pitch_range: float = 1.0
+    # Formant (docs/DEVIATIONS.md §12): resonances shifted by this many semitones while the
+    # pitch stays put; negative = deeper / bigger, positive = lighter / smaller. -4..+4 in
+    # 0.5 st steps (each step is its own decoder shape: a cached synth graph).
+    formant_st: float = 0.0
 
 
 @dataclass(frozen=True)

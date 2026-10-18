@@ -20,6 +20,7 @@ not the default: its replay hung on the reference machine (docs/DEVIATIONS.md R2
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -34,6 +35,10 @@ MODES = ("off", "on", "auto")
 WARMUP_ITERS = 3
 SOLA = "sola"
 HOP = "hop"  # the whole-hop single graph (experimental, Q16)
+SYNTH = "synth"
+# Formant steps whose synth graph stays captured (docs/DEVIATIONS.md §12): a step in the
+# cache switches between hops with no capture; the least recently used one is dropped.
+FORMANT_GRAPHS_KEPT = 4
 
 
 class GraphCaptureError(RuntimeError):
@@ -143,6 +148,9 @@ class StageGraphs:
         self._key: tuple | None = None
         self.report = GraphReport(mode)
         self._sola_static: Tensor | None = None
+        # formant step -> captured synth graph (LRU); the active one is self.graphs[SYNTH]
+        self._synth_cache: OrderedDict[float, torch.cuda.CUDAGraph] = OrderedDict()
+        self.formant_captures = 0  # synth graphs captured for a new step (live, after start)
 
     # ------------------------------------------------------------------ control path
 
@@ -165,6 +173,7 @@ class StageGraphs:
         self.pipeline.stage_impl.update(self.pipeline.stage_fns)
         self.sola._impl = self.sola._stitch_eager
         self.graphs.clear()
+        self._synth_cache.clear()
         self._sola_static = None
         self._key = None
         self.report = GraphReport(self.mode)
@@ -205,7 +214,59 @@ class StageGraphs:
         self._key = self.key()
         self.report.active = True
         self.report.capture_ms = (time.perf_counter() - start) * 1000.0
+        if SYNTH in self.graphs:
+            self._synth_cache[pipeline.formant_st] = self.graphs[SYNTH]
         return self.report
+
+    # ------------------------------------------------------------- formant steps
+
+    @property
+    def synth_step(self) -> float | None:
+        """The formant step the active synth graph was captured for (None: eager)."""
+        graph = self.graphs.get(SYNTH)
+        return next((st for st, g in self._synth_cache.items() if g is graph), None)
+
+    def formant_needs_capture(self) -> bool:
+        """True when switching to the pipeline's formant step means capturing a graph
+        (a first visit, or one evicted from the cache): the caller mutes around it."""
+        if not self.active or SYNTH not in self.graphs:
+            return False
+        st = self.pipeline.formant_st
+        return st != self.synth_step and st not in self._synth_cache
+
+    def sync_formant(self) -> str:
+        """Point the synth stage at the graph of the pipeline's current formant step:
+        ``"same"``, ``"cached"`` (swapped between hops, no capture) or ``"captured"``
+        (a new synth graph; the rest of the hop's graphs are untouched). Eager pipelines
+        need nothing: the eager stage reads ``pipeline.warp`` itself."""
+        if not self.active or SYNTH not in self.graphs:
+            return "same"
+        pipeline = self.pipeline
+        st = pipeline.formant_st
+        if st == self.synth_step:
+            return "same"
+        graph = self._synth_cache.get(st)
+        outcome = "cached"
+        if graph is None:
+            snapshot = _Snapshot(pipeline.state_tensors() + self.sola.state_tensors())
+            try:
+                graph = _capture(pipeline.stage_fns[SYNTH], self.device, self.autotune)
+            except Exception as err:  # noqa: BLE001 - fall back to eager synth, keep going
+                snapshot.restore()
+                pipeline.stage_impl[SYNTH] = pipeline.stage_fns[SYNTH]
+                self.graphs.pop(SYNTH, None)
+                self.report.stages[SYNTH] = f"eager (formant capture failed: {err})"
+                return "eager"
+            snapshot.restore()
+            self._synth_cache[st] = graph
+            self.formant_captures += 1
+            outcome = "captured"
+            while len(self._synth_cache) > FORMANT_GRAPHS_KEPT:
+                self._synth_cache.popitem(last=False)  # oldest; never the one just added
+        self._synth_cache.move_to_end(st)
+        self.graphs[SYNTH] = graph
+        pipeline.stage_impl[SYNTH] = _Replay(graph)
+        return outcome
 
     def _capture_sola(self) -> None:
         sola, pipeline = self.sola, self.pipeline

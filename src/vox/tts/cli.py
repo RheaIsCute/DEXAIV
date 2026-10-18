@@ -43,6 +43,8 @@ def add_say_parser(sub, default_models: Path, default_profile: Path) -> None:
                    help="transpose in semitones (default: measured from the TTS audio)")
     p.add_argument("--index-rate", type=float, default=None)
     p.add_argument("--protect", type=float, default=None)
+    p.add_argument("--formant", type=float, default=None, dest="formant_st",
+                   help="formant shift in semitones, -4..+4 (pitch unchanged)")
     p.add_argument("--f0-method", choices=("rmvpe", "fcpe"), default=None)
     p.add_argument("--variation", type=float, default=DEFAULT_AMOUNT,
                    help="0..1: how differently the same text is delivered each time (speed, "
@@ -179,7 +181,7 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError(str(err)) from err
         params = resolve_runtime_params(profile, config, {
             "index_rate": args.index_rate, "protect": args.protect,
-            "f0_method": args.f0_method})
+            "f0_method": args.f0_method, "formant_st": args.formant_st})
         spoken = spoken_text(text, args.profile, not args.no_normalize, args.laughter)
         seed = args.seed if args.seed is not None or amount > 0 else 0
         voices = backend.voices() if amount > 0 and getattr(backend, "blends", False) else ()

@@ -73,6 +73,12 @@ class ChunkPlan:
         return 1000.0 * device_samples / self.device_sr
 
     @property
+    def decode_frames(self) -> int:
+        """Frames the decoder renders per hop: the kept tail plus its left context. A
+        formant shift stretches exactly these (``synthesis.formant``)."""
+        return self.return_length + self.dec_context
+
+    @property
     def block_ms(self) -> float:
         return self.ms(self.block)
 

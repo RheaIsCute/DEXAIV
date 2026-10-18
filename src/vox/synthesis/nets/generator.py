@@ -171,14 +171,19 @@ class _GeneratorBase(nn.Module):
 class Generator(_GeneratorBase):
     """Plain HiFi-GAN for non-F0 (``*_nono``) models."""
 
-    def forward(self, x: Tensor, g: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, g: Tensor | None = None, warp=None) -> Tensor:
+        # ``warp``: a ``synthesis.formant.FormantWarp`` (formant shift): the latent is
+        # stretched in time before decoding and the audio resampled back after.
+        if warp is not None:
+            x = warp.stretch_frames(x)
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
         for i in range(self.num_upsamples):
             x = self.ups[i](F.leaky_relu(x, LRELU_SLOPE))
             x = self._resblocks(x, i)
-        return self._finish(x)
+        out = self._finish(x)
+        return warp.compress(out) if warp is not None else out
 
 
 class GeneratorNSF(_GeneratorBase):
@@ -206,9 +211,15 @@ class GeneratorNSF(_GeneratorBase):
 
     def forward(self, x: Tensor, f0: Tensor, g: Tensor | None = None,
                 source: Tensor | None = None, source_noise: Tensor | None = None,
-                phase: Tensor | None = None, phase_frames: int = 0) -> Tensor:
+                phase: Tensor | None = None, phase_frames: int = 0, warp=None) -> Tensor:
         if source is None:
             source = self.source(f0, source_noise, phase, phase_frames)
+        if warp is not None:
+            # Formant shift: the excitation (built at the requested pitch, phase carry and
+            # noise in the unstretched domain) and the latent are stretched by the factor;
+            # the decoded audio is resampled back below (synthesis.formant).
+            source = warp.stretch_source(source)
+            x = warp.stretch_frames(x)
         source = source.to(x.dtype)
         x = self.conv_pre(x)
         if g is not None:
@@ -217,4 +228,5 @@ class GeneratorNSF(_GeneratorBase):
             x = self.ups[i](F.leaky_relu(x, LRELU_SLOPE))
             x = x + self.noise_convs[i](source)
             x = self._resblocks(x, i)
-        return self._finish(x)
+        out = self._finish(x)
+        return warp.compress(out) if warp is not None else out

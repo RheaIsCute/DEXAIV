@@ -25,6 +25,7 @@ from vox.offline.simulate import Engine, StreamSimulator, load_engine
 from vox.pitch.base import PitchExtractor, postprocess_f0, semitones_to_ratio
 from vox.retrieval import gpu_knn
 from vox.retrieval.gpu_knn import GpuIndex
+from vox.synthesis.formant import FormantWarp, effective_factor, snap_formant
 from vox.synthesis.rvc_model import RvcModel
 
 SR = 16000
@@ -79,6 +80,7 @@ class FullFileConverter:
         bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=SR)
         audio = signal.filtfilt(bh, ah, audio).astype(np.float32)
 
+        formant = snap_formant(params.formant_st)
         cuts = self._cut_points(audio)
         padded = np.pad(audio, (t_pad, t_pad), mode="reflect")
         wave = torch.from_numpy(padded).to(self.device)
@@ -91,6 +93,12 @@ class FullFileConverter:
                 round(params.f0_bridge_ms / 10.0), params.f0_ceiling_hz)
             if f0_contour_scale != 1.0:
                 coarse, cont = scale_contour(cont, f0_contour_scale, t_pad // WINDOW)
+            if formant != 0.0:
+                # as the live engine: excitation at the requested pitch, coarse pitch at
+                # pitch / factor (synthesis.formant)
+                from vox.pitch.base import f0_to_coarse
+
+                coarse = f0_to_coarse(cont / effective_factor(formant, self.model.upp))
             pitch, pitchf = coarse[:p_len].unsqueeze(0), cont[:p_len].unsqueeze(0)
 
         pieces: list[torch.Tensor] = []
@@ -148,7 +156,10 @@ class FullFileConverter:
             feats = protect_blend(feats, to_100hz(feats0)[:, :p_len], pitchf, params.protect)
         lengths = torch.tensor([p_len], dtype=torch.long, device=self.device)
         sid = torch.tensor([params.sid], dtype=torch.long, device=self.device)
-        return self.model.infer(feats, lengths, pitch, pitchf, sid)
+        formant = snap_formant(params.formant_st)
+        warp = (FormantWarp(formant, p_len, self.model.upp, self.device)
+                if formant != 0.0 else None)
+        return self.model.infer(feats, lengths, pitch, pitchf, sid, warp=warp)
 
 
 def _rms_frames(audio: np.ndarray, frame: int, hop: int) -> np.ndarray:

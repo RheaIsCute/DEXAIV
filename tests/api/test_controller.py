@@ -603,7 +603,7 @@ def test_speak_and_sing_presets_keep_their_own_values_per_model(env):
     # hot: the four values and the singing input chain, nothing restarted
     assert session.calls == [
         ("params", {"f0_up_key": 6.0, "index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0,
-                    "target_f0_hz": 200.0, "pitch_range": 1.0}),
+                    "target_f0_hz": 200.0, "pitch_range": 1.0, "formant_st": 0.0}),
         ("conditioning", {"auto_level": True, "trim_db": 0.0, "max_gain_db": 10.0})]
     assert len(FakeSession.created) == 1
     c.set_param("pitch", 4)
@@ -628,6 +628,31 @@ def test_speak_and_sing_presets_keep_their_own_values_per_model(env):
     assert (cfg.conditioning.max_gain_db, cfg.conditioning.trim_db) == (10.0, 0.0)
     # the other model is untouched by Alpha's preset
     assert again._params("Beta").f0_ceiling_hz == 0.0
+
+
+def test_formant_is_snapped_kept_per_preset_and_reaches_the_session(env):
+    """Formant (docs/DEVIATIONS.md §12): 0.5 st steps within +-4, its own value in each
+    preset (Sing starts from the Speak value), persisted, and sent hot."""
+    c = env.make(model="Alpha")
+    assert c.state()["params"]["formant"] == 0.0
+    assert c.set_param("formant", 1.3) == {"formant": 1.5}
+    assert c.set_param("formant", -9) == {"formant": -4.0}
+    c.set_param("formant", -1.0)
+    c.set_preset("sing")
+    assert c.state()["params"]["formant"] == -1.0  # carried over from Speak
+    c.set_param("formant", 0.5)
+    c.set_preset("speak")
+    assert c.state()["params"]["formant"] == -1.0
+    saved = json.loads((env.profile / ctl.STATE_FILE).read_text())
+    assert saved["models"]["Alpha"]["formant"] == -1.0
+    assert saved["models"]["Alpha"]["sing"]["formant"] == 0.5
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    assert session.cfg.params.formant_st == -1.0
+    c.set_param("formant", 2)
+    assert ("params", {"formant_st": 2.0}) in session.calls
+    c.shutdown()
 
 
 def test_gui_state_keeps_only_user_choices_so_new_defaults_reach_the_engine(env, monkeypatch):

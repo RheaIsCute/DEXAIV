@@ -20,6 +20,7 @@ LATER = {"calibrate": "Phase 5 (calibration)"}
 RUN_HELP = """\
 live commands (type and press Enter):
   pitch N | index X | protect X | envelope X   hot parameters, applied before the next hop
+  formant ST                                   formant shift, -4..+4 st (first use of a value: brief pause)
   ceiling HZ                                   soft F0 ceiling after transposition (0 = off)
   autopitch on|off | target HZ                 auto pitch: follow the register onto target
   gate on|off                                  silence gate
@@ -51,6 +52,9 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                         "--target-f0-hz (the intonation is kept); fixed: --pitch (default)")
     p.add_argument("--target-f0-hz", type=float, default=None, dest="target_f0_hz",
                    help="auto pitch target, Hz (default: the model's register, else 200)")
+    p.add_argument("--formant", type=float, default=None, dest="formant_st",
+                   help="formant shift in semitones, -4..+4 in 0.5 steps (pitch unchanged): "
+                        "negative = deeper / heavier, positive = lighter; best within +-2")
     p.add_argument("--pitch-range", type=float, default=None,
                    help="auto pitch: 1 keeps the intonation, lower squeezes it")
     p.add_argument("--pitch-follow-s", type=float, default=None,
@@ -257,6 +261,10 @@ def _run_command(session, line: str) -> bool:
             print("params:", session.set_params(f0_up_key=float(arg)))
         elif cmd == "index":
             print("params:", session.set_params(index_rate=float(arg)))
+        elif cmd == "formant":
+            from vox.synthesis.formant import snap_formant
+
+            print("params:", session.set_params(formant_st=snap_formant(float(arg))))
         elif cmd == "protect":
             print("params:", session.set_params(protect=float(arg)))
         elif cmd == "envelope":

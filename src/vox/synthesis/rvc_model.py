@@ -55,7 +55,7 @@ class RvcModel:
               pitchf: Tensor | None, sid: Tensor, skip_head: int = 0,
               return_length: int | None = None, dec_context: int = 0,
               noise: Tensor | None = None, source_noise: Tensor | None = None,
-              phase: Tensor | None = None, phase_frames: int = 0) -> Tensor:
+              phase: Tensor | None = None, phase_frames: int = 0, warp=None) -> Tensor:
         """``feats [1, T, C]`` at 100 Hz -> audio ``[frames * upp]`` at ``tgt_sr``.
 
         ``skip_head`` / ``return_length`` are host ints from the static chunk plan, so the
@@ -66,7 +66,7 @@ class RvcModel:
         if not self.decoder_fp16:
             return self.net.infer(feats, p_len, pitch, pitchf, sid, skip_head,
                                   return_length, dec_context, noise, source_noise,
-                                  phase, phase_frames)[0, 0]
+                                  phase, phase_frames, warp)[0, 0]
         dec_context = min(dec_context, skip_head) if return_length is not None else 0
         z, g = self.net.infer_latent(feats, p_len, pitch, sid, skip_head, return_length,
                                      dec_context, noise)
@@ -74,6 +74,6 @@ class RvcModel:
             pitchf = pitchf[:, skip_head - dec_context:skip_head + return_length]
         with torch.autocast(self.device.type, dtype=torch.float16):
             audio = (self.net.dec(z, pitchf, g=g, source_noise=source_noise, phase=phase,
-                                  phase_frames=phase_frames) if self.has_f0
-                     else self.net.dec(z, g=g))
+                                  phase_frames=phase_frames, warp=warp) if self.has_f0
+                     else self.net.dec(z, g=g, warp=warp))
         return audio[0, 0, dec_context * self.upp:].float()

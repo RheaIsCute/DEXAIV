@@ -93,8 +93,12 @@ class Synthesizer(nn.Module):
               pitchf: Tensor | None, sid: Tensor, skip_head: int = 0,
               return_length: int | None = None, dec_context: int = 0,
               noise: Tensor | None = None, source_noise: Tensor | None = None,
-              phase: Tensor | None = None, phase_frames: int = 0) -> Tensor:
+              phase: Tensor | None = None, phase_frames: int = 0, warp=None) -> Tensor:
         """Returns audio ``[b, 1, return_length * upp]`` at the model sample rate.
+
+        ``warp`` (``synthesis.formant.FormantWarp`` built for the decoded frame count,
+        ``return_length + dec_context`` or the whole window) shifts the formants; the
+        caller has already set the coarse pitch to ``pitch / factor``.
 
         ``dec_context`` frames ahead of the tail are decoded too and their samples dropped.
         The receptive field of the decoder is roughly +-90 ms; without left context a short
@@ -107,12 +111,12 @@ class Synthesizer(nn.Module):
         z, g = self.infer_latent(phone, lengths, pitch, sid, skip_head, return_length,
                                  dec_context, noise)
         if not self.has_f0:
-            audio = self.dec(z, g=g)
+            audio = self.dec(z, g=g, warp=warp)
         else:
             if return_length is not None:
                 pitchf = pitchf[:, skip_head - dec_context:skip_head + return_length]
             audio = self.dec(z, pitchf, g=g, source_noise=source_noise, phase=phase,
-                             phase_frames=phase_frames)
+                             phase_frames=phase_frames, warp=warp)
         return audio[:, :, dec_context * self.upp:]
 
 

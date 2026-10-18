@@ -228,6 +228,7 @@ class InferenceWorker(threading.Thread):
             self.params = params
             if self.pipeline.set_params(params):
                 self._recapture("f0_unvoiced changed")
+            self._sync_formant()
         gate = self._pending_gate
         if gate is not None:
             self._pending_gate = None
@@ -372,6 +373,39 @@ class InferenceWorker(threading.Thread):
         self.pipeline.on_onset()  # carried sine phase restarts with the new graphs
         self.log(f"worker: recaptured graphs ({why}) in "
                  f"{(time.perf_counter() - start) * 1000:.0f} ms")
+
+    def _sync_formant(self) -> None:
+        """A new formant step: swap to its cached synth graph between hops (silent), or
+        on a first visit capture it with the voice faded out around the capture, the way a
+        hop change does (docs/DEVIATIONS.md §12)."""
+        if not self.graphs.formant_needs_capture():
+            self.graphs.sync_formant()
+            return
+        start = time.perf_counter()
+        self._fade_out()
+        outcome = self.graphs.sync_formant()
+        self._resume()
+        self.log(f"worker: formant {self.pipeline.formant_st:+g} st: synth graph {outcome} "
+                 f"in {(time.perf_counter() - start) * 1000:.0f} ms")
+
+    def _fade_out(self) -> None:
+        """Close the voice cleanly: fade the SOLA tail into the output ring, reset the gate
+        (it reopens with the usual onset fade once the capture is done)."""
+        if self.gate.open:
+            self.sola.begin_drain()
+            while self.sola.draining:
+                self._host_out.copy_(self.sola.drain_step())
+                self.out_ring.write(self._host_out_np)
+            self.gate.reset()
+
+    def _resume(self) -> None:
+        """After a stall: drop the input that piled up (keep one hop) and refill the
+        output to the target, so the stall does not stay behind as latency."""
+        dropped = self.in_ring.keep_latest(self.plan.block)
+        self.stats.dropped_input_samples += dropped
+        self.out_ring.drop(self.out_ring.available())
+        self._prefill(self.fill_target)
+        self.pipeline.on_onset()
 
     def _rebuild(self, request: ShapeRequest) -> None:
         """Apply a restart-class change in place: drain, replan, recapture, resume."""

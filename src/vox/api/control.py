@@ -194,8 +194,23 @@ class LiveSession:
         if self.worker is not None:
             self.worker.stop()
 
+    def index_info(self) -> dict[str, Any]:
+        """Whether the active model's retrieval index is loaded on the GPU (the only way
+        the index rate can change anything), with its file, size and the rate in use."""
+        e = self.engine
+        index = getattr(getattr(e, "pipeline", None), "index", None)
+        path = getattr(getattr(e, "loaded", None), "index_path", None)
+        rate = getattr(getattr(self.worker, "params", None), "index_rate", 0.0)
+        return {"loaded": index is not None, "file": path.name if path else None,
+                "vectors": index.ntotal if index is not None else 0,
+                "dim": index.dim if index is not None else 0, "rate": rate}
+
     def describe(self) -> str:
         e, cfg = self.engine, self.cfg
+        idx = self.index_info()
+        index_text = (f"index {idx['file']} {idx['vectors']}x{idx['dim']} rate "
+                      f"{idx['rate']:.2f}" if idx["loaded"]
+                      else "index none" + (f" ({idx['file']} not loaded)" if idx["file"] else ""))
         plan = self.worker.plan  # the active plan: ``engine.plan`` is the one at start
         src = (f"file {cfg.input_file.name}" if cfg.input_file is not None
                else f"{self.in_device.index} {self.in_device.name}")
@@ -204,6 +219,7 @@ class LiveSession:
                 f" | hop {plan.block_ms:.0f} ms, overlap {plan.overlap_ms:.0f}, search "
                 f"{plan.search_ms:.0f}, extra {plan.extra_ms:.0f} | f0 "
                 f"{self.worker.params.f0_method} | "
+                f"{index_text} | formant {getattr(self.worker.params, 'formant_st', 0.0):+g} st | "
                 f"mode {e.mode} | gate {'on' if cfg.gate.enabled else 'off'} | "
                 f"suppression {'on' if self.suppression else 'off'} | "
                 f"fill target {1000 * self.worker.fill_target / plan.device_sr:.0f} ms | "
@@ -255,6 +271,7 @@ class LiveSession:
             "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._record_started)),
             "model": self.cfg.model, "input": self.describe(),
             "params": dataclasses.asdict(w.params),
+            "index": self.index_info(),
             "shape": dataclasses.asdict(w.shape),
             "gate": dataclasses.asdict(w.gate.config),
             "conditioning": dataclasses.asdict(self.cfg.conditioning),

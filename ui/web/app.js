@@ -19,6 +19,7 @@ let lastScreen = null;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const signed = (n) => (n > 0 ? "+" : "") + Math.round(n);
+const formantText = (st) => (st === 0 ? "0 st" : (st > 0 ? "+" : "") + st.toFixed(1) + " st");
 const fixed = (n, d = 1) => (n == null ? "–" : Number(n).toFixed(d));
 
 // ---------------------------------------------------------------- transport
@@ -184,6 +185,8 @@ function render() {
     badge.textContent = sing ? "sing default" : calibrated ? "auto · calibrated" : "profile default";
     badge.disabled = true;
     document.querySelectorAll("#preset [data-preset]").forEach((b) => b.classList.toggle("on", b.dataset.preset === params.preset));
+    setValue($("formant"), params.formant || 0);
+    if (document.activeElement !== $("formant")) $("formant-value").textContent = formantText(params.formant || 0);
     setValue($("index-rate"), Math.round(params.index_rate * 100));
     $("index-rate-value").textContent = fixed(params.index_rate, 2);
     setValue($("protect"), Math.round(params.protect * 100));
@@ -206,6 +209,7 @@ function render() {
       : "No calibration yet: the full " + lo + "–" + hi + " Hz range is tracked.";
   }
   $("pitch").disabled = !params;
+  $("formant").disabled = !params;
   document.querySelectorAll("#preset [data-preset]").forEach((b) => { b.disabled = !params; });
   $("conversion-badge").hidden = !calibrated || sing;
   $("preset-badge").hidden = !sing;
@@ -544,6 +548,15 @@ function wire() {
 
   const sendPitch = throttled((v) => cmd("set_param", { name: "pitch", value: v }));
   $("pitch").addEventListener("input", (e) => { $("pitch-value").textContent = signed(+e.target.value); sendPitch(+e.target.value); });
+  // Formant: each value is its own engine shape (a first visit pauses the voice briefly), so
+  // it is sent when the slider is let go, not on every step it passes.
+  $("formant").addEventListener("input", (e) => { $("formant-value").textContent = formantText(+e.target.value); });
+  $("formant").addEventListener("change", (e) => cmd("set_param", { name: "formant", value: +e.target.value }));
+  $("formant").addEventListener("dblclick", () => {
+    $("formant").value = 0;
+    $("formant-value").textContent = formantText(0);
+    cmd("set_param", { name: "formant", value: 0 });
+  });
   const sendGate = throttled((v) => cmd("set_gate", { threshold_dbfs: v }));
   $("gate-threshold").addEventListener("input", (e) => {
     const v = +e.target.value;
