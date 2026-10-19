@@ -167,12 +167,18 @@ def _settle_s(plan) -> float:
     return plan.context_ms / 1000.0 + 0.5
 
 
-def _quality(reference: np.ndarray, result, sr: int, start_s: float) -> dict[str, float]:
-    from vox.offline.metrics import boundary_click_ratio, compare
+def _quality(reference: np.ndarray, result, sr: int, start_s: float,
+             seam: bool = True) -> dict[str, float]:
+    from vox.offline.metrics import boundary_click_ratio, compare, seam_prominence
 
     stream = result.aligned[:len(reference)]
     out = compare(reference, stream, sr, lag_search_ms=15.0, start_s=start_s)
     out["click_ratio"] = boundary_click_ratio(result.audio, result.plan.block)
+    if seam:  # seam-rate modulation prominence, stream and whole-file (docs/DEVIATIONS.md §13)
+        begin = int(start_s * sr)
+        hop_ms = result.plan.block_ms
+        out["seam_db"] = seam_prominence(stream[begin:], sr, hop_ms)["seam_db"]
+        out["seam_full_db"] = seam_prominence(reference[begin:], sr, hop_ms)["seam_db"]
     return out
 
 
@@ -548,7 +554,8 @@ def cmd_ab(args) -> int:
         rows.append(row)
         if name in quality_rows:
             quality_rows[name].extra.update(click=row["click"], r3=row["r3_ratio"],
-                                            hf_lf=row["hf_lf"])
+                                            hf_lf=row["hf_lf"],
+                                            seam_db=quality.get("seam_db", float("nan")))
         _record("ab", {"model": args.model, "audio": str(args.audio), "pitch": args.pitch,
                        "overrides": _overrides(args), "variant": name,
                        "shape": shape_kw, "params": param_kw, "conditioning": cond_kw,
@@ -575,7 +582,8 @@ def cmd_ab(args) -> int:
         print("\nPhase 0 quality (" + ", ".join(sorted(kit.enable)) + "):\n")
         print(quality_mod.table(quality_rows, extra=(("click", "click", "{:.2f}"),
                                                      ("R3 x", "r3", "{:.2f}"),
-                                                     ("HF/LF", "hf_lf", "{:+.1f}"))))
+                                                     ("HF/LF", "hf_lf", "{:+.1f}"),
+                                                     ("seam dB", "seam_db", "{:+.1f}"))))
     if args.pairs and len(names) > 1:
         pairs = [quality_mod.Pair(names[0], other, f"{AB_VARIANTS[names[0]][3]} vs "
                                   f"{AB_VARIANTS[other][3]}") for other in names[1:]]
@@ -674,7 +682,7 @@ def cmd_quality(args) -> int:
     from quality import MATRIX_PAIRS_SEED, Pair, table, wer, write_pairs
     from vox.audio.resample import load_audio
     from vox.models.registry import ModelRegistry
-    from vox.offline.metrics import active_frames, boundary_click_ratio
+    from vox.offline.metrics import active_frames, boundary_click_ratio, seam_prominence
 
     if not args.files:
         raise SystemExit("quality: give --files a.wav,b.wav")
@@ -699,12 +707,15 @@ def cmd_quality(args) -> int:
         scores = kit.score(audio, sr, reference_text=script, mic_wer=mic_wer, targets=targets,
                            mask=active_frames(audio, sr))
         scores.extra["click"] = boundary_click_ratio(audio, int(round(sr * args.block_ms / 1000)))
+        scores.extra["seam_db"] = seam_prominence(audio, sr, args.block_ms)["seam_db"]
         rows[name] = scores
         print(f"[{name}] {scores.transcript!r}" if scores.transcript else f"[{name}]",
               flush=True)
         _record("quality", {"file": str(path), "model": args.model, **scores.as_dict()})
     print()
-    print(table(rows, extra=(("click", "click", "{:.2f}"),)))
+    print(table(rows, extra=(("click", "click", "{:.2f}"), ("seam dB", "seam_db", "{:+.1f}"))))
+    print(f"(seam dB: envelope modulation at the {1000 / args.block_ms:.1f} Hz hop rate over "
+          "its neighbouring floor; compare with the whole-file render of the same take)")
     if args.pairs:
         names = list(files)
         pairs = [Pair(names[0], other, f"{names[0]} vs {other}") for other in names[1:]]
@@ -1019,7 +1030,9 @@ def cmd_underrun(args) -> int:
         for extra in extras:
             for hop in hops:
                 engine = _engine(args, registry, cache, {"block_ms": hop, "extra_ms": extra})
-                result = StreamSimulator(engine).run(audio, realtime=True, seed=0)
+                result = StreamSimulator(engine).run(audio, realtime=True, seed=0,
+                                                     fill_rule=args.fill_rule,
+                                                     fill_margin_ms=args.fill_margin_ms)
                 table = stage_table(engine.timers, SKIP)
                 host = table["total"]["host"]
                 gpu = {k: v.get("gpu", {}).get("p50") for k, v in table.items()
@@ -1029,10 +1042,11 @@ def cmd_underrun(args) -> int:
                        "p99": host["p99"], "max": host["max"],
                        "underruns": result.underruns, "underrun_t": times[:20],
                        "deadline_misses": result.deadline_misses, "gpu_p50": gpu,
-                       "broadcast_load": bool(args.broadcast_load)}
+                       "broadcast_load": bool(args.broadcast_load),
+                       "fill_rule": args.fill_rule, "fill_margin_ms": args.fill_margin_ms}
                 rows.append(row)
                 _record("underrun", row)
-                print(f"[{args.model} hop {hop:g} extra {extra:g}"
+                print(f"[{args.model} hop {hop:g} extra {extra:g} fill {args.fill_rule}"
                       f"{' +Broadcast' if side else ''}] p50 {host['p50']:.1f} p99 "
                       f"{host['p99']:.1f} ms (budget {hop:g}); underruns {result.underruns}"
                       f"{' at ' + ', '.join(f'{t:.1f}s' for t in times[:8]) if times else ''};"
@@ -1935,6 +1949,10 @@ def main() -> int:
                         help="underrun: comma-separated context (extra) sizes in ms")
     parser.add_argument("--broadcast-load", action="store_true",
                         help="underrun: hold the NVIDIA Broadcast mic open meanwhile")
+    parser.add_argument("--fill-rule", choices=("legacy", "hop_plus"), default="legacy",
+                        help="underrun: output-ring fill rule (docs/DEVIATIONS.md 13)")
+    parser.add_argument("--fill-margin-ms", type=float, default=20.0,
+                        help="underrun: hop_plus margin")
     parser.add_argument("--vowel", type=Path, default=None,
                         help="suppress: a sung recording; band loss is measured on its held "
                              "notes")

@@ -88,6 +88,11 @@ class RuntimeParams:
     # hop seams on held notes; 1 = upstream (docs/DEVIATIONS.md §8.4)
     f0_trim_tail: int = 2
     sine_phase_carry: bool = True  # NSF sine phase continuous across hops (8.8)
+    # ContentVec conv-layer-0 normalisation (docs/DEVIATIONS.md §13): "window" = the
+    # checkpoint's GroupNorm over the window's time axis; "frozen" = per-channel statistics
+    # measured once (models/_embedders/contentvec/frozen_norm.pt). Restart-class: set at
+    # engine build (features/contentvec.py).
+    contentvec_norm: str = "window"
     # Auto pitch (docs/DEVIATIONS.md §9): "fixed" transposes by f0_up_key; "auto" measures
     # the talker's register (a running mean of log F0, time constant pitch_follow_s) and
     # transposes it onto target_f0_hz, keeping the intonation (pitch_range 1.0; lower

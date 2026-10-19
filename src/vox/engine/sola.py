@@ -116,10 +116,11 @@ class Sola:
         """0-dim device tensor: the best alignment offset in ``[0, search]``, or the
         previous hop's offset while its score is within ``hold_eps`` of the best."""
         score = self.scores(infer)
-        best = torch.argmax(score)
-        prev = self.prev_offset[0]
-        hold = score[prev] >= score[best] - self._hold_eps
-        return torch.where(hold, prev, best)
+        best = torch.argmax(score).view(1)
+        # index_select, not score[prev]: a tensor index would be read back as a host int
+        # (a sync, and not permitted inside a graph capture)
+        held = score.index_select(0, self.prev_offset) >= score.max() - self._hold_eps
+        return torch.where(held, self.prev_offset, best).view(())
 
     @torch.inference_mode()
     def stitch(self, infer: Tensor) -> Tensor:

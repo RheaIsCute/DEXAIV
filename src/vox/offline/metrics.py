@@ -223,3 +223,142 @@ def zero_runs(audio: np.ndarray, min_samples: int) -> list[tuple[int, int]]:
     starts, ends = edges[0::2], edges[1::2]
     keep = ends - starts >= min_samples
     return list(zip(starts[keep].tolist(), ends[keep].tolist()))
+
+
+# ------------------------------------------------------------ seam-rate modulation prominence
+# Report 18 §E11 / brief 16: a streamed render joins a render every hop, so whatever the two
+# renders disagree on shows up as an amplitude modulation at the hop rate (50 Hz at a 20 ms
+# hop: the ear's roughness band). Log-mel L1 averages it away inside its 25 ms frames; the
+# envelope spectrum within critical bands sees it directly.
+
+SEAM_BAND_LOW_HZ = 200.0
+SEAM_BANDS = 17  # 1/3-octave centres 200 Hz .. ~8 kHz (fewer when sr / 2 is lower)
+SEAM_ENV_SR = 1000  # envelope sample rate
+
+
+def third_octave_bands(sr: int, low_hz: float = SEAM_BAND_LOW_HZ, count: int = SEAM_BANDS
+                       ) -> list[tuple[float, float]]:
+    """``(lo, hi)`` edges of 1/3-octave bands from ``low_hz`` up, below 0.45 x sr."""
+    edges = []
+    for k in range(count):
+        centre = low_hz * 2.0 ** (k / 3.0)
+        lo, hi = centre / 2.0 ** (1.0 / 6.0), centre * 2.0 ** (1.0 / 6.0)
+        if hi >= 0.45 * sr:
+            break
+        edges.append((lo, hi))
+    return edges
+
+
+def band_envelopes(audio: np.ndarray, sr: int, bands: list[tuple[float, float]] | None = None,
+                   env_sr: int = SEAM_ENV_SR) -> np.ndarray:
+    """``[bands, samples @ env_sr]`` Hilbert envelopes of the 1/3-octave band signals."""
+    from fractions import Fraction
+
+    from scipy import signal
+
+    bands = bands or third_octave_bands(sr)
+    x = np.ascontiguousarray(audio, dtype=np.float64)
+    ratio = Fraction(env_sr, sr)
+    out = []
+    for lo, hi in bands:
+        sos = signal.butter(4, [lo, hi], btype="bandpass", fs=sr, output="sos")
+        y = signal.sosfiltfilt(sos, x)
+        env = np.abs(signal.hilbert(y))
+        out.append(signal.resample_poly(env, ratio.numerator, ratio.denominator))
+    return np.stack(out)
+
+
+def seam_prominence(audio: np.ndarray, sr: int, hop_ms: float, block_ms: float = 400.0,
+                    harmonics: int = 3, env_sr: int = SEAM_ENV_SR,
+                    envelopes: np.ndarray | None = None) -> dict[str, float]:
+    """Seam-rate modulation prominence, dB: the envelope-spectrum peak at the hop rate
+    (and its first harmonics) over the neighbouring modulation floor, per 1/3-octave band,
+    per ``block_ms`` block (Hann, half overlap), energy-weighted over bands and averaged
+    over speech blocks (block energy above the median).
+
+    ``seam_db`` is the fundamental (50 Hz at hop 20, 25 at 40, 16.7 at 60), ``seam_h2_db``
+    / ``seam_h3_db`` its harmonics, ``seam_sum_db`` the three peaks' summed power over the
+    summed floors; ``seam_depth_pct`` reads the fundamental as an AM depth (the quantity
+    ``impose_am`` imposes: on speech the floor-relative dB compress, a 20 % dip reading
+    ~+3 dB, while the depth tracks it ~linearly on top of the talker's own modulation).
+    Only bands at least 2.5 x the hop rate wide take part (narrower filters remove the AM
+    sidebands). The floor of each harmonic is the median envelope power within
+    +-0.4 x hop rate of it, excluding the peak's own bins, so the talker's syllabic
+    modulation (2-10 Hz) stays out of the comparison. Compare against the whole-file
+    render of the same take: a value near the whole-file's means no seam modulation the
+    metric can see. Calibrated on imposed AM (``impose_am``): docs/DEVIATIONS.md §13.
+    """
+    f_hop = 1000.0 / hop_ms
+    env = band_envelopes(audio, sr, env_sr=env_sr) if envelopes is None else envelopes
+    # A band narrower than ~2.5 x the hop rate cannot carry that rate's AM sidebands (its
+    # filter removes them), so at 50 Hz the bands below ~500 Hz are left out.
+    wide = [i for i, (lo, hi) in enumerate(third_octave_bands(sr)) if hi - lo >= 2.5 * f_hop]
+    env = env[wide] if len(wide) < env.shape[0] else env
+    block = max(16, int(round(env_sr * block_ms / 1000.0)))
+    hop = block // 2
+    nan = float("nan")
+    if env.shape[1] < block:
+        return {"seam_db": nan, "seam_h2_db": nan, "seam_h3_db": nan, "seam_sum_db": nan,
+                "hop_rate_hz": f_hop, "blocks": 0}
+    window = np.hanning(block)
+    freqs = np.fft.rfftfreq(block, 1.0 / env_sr)
+    df = freqs[1]
+    starts = np.arange(0, env.shape[1] - block + 1, hop)
+    peaks = np.full((len(starts), harmonics), nan)
+    floors = np.full((len(starts), harmonics), nan)
+    depth = np.full(len(starts), nan)  # AM depth at the hop rate, 0-1
+    energy = np.zeros(len(starts))
+    for i, s in enumerate(starts):
+        seg = env[:, s:s + block]
+        mean = seg.mean(axis=1)
+        weight = mean ** 2  # band energy in the block
+        energy[i] = weight.sum()
+        if energy[i] <= 0:
+            continue
+        weight = weight / weight.sum()
+        spectrum = np.fft.rfft((seg - mean[:, None]) * window, axis=1)
+        spec = np.abs(spectrum) ** 2
+        for k in range(1, harmonics + 1):
+            f = k * f_hop
+            near = np.abs(freqs - f) <= 1.5 * df
+            around = (np.abs(freqs - f) <= 0.4 * f_hop) & ~near & (freqs > 0)
+            if not near.any() or around.sum() < 3:
+                continue
+            peak = spec[:, near].max(axis=1)
+            floor = np.median(spec[:, around], axis=1)
+            peaks[i, k - 1] = float((weight * peak).sum())
+            floors[i, k - 1] = float((weight * floor).sum())
+            if k == 1:
+                # a dip of depth d once per period is a cosine of amplitude d/2 x the mean
+                # envelope: |X| = (d/2) x mean x sum(window) / 2
+                amplitude = np.abs(spectrum[:, near]).max(axis=1)
+                d = 4.0 * amplitude / (np.maximum(mean, 1e-12) * window.sum())
+                depth[i] = float((weight * d).sum())
+    speech = energy > np.median(energy)
+    if not speech.any():
+        speech = energy > 0
+    p, f = peaks[speech], floors[speech]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per_block = 10.0 * np.log10(p / f)
+        total = 10.0 * np.log10(np.nansum(p, axis=1) / np.nansum(f, axis=1))
+
+    def mean_db(column: int) -> float:
+        if column >= harmonics or np.isnan(per_block[:, column]).all():
+            return nan
+        return float(np.nanmean(per_block[:, column]))
+
+    return {"seam_db": mean_db(0), "seam_h2_db": mean_db(1), "seam_h3_db": mean_db(2),
+            "seam_sum_db": float(np.nanmean(total)) if np.isfinite(total).any() else nan,
+            # the fundamental's AM depth in %, the same quantity ``impose_am`` imposes
+            "seam_depth_pct": float(100.0 * np.nanmean(depth[speech]))
+            if np.isfinite(depth[speech]).any() else nan,
+            "hop_rate_hz": f_hop, "blocks": int(speech.sum())}
+
+
+def impose_am(audio: np.ndarray, sr: int, rate_hz: float, depth: float) -> np.ndarray:
+    """``audio`` with a raised-cosine amplitude dip of ``depth`` (0-1) once per period of
+    ``rate_hz``: the gain runs between ``1 - depth`` and 1. The calibration signal for
+    ``seam_prominence``."""
+    t = np.arange(len(audio)) / sr
+    gain = 1.0 - depth * 0.5 * (1.0 - np.cos(2 * np.pi * rate_hz * t))
+    return (audio * gain).astype(np.float32)

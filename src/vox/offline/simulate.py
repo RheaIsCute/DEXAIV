@@ -113,6 +113,15 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
     # Off until warmup's ladder picks a candidate (or the profile already did). A build
     # without warmup (the full-file converter, ``vox say``) therefore runs HuBERT in FP32.
     embedder.autocast = "off"
+    if embedder.has_group_norm:
+        stats = None
+        if params.contentvec_norm == "frozen":
+            stats = ContentVec.load_norm_stats(Path(models_dir))
+            if stats is None:
+                raise FileNotFoundError(
+                    f"contentvec_norm='frozen' needs {ContentVec.norm_stats_path(models_dir)} "
+                    "(vox bench drift --store-norm measures it on a take)")
+        embedder.set_norm(params.contentvec_norm, stats)
     extractor = None
     f0_tail = 0
     if model.has_f0:
@@ -219,7 +228,7 @@ class StreamSimulator:
             sync_debug: bool = False, reset: bool = True, seed: int | None = 0,
             gate: bool = False, fill_ms: float | None = None,
             condition: bool = True, fill_rule: str = "legacy",
-            fill_margin_ms: float = 20.0) -> SimResult:
+            fill_margin_ms: float = 20.0, on_hop=None) -> SimResult:
         """Feed ``audio`` (mono float32 at the device rate) through the engine.
 
         ``sync_debug`` makes any implicit host<->device synchronisation inside the hop raise
@@ -232,6 +241,9 @@ class StreamSimulator:
         ``chunker.fill_target_ms``) to count underruns.
         Gate transitions and underruns are logged in ``engine.timers.events`` with stream
         time (hop index x hop duration) and returned in ``SimResult.events``.
+        ``on_hop(n)`` is called after every hop the model ran (the pipeline's buffers hold
+        that hop's features and pitch): the drift measurement's probe (``offline/drift.py``).
+        It syncs with the device, so a run with it is not a timing run.
         """
         engine = self.engine
         plan, pipeline, sola, timers = engine.plan, engine.pipeline, engine.sola, engine.timers
@@ -306,6 +318,8 @@ class StreamSimulator:
                     infer = pipeline.process_hop()
                     with timers.stage("sola"):
                         stitched = sola.stitch(infer)
+                    if on_hop is not None:
+                        on_hop(n)
                 else:
                     # Gate closed: the Applio protocol (engine/gate.py module docstring).
                     if decision.drain:

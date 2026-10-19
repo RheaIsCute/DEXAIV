@@ -315,7 +315,8 @@ class HopPipeline:
             self.plan, id(self.model), id(self.embedder), id(self.extractor),
             id(self.index), self._interp, self._bridge, self._trim_tail, self._phase_carry,
             self.model.decoder_fp16,
-            getattr(self.embedder, "autocast", None), self.post.rms_mix.graph_safe,
+            getattr(self.embedder, "autocast", None), getattr(self.embedder, "norm_mode", None),
+            self.post.rms_mix.graph_safe,
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
             torch.backends.cudnn.benchmark,
         )
