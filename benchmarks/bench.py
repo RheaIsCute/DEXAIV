@@ -34,6 +34,9 @@ the stream simulator; there is no separate batch path.
                                       pitch kept, F1/F2 moved, seams, synth cost -> out/ab/formant
     vox bench index                   index_rate 0/0.3/0.6/1.0 on a raw-mic take (same seed,
                                       seed floor): does the index change anything? -> out/ab/index
+    vox bench drift                   feature / F0 drift by age (0/20/40/80 ms from the window's
+                                      end) vs the whole-file features and F0 of the same frames;
+                                      --store-norm measures the frozen ContentVec norm statistics
 
 Results are appended to benchmarks/results/<name>.jsonl with the environment fingerprint.
 """
@@ -1603,6 +1606,41 @@ def cmd_index(args) -> int:
 # --------------------------------------------------------------------------------- perf
 
 
+def cmd_drift(args) -> int:
+    """Report 18 F8 / docs/DEVIATIONS.md 13: how far the ContentVec feature and the cached F0
+    of a frame are from the whole-file values when the frame is 0 / 20 / 40 / 80 ms old
+    (``--ages``), at ``--right`` ms of lookahead and with ``--norm window|frozen``.
+    ``--store-norm`` first measures conv layer 0's statistics on ``--audio`` and stores them
+    where ``contentvec_norm="frozen"`` loads them."""
+    from vox.audio.resample import resample_array
+    from vox.features.contentvec import ContentVec
+    from vox.offline.drift import measure_drift
+
+    audio, registry, cache = _setup(args)
+    if args.store_norm:
+        engine = _engine(args, registry, cache)
+        wave = torch.from_numpy(resample_array(audio, 48000, 16000).astype(np.float32))
+        stats = engine.pipeline.embedder.measure_norm_stats(wave.to(engine.device))
+        path = ContentVec.save_norm_stats(args.models_dir, stats)
+        print(f"frozen norm statistics from {args.audio.name} ({len(audio) / 48000:.0f} s) "
+              f"-> {path}")
+        engine.graphs.release()
+        del engine
+    engine = _engine(args, registry, cache, {"extra_right_ms": args.right},
+                     contentvec_norm=args.norm)
+    ages = tuple(int(float(a)) for a in args.ages.split(","))
+    result = measure_drift(engine, audio, ages_ms=ages, start_s=_settle_s(engine.plan))
+    print(f"[{args.model} hop {engine.plan.block_ms:g} right {args.right:g} norm {args.norm}] "
+          f"{result.frames} frames per age; ages from the window's end (the kept region's "
+          f"newest frame has age {engine.plan.right_ms:g} ms)\n")
+    print(result.table())
+    _record("drift", {"model": args.model, "audio": str(args.audio), "right": args.right,
+                      "norm": args.norm, "ages": ages, "feature": result.feature,
+                      "f0": result.f0, "f0_lagged": result.f0_lagged, "frames": result.frames})
+    engine.graphs.release()
+    return 0
+
+
 def cmd_perf(args) -> int:
     import yaml
 
@@ -1904,7 +1942,7 @@ def main() -> int:
                                             "block", "decctx", "envelope", "gate",
                                             "graph-probe", "sing", "onset", "suppress",
                                             "underrun", "quality", "target-f0", "take",
-                                            "formant", "index"))
+                                            "formant", "index", "drift"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--audio", type=Path, default=DEFAULT_AUDIO)
@@ -1987,6 +2025,14 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="target-f0: write nothing")
     parser.add_argument("--formants", default="-2,-1,0,1,2,4",
                         help="formant: steps in semitones (wavs for |step| <= 2)")
+    parser.add_argument("--right", type=float, default=0.0,
+                        help="drift: extra_right_ms (lookahead) of the engine under test")
+    parser.add_argument("--ages", default="0,20,40,80",
+                        help="drift: frame ages in ms from the window's end")
+    parser.add_argument("--norm", choices=("window", "frozen"), default="window",
+                        help="drift: ContentVec conv-layer-0 normalisation")
+    parser.add_argument("--store-norm", action="store_true",
+                        help="drift: measure the frozen-norm statistics on --audio and store them")
     parser.add_argument("--matrix", action="store_true", help="take: record every cell")
     parser.add_argument("--plan", action="store_true", help="take: print the cells and exit")
     parser.add_argument("--analyze", type=Path, default=None,
@@ -2014,7 +2060,7 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=None,
                         help="take: where the matrix folder goes (default recordings/matrix_*)")
     args = parser.parse_args()
-    if args.command in ("formant", "index"):
+    if args.command in ("formant", "index", "drift"):
         if args.model == "base_f0_48k_v2":
             args.model = "Mom"
             if args.pitch == 0.0:
@@ -2037,7 +2083,8 @@ def main() -> int:
                "gate": cmd_gate, "graph-probe": cmd_graph_probe, "sing": cmd_sing,
                "onset": cmd_onset, "suppress": cmd_suppress,
                "underrun": cmd_underrun, "quality": cmd_quality, "target-f0": cmd_target_f0,
-               "take": cmd_take, "formant": cmd_formant, "index": cmd_index}[args.command]
+               "take": cmd_take, "formant": cmd_formant, "index": cmd_index,
+               "drift": cmd_drift}[args.command]
     return handler(args)
 
 
