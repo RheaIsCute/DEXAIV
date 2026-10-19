@@ -139,3 +139,62 @@ def test_decoder_context_is_clamped_to_the_available_history():
     assert default().dec_context == 0  # upstream behaviour by default
     assert default(decoder_context_ms=80).dec_context == 8
     assert default(extra_ms=50, decoder_context_ms=200).dec_context == 5  # skip_head is 5
+
+
+# ------------------------------------------------------------ right context (lookahead)
+
+
+@pytest.mark.parametrize("right_ms", [0, 20, 40, 80, 100])
+def test_right_context_extends_the_window_and_moves_the_kept_region(right_ms):
+    """convert = extra + right + crossfade + search + block; the kept region ends ``right``
+    before the window's end; the decoder renders those frames too and drops them."""
+    p = default(extra_ms=500, decoder_context_ms=80, extra_right_ms=right_ms)
+    r = right_ms // 10
+    assert p.right == r * 480 and p.right_frames == r
+    assert p.convert_16k == 16 * (500 + right_ms + 20 + 10 + 20)
+    assert p.convert_frames == 55 + r and p.p_len == p.convert_frames
+    assert p.return_length == 5  # the kept region itself is unchanged
+    assert p.skip_head == 50 and p.skip_head + p.return_length + p.right_frames == p.convert_frames
+    assert p.dec_context == 8
+    assert p.decode_frames == 5 + 8 + r
+    assert p.out_device == 2400 and p.decoder_out == 5 * 480  # emitted sizes unchanged
+    # latency: the stream trails the input by the overlap, the search and the lookahead
+    assert p.stream_delay == p.sola_buffer + p.sola_search + p.right
+    assert p.algorithmic_latency_ms == 20 + 20 + 10 + right_ms
+    assert p.right_ms == right_ms
+    assert p.hubert_phase_stable
+
+
+def test_right_context_from_shape_and_rounding():
+    from vox.config.schemas import ShapeParams
+
+    p = chunker.from_shape(ShapeParams(extra_right_ms=40), 48000)
+    assert p.right_frames == 4 and p.right == 4 * 480
+    assert default(extra_right_ms=14).right_frames == 1  # 10 ms units, half up
+    assert default(extra_right_ms=15).right_frames == 2
+    with pytest.raises(ChunkPlanError):
+        default(extra_right_ms=-10)
+
+
+def test_right_context_at_hop_40_and_with_the_f0_tail():
+    p = default(block_ms=40, crossfade_ms=40, extra_ms=1000, extra_right_ms=40,
+                f0_tail_16k=4960, decoder_context_ms=80)
+    assert p.sola_buffer == 4 * 480 and p.return_length == 4 + 4 + 1
+    assert p.skip_head == p.convert_frames - 9 - 4
+    assert p.history_16k == p.convert_16k  # the window is longer than the F0 tail
+    assert p.algorithmic_latency_ms == 40 + 40 + 10 + 40
+
+
+# ------------------------------------------------------------------- output-ring fill rule
+
+
+@pytest.mark.parametrize("block_ms, legacy, hop_plus", [(20, 50, 40), (40, 90, 60), (60, 130, 80),
+                                                       (200, 410, 220)])
+def test_fill_rules(block_ms, legacy, hop_plus):
+    assert chunker.fill_target_ms(block_ms, 10.0) == legacy
+    assert chunker.fill_target_ms(block_ms, 10.0, "legacy") == legacy
+    assert chunker.fill_target_ms(block_ms, 10.0, "hop_plus", 20.0) == hop_plus
+    assert chunker.fill_target_ms(block_ms, 10.0, "hop_plus", 30.0) == block_ms + 30
+    with pytest.raises(ChunkPlanError):
+        chunker.fill_target_ms(block_ms, 10.0, "twice")
+    assert chunker.FILL_RULES == ("legacy", "hop_plus")

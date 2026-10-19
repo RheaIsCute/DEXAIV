@@ -253,3 +253,90 @@ def test_stitch_never_synchronises_with_the_host(mode):
             sola.stitch(chunk)
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+# --------------------------------------------------------------- offset damping (hold)
+
+
+def test_hold_eps_zero_is_the_plain_argmax():
+    plan, sola = make()
+    gen = torch.Generator().manual_seed(7)
+    chunk = torch.randn(plan.out_device, generator=gen) * 0.1
+    sola.buffer.copy_(chunk[300:300 + sola.overlap])
+    sola.prev_offset.fill_(123)
+    assert sola.hold_eps == 0.0 and sola.find_offset(chunk).item() == 300
+
+
+def test_hold_keeps_the_previous_offset_within_eps_and_jumps_beyond_it():
+    """A 200 Hz sine: the previous offset one period away from the best scores within a
+    hair of it (both are phase-aligned); a quarter period away it scores ~0."""
+    plan, sola = make()
+    freq = 200.0  # period 240 samples
+    sola.buffer.copy_(sine(1000, sola.overlap, freq))
+    chunk = sine(1000 - 100, plan.out_device, freq)  # best offsets: 100 and 340
+    score = sola.scores(chunk)
+    assert score.shape[0] == sola.search + 1 and score.max() <= 1.0 + 1e-5
+    assert score[100] > 0.99 and score[340] > 0.99 and abs(score[160]) < 0.2
+    best = int(torch.argmax(score))
+    other = 340 if best == 100 else 100
+    sola.set_hold_eps(0.05)
+    sola.prev_offset.fill_(other)
+    assert sola.find_offset(chunk).item() == other  # held: within eps of the max
+    sola.prev_offset.fill_(160)
+    assert sola.find_offset(chunk).item() == best  # a quarter period off: jump
+    sola.set_hold_eps(0.0)
+    sola.prev_offset.fill_(160)
+    assert sola.find_offset(chunk).item() == best  # eps 0: argmax
+    with pytest.raises(ValueError):
+        sola.set_hold_eps(-1.0)
+
+
+def test_hold_reduces_offset_jumps_on_a_steady_tone_and_the_histograms_count_them():
+    """Coherent renders of a 50 Hz tone (period 960 > the search) with a little noise: the
+    correlation peak is broad, so the plain argmax wanders a few samples hop to hop on the
+    noise; with damping the offset is held while the wander is within eps."""
+    freq = 50.0
+    outcomes = {}
+    for eps in (0.0, 0.05):
+        plan, sola = make()
+        sola.set_hold_eps(eps)
+        gen = torch.Generator().manual_seed(1)
+        position = 0
+        for _ in range(60):
+            render = sine(position, plan.out_device, freq) + 0.1 * torch.randn(
+                plan.out_device, generator=gen)
+            sola.stitch(render)
+            position += plan.block
+        assert sola.offset_hist.sum().item() == 60 and sola.jump_hist.sum().item() == 60
+        jumps = sola.jumps_ms(SR)[2:]  # after the fade-in from silence
+        outcomes[eps] = float(np.mean(jumps > 0))
+    assert outcomes[0.0] > 0.5  # the plain argmax re-times most hops on the noise
+    assert outcomes[0.05] < 0.1
+
+
+def test_hold_state_resets_and_is_graph_state():
+    plan, sola = make()
+    sola.set_hold_eps(0.02)
+    sola.stitch(torch.randn(plan.out_device))
+    sola.stitch(torch.randn(plan.out_device))
+    assert sola.jump_hist.sum().item() == 2
+    state = sola.state_tensors()
+    assert any(t is sola.prev_offset for t in state) and any(t is sola.jump_hist for t in state)
+    sola.reset()
+    assert sola.prev_offset.item() == 0 and sola.jump_hist.sum().item() == 0
+    assert sola.hold_eps == 0.02  # the parameter survives a reset; only state is cleared
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("eps", [0.0, 0.05])
+def test_hold_never_synchronises_with_the_host(eps):
+    plan, sola = make(device="cuda")
+    sola.set_hold_eps(eps)
+    chunks = [torch.randn(plan.out_device, device="cuda") for _ in range(4)]
+    sola.stitch(chunks[0])
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for chunk in chunks[1:]:
+            sola.stitch(chunk)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

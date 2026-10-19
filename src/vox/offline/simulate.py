@@ -60,7 +60,8 @@ def tune_key(model_name: str, plan: ChunkPlan, params: RuntimeParams,
              precision: PrecisionParams) -> str:
     """Everything that fixes the hop's kernel shapes: the persisted decisions' key."""
     return (f"{model_name}|hop{plan.block_ms:g}|extra{plan.extra_ms:g}|"
-            f"xf{plan.overlap_ms:g}|search{plan.search_ms:g}|sr{plan.device_sr}|"
+            f"xf{plan.overlap_ms:g}|search{plan.search_ms:g}|"
+            f"{f'right{plan.right_ms:g}|' if plan.right else ''}sr{plan.device_sr}|"
             f"{params.f0_method}|dec{'16' if precision.decoder_fp16 else '32'}|"
             f"torch{torch.__version__}")
 
@@ -131,7 +132,7 @@ def load_engine(models_dir: Path, model_name: str, shape: ShapeParams | None = N
 
     timers = StageTimers(STAGES, device, capacity=defaults.PROFILER_RING)
     pipeline = HopPipeline(plan, model, embedder, extractor, device, params, timers, index)
-    sola = Sola(plan, device, params.sola_mode)
+    sola = Sola(plan, device, params.sola_mode, params.sola_hold_eps)
     stage_graphs = StageGraphs(pipeline, sola, precision.graphs)
     gate_config = gate or GateConfig()
     vad = None
@@ -175,6 +176,7 @@ class SimResult:
     closed_hop_ms: np.ndarray | None = None  # host ms of hops the gate skipped
     # Paced runs: underruns of a modelled output ring (``_PlayoutModel``); None otherwise.
     underruns: int | None = None
+    sola_jumps_ms: np.ndarray | None = None  # hop-to-hop |offset change| per hop
     events: list[dict] = field(default_factory=list)  # timers.events: gate / underrun log
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -216,7 +218,8 @@ class StreamSimulator:
     def run(self, audio: np.ndarray, realtime: bool = False, jitter_ms: float = 0.0,
             sync_debug: bool = False, reset: bool = True, seed: int | None = 0,
             gate: bool = False, fill_ms: float | None = None,
-            condition: bool = True) -> SimResult:
+            condition: bool = True, fill_rule: str = "legacy",
+            fill_margin_ms: float = 20.0) -> SimResult:
         """Feed ``audio`` (mono float32 at the device rate) through the engine.
 
         ``sync_debug`` makes any implicit host<->device synchronisation inside the hop raise
@@ -225,7 +228,8 @@ class StreamSimulator:
         block after ``engine.conditioner`` (the live input chain; ``condition=False``
         feeds the raw audio, as the engine did before it existed).
         ``realtime`` paces the input and models the output ring (fill target ``fill_ms``,
-        default two hops + a 10 ms callback, as ``LiveSession``) to count underruns.
+        default ``fill_rule`` / ``fill_margin_ms`` at a 10 ms callback, as ``LiveSession``:
+        ``chunker.fill_target_ms``) to count underruns.
         Gate transitions and underruns are logged in ``engine.timers.events`` with stream
         time (hop index x hop duration) and returned in ``SimResult.events``.
         """
@@ -265,8 +269,9 @@ class StreamSimulator:
         closed_ms: list[float] = []
         transitions = 0
         events = timers.events
-        fill = round(plan.device_sr * (fill_ms if fill_ms is not None
-                                       else 2 * plan.block_ms + 10.0) / 1000.0)
+        if fill_ms is None:
+            fill_ms = chunker.fill_target_ms(plan.block_ms, 10.0, fill_rule, fill_margin_ms)
+        fill = round(plan.device_sr * fill_ms / 1000.0)
         playout = _PlayoutModel(fill, block, plan.device_sr) if realtime else None
         underruns = 0
 
@@ -346,6 +351,7 @@ class StreamSimulator:
             rtf=compute / seconds,
             deadline_misses=timers.counters.deadline_misses,
             sola_offsets_ms=sola.offsets_ms(plan.device_sr),
+            sola_jumps_ms=sola.jumps_ms(plan.device_sr),
             alloc=self.alloc.summary(skip=min(defaults.PROFILER_WARMUP_HOPS, hops // 2)),
             pointers_stable=stable,
             gate_open=gate_open if silence_gate is not None else None,

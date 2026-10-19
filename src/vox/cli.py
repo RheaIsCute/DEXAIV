@@ -189,7 +189,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
                    "extra": f"{plan.extra_ms:.0f} ms", "f0": params.f0_method},
             alloc=result.alloc, sola_offsets_ms=result.sola_offsets_ms))
         print(f"RTF {result.rtf:.3f}   mode {engine.mode}   algorithmic latency "
-              f"{plan.algorithmic_latency_ms:.0f} ms (hop + overlap + search; device and "
+              f"{plan.algorithmic_latency_ms:.0f} ms (hop + overlap + search + lookahead; device and "
               f"ring terms come with live audio)")
     return 0
 
@@ -336,7 +336,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                      conditioning=args.conditioning_config, input=args.input,
                      output=args.output, exclusive=args.exclusive,
                      exclusive_input=args.exclusive_input, callback_ms=args.callback_ms,
-                     fill_target_ms=args.fill_ms, input_file=args.input_file,
+                     fill_target_ms=args.fill_ms, fill_rule=args.fill_rule,
+                     fill_margin_ms=args.fill_margin_ms, input_file=args.input_file,
                      loop_file=args.loop_file, device=args.device, profile_dir=args.profile,
                      suppression={"on": True, "off": False}.get(args.suppression),
                      suppression_profile=args.profile_obj.calibration.rnnoise_enabled,
@@ -454,7 +455,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="WASAPI exclusive on the input too; watch the INPUT RATE warning")
     p.add_argument("--callback-ms", type=float, default=10.0, help="device block (transport)")
     p.add_argument("--fill-ms", type=float, default=None,
-                   help="output ring fill target (default: two hops + callback block)")
+                   help="output ring fill target (default: --fill-rule)")
+    p.add_argument("--fill-rule", choices=("legacy", "hop_plus"), default="legacy",
+                   help="fill target rule: legacy = 2 x hop + callback; hop_plus = hop + "
+                        "--fill-margin-ms (docs/DEVIATIONS.md 13)")
+    p.add_argument("--fill-margin-ms", type=float, default=20.0)
     p.add_argument("--minutes", type=float, default=None, help="stop after this long")
     p.add_argument("--input-file", type=Path, default=None,
                    help="software microphone: feed this WAV at real-time pace instead")

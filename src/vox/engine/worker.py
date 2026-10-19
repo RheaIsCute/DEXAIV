@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -50,7 +51,7 @@ def _applied(shape: ShapeParams, plan: chunker.ChunkPlan) -> ShapeParams:
     return dataclasses.replace(shape, block_ms=plan.block_ms,
                                crossfade_ms=plan.ms(plan.crossfade),
                                sola_search_ms=plan.search_ms, extra_ms=plan.extra_ms,
-                               device_sr=plan.device_sr)
+                               extra_right_ms=plan.right_ms, device_sr=plan.device_sr)
 
 
 @dataclass
@@ -97,7 +98,8 @@ class InferenceWorker(threading.Thread):
                  out_ring: SPSCRing, hop_event: threading.Event, fill_target: int,
                  extractors: dict[str, PitchExtractor] | None = None,
                  log=print, conditioner: InputConditioner | None = None,
-                 shape: ShapeParams | None = None) -> None:
+                 shape: ShapeParams | None = None,
+                 fill_for_hop: Callable[[float], float] | None = None) -> None:
         super().__init__(name="vox-inference", daemon=True)
         self.pipeline = pipeline
         # The shape the hop runs at, as the chunker rounded it: replaced by ``_rebuild``
@@ -115,6 +117,8 @@ class InferenceWorker(threading.Thread):
         self.out_ring = out_ring
         self.hop_event = hop_event
         self.fill_target = fill_target
+        # hop ms -> fill target ms (the session's fill rule), for a live hop change
+        self.fill_for_hop = fill_for_hop
         self.extractors = extractors or {}
         self.log = log
         self.stats = WorkerStats()
@@ -189,6 +193,7 @@ class InferenceWorker(threading.Thread):
         parts = {
             "hop": plan.block_ms, "input_backlog": s.in_backlog_ms, "compute": compute_p50_ms,
             "output_ring": s.out_fill_ms, "sola": plan.overlap_ms + plan.search_ms,
+            "lookahead": plan.right_ms,  # extra_right_ms: the kept region's right context
             "devices": device_ms,
             # RNNoise's own delay while suppression runs (audio/suppression.py)
             "input_chain": self.conditioner.delay_ms if self.conditioner is not None else 0.0,
@@ -237,6 +242,7 @@ class InferenceWorker(threading.Thread):
                 self._fade_out()
             if self.pipeline.set_params(params):
                 self._recapture("f0_unvoiced changed")
+            self.sola.set_hold_eps(params.sola_hold_eps)
             outcome = self.graphs.sync_formant()
             if heavy:
                 self._resume()
@@ -435,14 +441,18 @@ class InferenceWorker(threading.Thread):
         pipeline.set_plan(plan)
         pipeline.set_params(self.params)
         mode = request.sola_mode or self.sola.mode
-        self.sola = Sola(plan, pipeline.device, mode)
+        self.sola = Sola(plan, pipeline.device, mode, self.params.sola_hold_eps)
         self.graphs.sola = self.sola
         self.gate = SilenceGate(plan, self.gate.config, self.gate.vad)
         if self.conditioner is not None:
             self.conditioner.resize(plan.block)  # filter state and level carry over
         self._alloc()
         if plan.block != old_plan.block:
-            self.fill_target = int(round(self.fill_target * plan.block / old_plan.block))
+            if self.fill_for_hop is not None:
+                self.fill_target = int(round(plan.device_sr * self.fill_for_hop(plan.block_ms)
+                                             / 1000.0))
+            else:
+                self.fill_target = int(round(self.fill_target * plan.block / old_plan.block))
         # 4. warm up and capture at the new shapes (resets pipeline + SOLA state)
         warmup.run(pipeline, self.sola, 3, self.graphs, log=self.log)
         # 5. the input piled up meanwhile: keep one hop, refill the output to target

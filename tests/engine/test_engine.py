@@ -199,6 +199,9 @@ def test_pitch_cache_matches_full_window_f0(engine, clip_48k):
     (dict(), dict(f0_method="fcpe")),
     # the Step 2 A/B settings (docs/DEVIATIONS.md §7), all at once
     (dict(embed_pad_ms=15.0, decoder_context_ms=80.0), dict(noise_roll=True, f0_bridge_ms=60.0)),
+    # right context (docs/DEVIATIONS.md §13): lookahead at hop 20 and at hop 40 + overlap 40
+    (dict(extra_right_ms=40.0), dict(volume_envelope=0.5)),
+    (dict(block_ms=40, crossfade_ms=40, extra_right_ms=100.0, decoder_context_ms=120.0), {}),
 ])
 def test_other_plans_and_params_run_clean(device, cache, clip_48k, shape, params):
     engine = load_engine(MODELS, TEST_MODEL, dataclasses.replace(defaults.DEFAULT_SHAPE, **shape),

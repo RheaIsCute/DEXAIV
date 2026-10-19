@@ -166,7 +166,7 @@ class HopPipeline:
         # hop's decoded slice starts; written by the synth stage, zeroed at gate onsets.
         self.sine_phase = torch.zeros(1, 1, 1, device=dev)
         latent, source = self.model.noise_shapes(p.p_len, p.skip_head, p.return_length,
-                                                 p.dec_context)
+                                                 p.dec_context, p.right_frames)
         self.noise_z = torch.zeros(latent, device=dev)
         self.noise_src = torch.zeros(source, device=dev) if source is not None else None
         # A/B (``noise_roll``): scratch for shifting the noise with the window.
@@ -176,9 +176,12 @@ class HopPipeline:
             if self.noise_src is not None else None)
         self.audio_model = torch.zeros(p.decoder_out, device=dev)
         self.out = torch.zeros(p.out_device, device=dev)
-        # Device-rate copy of the input under the decoded tail: the RMS-mix reference.
-        self.in_tail = torch.zeros(p.out_device, device=dev)
-        self._in_tail_tmp = torch.zeros(p.out_device - p.block, device=dev)
+        # Device-rate copy of the input under the decoded tail: the RMS-mix reference. With
+        # lookahead the tail ends ``right`` samples before the newest input, so the ring is
+        # that much longer and the reference is its first ``out_device`` samples.
+        self.in_tail = torch.zeros(p.out_device + p.right, device=dev)
+        self.in_tail_ref = self.in_tail[:p.out_device]
+        self._in_tail_tmp = torch.zeros(p.out_device + p.right - p.block, device=dev)
         self.post = PostChain(p, dev)
         self.stage_fns: dict[str, Callable[[], None]] = {
             "resample_in": self._stage_resample_in,
@@ -414,12 +417,12 @@ class HopPipeline:
         audio = self.model.infer(self.feats, self.p_len_t, pitch, pitchf, self.sid_t,
                                  p.skip_head, p.return_length, p.dec_context,
                                  self.noise_z, self.noise_src, phase, p.shift_frames,
-                                 self.warp)
+                                 self.warp, p.right_frames)
         self.audio_model.copy_(audio)
 
     def _stage_post(self) -> None:
         self.out.copy_(self.resampler_out.run(self.audio_model))
-        self.post.run(self.out, self.in_tail)
+        self.post.run(self.out, self.in_tail_ref)
 
     @torch.inference_mode()
     def process_hop(self) -> Tensor:

@@ -12,6 +12,14 @@ The offset never leaves the device: it is applied with ``index_select`` on a ten
 so the hop has no ``.item()`` sync and the stage is CUDA-graph capturable. ``stitch`` runs
 ``_impl``, which graphs.py may replace with a graph replay of ``_stitch_eager``.
 
+Offset damping (``hold_eps``, docs/DEVIATIONS.md §13): the score is the normalised
+correlation (in [-1, 1], so ``eps`` is scale-free); the previous hop's offset is kept while
+its score is within ``eps`` of the maximum, otherwise the argmax is taken. ``eps = 0`` is
+the plain argmax. The choice is a ``torch.where`` on device tensors: no sync, and the op
+sequence is the same at every ``eps``, so the captured graph reads the hot value.
+``jump_hist`` counts the hop-to-hop |offset change| in samples, as ``offset_hist`` counts
+the offsets.
+
 Gate protocol hooks (docs/research/03 §5, Applio): ``begin_drain`` / ``drain_step`` fade
 the saved tail out over exactly one overlap when the gate closes; ``zero`` forgets it. A
 zero tail makes the next hop fade in from silence through the ordinary crossfade; on a
@@ -38,7 +46,7 @@ MODES = ("plain", "pv")
 
 class Sola:
     def __init__(self, plan: ChunkPlan, device: torch.device | str,
-                 mode: str = "plain") -> None:
+                 mode: str = "plain", hold_eps: float = 0.0) -> None:
         if mode not in MODES:
             raise ValueError(f"sola mode must be one of {MODES}")
         self.mode = mode
@@ -71,7 +79,15 @@ class Sola:
         self._aligned = torch.zeros(self.block + n, device=device)
         self.out = self._aligned[:self.block]  # stable view: the hop's emitted samples
         self.offset_hist = torch.zeros(self.search + 1, dtype=torch.long, device=device)
+        self.jump_hist = torch.zeros(self.search + 1, dtype=torch.long, device=device)
         self._one = torch.ones(1, dtype=torch.long, device=device)
+        # Offset damping: the previous hop's offset and the hot tolerance (control path
+        # ``set_hold_eps``); ``_jump`` is scratch for the histogram index.
+        self.prev_offset = torch.zeros(1, dtype=torch.long, device=device)
+        self._hold_eps = torch.zeros((), device=device)
+        self._jump = torch.zeros(1, dtype=torch.long, device=device)
+        self.hold_eps = 0.0
+        self.set_hold_eps(hold_eps)
         self._drain_out = torch.zeros(self.block, device=device)
         self._drain_pos = n  # == overlap: nothing left to drain
         if mode == "pv":
@@ -80,12 +96,30 @@ class Sola:
             self._pv_time = torch.arange(n, device=device).unsqueeze(-1) / n
         self._impl = self._stitch_eager
 
-    def find_offset(self, infer: Tensor) -> Tensor:
-        """0-dim device tensor: the best alignment offset in ``[0, search]``."""
+    def set_hold_eps(self, eps: float) -> None:
+        """Control path: the damping tolerance (0 = plain argmax). Hot: a 0-dim fill."""
+        if eps < 0:
+            raise ValueError("sola_hold_eps must be >= 0")
+        self.hold_eps = float(eps)
+        self._hold_eps.fill_(self.hold_eps)
+
+    def scores(self, infer: Tensor) -> Tensor:
+        """Normalised cross-correlation of the saved tail with every candidate offset in
+        ``[0, search]``: ``[search + 1]`` values in [-1, 1] (0 where either side is silent)."""
         head = infer[None, None, :self.overlap + self.search]
         numerator = F.conv1d(head, self.buffer[None, None, :])
         denominator = torch.sqrt(F.conv1d(head * head, self._ones) + 1e-8)
-        return torch.argmax(numerator[0, 0] / denominator[0, 0])
+        norm = torch.sqrt((self.buffer * self.buffer).sum() + 1e-8)
+        return numerator[0, 0] / (denominator[0, 0] * norm)
+
+    def find_offset(self, infer: Tensor) -> Tensor:
+        """0-dim device tensor: the best alignment offset in ``[0, search]``, or the
+        previous hop's offset while its score is within ``hold_eps`` of the best."""
+        score = self.scores(infer)
+        best = torch.argmax(score)
+        prev = self.prev_offset[0]
+        hold = score[prev] >= score[best] - self._hold_eps
+        return torch.where(hold, prev, best)
 
     @torch.inference_mode()
     def stitch(self, infer: Tensor) -> Tensor:
@@ -121,6 +155,9 @@ class Sola:
         # the raw render: a step at every seam (tests/unit/test_sola.py).
         self.buffer.copy_(self._aligned[self.block:self.block + self.overlap])
         self.offset_hist.index_add_(0, offset.view(1), self._one)
+        torch.sub(offset.view(1), self.prev_offset, out=self._jump).abs_()
+        self.jump_hist.index_add_(0, self._jump, self._one)
+        self.prev_offset.copy_(offset.view(1))
         return self.out
 
     def _phase_vocoder(self, prev: Tensor, new: Tensor) -> Tensor:
@@ -180,7 +217,8 @@ class Sola:
     # ----------------------------------------------------------------- control path
 
     def state_tensors(self) -> list[Tensor]:
-        return [self.buffer, self._aligned, self._index, self.offset_hist]
+        return [self.buffer, self._aligned, self._index, self.offset_hist, self.jump_hist,
+                self.prev_offset]
 
     def offsets_ms(self, device_sr: int):
         """Histogram of chosen offsets, expanded to per-hop values in ms. Control path."""
@@ -189,9 +227,19 @@ class Sola:
         counts = self.offset_hist.cpu().numpy()
         return np.repeat(np.arange(len(counts)) * 1000.0 / device_sr, counts)
 
+    def jumps_ms(self, device_sr: int):
+        """Histogram of hop-to-hop |offset changes|, expanded to per-hop ms. Control path.
+        (The first hop after a reset counts a change from offset 0.)"""
+        import numpy as np
+
+        counts = self.jump_hist.cpu().numpy()
+        return np.repeat(np.arange(len(counts)) * 1000.0 / device_sr, counts)
+
     def reset(self) -> None:
         self.buffer.zero_()
         self.offset_hist.zero_()
+        self.jump_hist.zero_()
+        self.prev_offset.zero_()
         self._drain_pos = self.overlap
         self._onset.zero_()
         self._onset_marked = False

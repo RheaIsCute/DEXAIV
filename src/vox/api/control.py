@@ -23,6 +23,7 @@ from vox.audio.rings import SPSCRing
 from vox.audio.streams import DuplexAudio, FileInput, OutputTap, StreamConfig
 from vox.config import defaults
 from vox.config.schemas import PrecisionParams, RuntimeParams, ShapeParams
+from vox.engine import chunker
 from vox.engine.gate import GateConfig
 from vox.engine.worker import InferenceWorker, ShapeRequest
 from vox.offline.simulate import Engine, load_engine
@@ -49,7 +50,11 @@ class LiveConfig:
     exclusive: bool = False  # WASAPI exclusive on the output stream
     exclusive_input: bool = False  # and on the input (check the delivered rate: R9)
     callback_ms: float = 10.0
-    fill_target_ms: float | None = None  # default: two hops + one callback block
+    fill_target_ms: float | None = None  # explicit ms; default: ``fill_rule``
+    # Output-ring fill rule (engine/chunker.py ``fill_target_ms``; docs/DEVIATIONS.md §13):
+    # "legacy" = 2 x hop + callback (today), "hop_plus" = hop + fill_margin_ms.
+    fill_rule: str = "legacy"
+    fill_margin_ms: float = 20.0
     input_file: Path | None = None  # software microphone (see streams.FileInput)
     loop_file: bool = False
     device: str | None = None
@@ -147,15 +152,20 @@ class LiveSession:
         callback_block = int(round(sr * cfg.callback_ms / 1000.0))
         # The first hop is ready one hop of accumulation plus compute (<= one hop under
         # graphs) after its first sample; the callback pulls in callback-sized steps.
-        fill_ms = cfg.fill_target_ms if cfg.fill_target_ms is not None else \
-            2 * plan.block_ms + cfg.callback_ms
-        fill_target = int(round(sr * fill_ms / 1000.0))
+        def fill_for_hop(block_ms: float) -> float:
+            if cfg.fill_target_ms is not None:
+                return cfg.fill_target_ms
+            return chunker.fill_target_ms(block_ms, cfg.callback_ms, cfg.fill_rule,
+                                          cfg.fill_margin_ms)
+
+        fill_target = int(round(sr * fill_for_hop(plan.block_ms) / 1000.0))
         self.in_ring = SPSCRing(int(sr * INPUT_RING_S), guard=4 * callback_block)
         self.out_ring = SPSCRing(int(sr * OUTPUT_RING_S), guard=2 * block)
         self.worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
                                       engine.timers, self.in_ring, self.out_ring, self.hop_event,
                                       fill_target, extractors, log=self.log,
-                                      conditioner=engine.conditioner, shape=cfg.shape)
+                                      conditioner=engine.conditioner, shape=cfg.shape,
+                                      fill_for_hop=fill_for_hop)
         self.worker.override.volume.jump(cfg.typed_gain)
         self.worker.start()
         self.worker.ready.wait(timeout=10.0)
@@ -217,7 +227,8 @@ class LiveSession:
         return (f"live: {cfg.model} | in: {src} | out: {self.out_device.index} "
                 f"{self.out_device.name} | {plan.device_sr} Hz, callback {cfg.callback_ms:.0f} ms"
                 f" | hop {plan.block_ms:.0f} ms, overlap {plan.overlap_ms:.0f}, search "
-                f"{plan.search_ms:.0f}, extra {plan.extra_ms:.0f} | f0 "
+                f"{plan.search_ms:.0f}, extra {plan.extra_ms:.0f}"
+                f"{f', lookahead {plan.right_ms:.0f}' if plan.right else ''} | f0 "
                 f"{self.worker.params.f0_method} | "
                 f"{index_text} | formant {getattr(self.worker.params, 'formant_st', 0.0):+g} st | "
                 f"mode {e.mode} | gate {'on' if cfg.gate.enabled else 'off'} | "
@@ -279,7 +290,8 @@ class LiveSession:
             "input_chain_delay_ms": (e.conditioner.delay_ms
                                      if getattr(e, "conditioner", None) is not None else 0.0),
             "plan": {"hop_ms": plan.block_ms, "overlap_ms": plan.overlap_ms,
-                     "search_ms": plan.search_ms, "extra_ms": plan.extra_ms},
+                     "search_ms": plan.search_ms, "extra_ms": plan.extra_ms,
+                     "right_ms": plan.right_ms},
             "mode": e.mode,
             "event_counts_in_take": {k: sum(1 for ev in events.since(first) if ev["kind"] == k)
                                      for k in ("gate_open", "gate_close", "underrun")},

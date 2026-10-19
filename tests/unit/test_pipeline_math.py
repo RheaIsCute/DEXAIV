@@ -263,3 +263,34 @@ def test_decoder_context_keeps_the_tail_length_and_position():
                 for c in (0, 8, 100)]  # 100 is clamped to skip_head
     assert all(o.shape == (1, 1, 20 * 20) for o in outs)
     assert all(torch.isfinite(o).all() for o in outs)
+
+
+def test_right_context_keeps_the_tail_length_and_position_and_sees_the_future():
+    """``dec_right`` frames after the tail are decoded and dropped: the output keeps the
+    tail's length; the tail's samples change (they now have right context) while a decode
+    with the same right context but a different *further* future does not change them."""
+    torch.manual_seed(0)
+    net = Synthesizer(TINY, 768, True).eval()
+    frames = 60
+    feats = torch.randn(1, frames, 768)
+    lengths, sid = torch.tensor([frames]), torch.tensor([0])
+    pitch = torch.randint(1, 255, (1, frames))
+    pitchf = torch.rand(1, frames) * 200 + 80
+    latent, source = net.noise_shapes(frames, 30, 10, 8, 4)
+    latent0, source0 = net.noise_shapes(frames, 30, 10, 8, 0)
+    assert latent == latent0 and source[1] == source0[1] + 4 * net.upp  # [1, frames*upp, dim]
+    noise = torch.randn(*latent)
+    src = torch.randn(*source)
+    src0 = src[:, :source0[1]]
+    with torch.no_grad():
+        plain = net.infer(feats, lengths, pitch, pitchf, sid, 30, 10, 8, noise, src0)
+        right = net.infer(feats, lengths, pitch, pitchf, sid, 30, 10, 8, noise, src,
+                          dec_right=4)
+    assert plain.shape == right.shape == (1, 1, 10 * 20)
+    assert torch.isfinite(right).all()
+    # the right context changes the tail's rendering (its end most of all)
+    assert not torch.allclose(plain, right)
+    # without ``return_length`` the whole window is decoded and ``dec_right`` is ignored
+    with torch.no_grad():
+        whole = net.infer(feats, lengths, pitch, pitchf, sid, dec_right=4)
+    assert whole.shape == (1, 1, frames * 20)

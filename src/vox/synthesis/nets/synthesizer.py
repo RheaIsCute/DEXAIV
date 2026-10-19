@@ -53,7 +53,8 @@ class Synthesizer(nn.Module):
         return max(skip_head - dec_context - FLOW_CONTEXT_FRAMES, 0)
 
     def noise_shapes(self, p_len: int, skip_head: int = 0, return_length: int | None = None,
-                     dec_context: int = 0) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+                     dec_context: int = 0, dec_right: int = 0
+                     ) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
         """Shapes of ``(noise, source_noise)`` for a window of ``p_len`` frames."""
         if return_length is not None:
             dec_context = min(dec_context, skip_head)
@@ -61,19 +62,20 @@ class Synthesizer(nn.Module):
                   p_len - self._flow_head(skip_head, return_length, dec_context))
         if not self.has_f0:
             return latent, None
-        frames = p_len if return_length is None else return_length + dec_context
+        frames = p_len if return_length is None else return_length + dec_context + dec_right
         return latent, self.dec.m_source.l_sin_gen.noise_shape(frames)
 
     def infer_latent(self, phone: Tensor, lengths: Tensor, pitch: Tensor | None, sid: Tensor,
                      skip_head: int = 0, return_length: int | None = None,
-                     dec_context: int = 0, noise: Tensor | None = None
+                     dec_context: int = 0, noise: Tensor | None = None, dec_right: int = 0
                      ) -> tuple[Tensor, Tensor]:
         """Everything up to the decoder input. Returns ``(z * mask, g)``.
 
         With ``return_length`` set, the encoder still attends over the whole window, the
         flow runs from 24 frames before the first returned frame, and the frames
-        ``[skip_head - dec_context, skip_head + return_length)`` are returned (tail-only
-        decode, docs/research/02 §3.7; ``dec_context`` is our addition, see ``infer``).
+        ``[skip_head - dec_context, skip_head + return_length + dec_right)`` are returned
+        (tail-only decode, docs/research/02 §3.7; ``dec_context`` and ``dec_right`` are our
+        additions, see ``infer``).
         """
         g = self.emb_g(sid).unsqueeze(-1)
         first = skip_head - dec_context
@@ -84,7 +86,8 @@ class Synthesizer(nn.Module):
         z_p = (m_p + torch.exp(logs_p) * noise * NOISE_SCALE) * x_mask
         z = self.flow.reverse(z_p, x_mask, g=g)
         if return_length is not None:
-            start, end = first - flow_head, skip_head - flow_head + return_length
+            start = first - flow_head
+            end = skip_head - flow_head + return_length + dec_right
             z = z[:, :, start:end]
             x_mask = x_mask[:, :, start:end]
         return z * x_mask, g
@@ -93,31 +96,40 @@ class Synthesizer(nn.Module):
               pitchf: Tensor | None, sid: Tensor, skip_head: int = 0,
               return_length: int | None = None, dec_context: int = 0,
               noise: Tensor | None = None, source_noise: Tensor | None = None,
-              phase: Tensor | None = None, phase_frames: int = 0, warp=None) -> Tensor:
+              phase: Tensor | None = None, phase_frames: int = 0, warp=None,
+              dec_right: int = 0) -> Tensor:
         """Returns audio ``[b, 1, return_length * upp]`` at the model sample rate.
 
         ``warp`` (``synthesis.formant.FormantWarp`` built for the decoded frame count,
-        ``return_length + dec_context`` or the whole window) shifts the formants; the
-        caller has already set the coarse pitch to ``pitch / factor``.
+        ``return_length + dec_context + dec_right`` or the whole window) shifts the
+        formants; the caller has already set the coarse pitch to ``pitch / factor``.
 
         ``dec_context`` frames ahead of the tail are decoded too and their samples dropped.
-        The receptive field of the decoder is roughly +-90 ms; without left context a short
-        tail (a 20 ms hop decodes ~60 ms) is rendered entirely against zero padding. This
-        costs compute, not latency. ``dec_context=0`` is the upstream behaviour.
+        The receptive field of the decoder is roughly +-100 ms; without left context a
+        short tail (a 20 ms hop decodes ~60 ms) is rendered entirely against zero padding.
+        This costs compute, not latency. ``dec_context=0`` is the upstream behaviour.
+        ``dec_right`` frames *after* the tail are decoded and dropped likewise: the window
+        must hold them, so they are latency (the chunker's ``extra_right_ms``).
         ``phase`` / ``phase_frames``: the NSF sine's carried phase (``SineGen``), counted
         from the first decoded frame.
         """
-        dec_context = min(dec_context, skip_head) if return_length is not None else 0
+        if return_length is None:
+            dec_context = dec_right = 0
+        else:
+            dec_context = min(dec_context, skip_head)
         z, g = self.infer_latent(phone, lengths, pitch, sid, skip_head, return_length,
-                                 dec_context, noise)
+                                 dec_context, noise, dec_right)
         if not self.has_f0:
             audio = self.dec(z, g=g, warp=warp)
         else:
             if return_length is not None:
-                pitchf = pitchf[:, skip_head - dec_context:skip_head + return_length]
+                pitchf = pitchf[:, skip_head - dec_context:
+                                skip_head + return_length + dec_right]
             audio = self.dec(z, pitchf, g=g, source_noise=source_noise, phase=phase,
                              phase_frames=phase_frames, warp=warp)
-        return audio[:, :, dec_context * self.upp:]
+        if return_length is None:
+            return audio
+        return audio[:, :, dec_context * self.upp:(dec_context + return_length) * self.upp]
 
 
 def fuse_weight_norm(state: dict[str, Tensor]) -> dict[str, Tensor]:
