@@ -548,3 +548,25 @@ UTMOS 1.54 -> 1.44. Still an A/B (`out/ab/p0_pairs/pair01`): Phase 1.2 decouples
 from `pitchf` first, so that interp no longer disables consonant protection, then the pair
 is re-rendered on the raw-mic takes.
 
+
+## Q7 - phase A (2026-10-19): the phase vocoder is still a no-op; what moves the seams is right context plus offset damping
+
+`docs/DEVIATIONS.md` 13.3-13.4, Mom +12 on the raw-Shure take. At 30 and 40 ms overlap
+(`overlap_beyond_hop`) `sola_mode="pv"` is within 0.02 of plain on L1, click ratio and the
+offset statistics; the overlap itself takes the click ratio from 1.28 (20 ms) to 1.05 (30)
+and 0.92 (40) at +10 / +20 ms of latency. The new knobs do more: 40 ms of right context
+(`extra_right_ms`) with `sola_hold_eps` 0.05 holds 82 % of the SOLA offsets (20 % today),
+mean hop-to-hop re-timing 0.30 ms (1.23 today), click 1.11, and L1 0.548 (0.586). PV stays
+an A/B; the pack (`out/ab/streaming_a_pairs/`) has both overlaps plain vs pv for the ear.
+
+## Q14 - phase A: the deterministic gap moves with right context, by ear still open
+
+R3 said hop size, extra, F0 and lookahead (judged by log-mel) left the gap alone. Judged
+again on the real voice with the same metric, lookahead does move it: 0.586 -> 0.545 (40 ms)
+-> 0.509 (100 ms) against a 0.254 floor, as far as a 200 ms hop took it (0.51), at hop 20.
+The drift measurement (13.7) says why the metric saw little before: the window's features
+carry a steady ~0.2 cosine offset from whole-file that no lookahead removes (attention over
+the window) plus an edge zone of 20-40 ms that lookahead does remove. The remaining ~0.5 is
+the window offset and the crossfade; only report 18's item 9 (commit once, stream the
+decoder) can take the crossfade out. Whether 40-100 ms of lookahead sounds like hop 200 did
+to the user is the pack's question.

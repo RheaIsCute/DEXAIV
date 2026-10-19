@@ -1119,3 +1119,287 @@ failed on the pre-formant commit (underruns): not a regression; they need a quie
   whether the typed and live formants match by ear, is the user's call.
 - The index verdict on GoatMommy (124,683 vectors) and on other takes: only Mom was measured.
 - Hop timings on a quiet GPU.
+
+## 13. Streaming engine, phase A (2026-10-19): the no-retraining fixes of report 18
+
+Branch `feature/streaming-a` (off `feature/formant`). Report 18 (`docs/research/18_STREAMING_
+ENGINE_REPORT.md`) answered brief 17: the stutter is structural (every emitted sample is a
+crossfade of two renders that disagree at their right edge, re-timed by SOLA fifty times a
+second). This section builds its §F items 1-8 and 10, every one as a flag, no default
+changed. Same machine; the GUI was closed; the GPU had only the one job unless stated.
+
+The take throughout: the raw-Shure matrix take (`shure_gateoff_agcoff_hop20_mic_raw`, first
+45 s) levelled once by the GUI's input chain (`out/ab/model_vs_engine/0_your_mic.wav`), Mom
++12, index 0, formant 0, conditioning off, seed 0 (the §12 / brief 17 setup). "L1" = speech-
+frame log-mel L1 against the whole-file render of the same take (`out/ab/right/wholefile.wav`),
+whose reseed floor is 0.254. "click" = the seam roughness ratio. "held" = share of hops that
+kept the previous SOLA offset; "jump" = mean hop-to-hop |offset change|.
+
+### 13.1 Deviations
+
+| # | Prompt said | What was built | Why |
+|---|---|---|---|
+| S1 | Commit per item | A1-A3 share one commit, A4/A6/A7 another | The items touch the same lines of `simulate.py` and `worker.py`; splitting the hunks would have left intermediate commits that do not import |
+| S2 | A1: "the decoder's `dec_context` is unaffected" | The decoder also decodes the `right` frames (`dec_right`) and drops them | Otherwise the kept tail would still be decoded against zero padding on its right and the lookahead would only reach the encoder, flow and F0 tracker. Cost ~+0.1 ms of synth per 20 ms |
+| S3 | A2: "NCC within eps of the maximum" | The score is the correlation normalised by both sides (in [-1, 1]) | So `eps` is scale-free; the plain NCC is scaled by the tail's level and a fixed `eps` would mean different things in a loud and a quiet hop |
+| S4 | A4: "peak over the neighbouring modulation floor, in dB" | Also `seam_depth_pct`, the fundamental read as an AM depth; and only bands at least 2.5 x the hop rate wide take part | On speech the floor-relative dB compress (a 20 % imposed dip reads +3 dB, 5 % +0.3 dB): the AM copies the talker's own envelope spectrum into sidebands and lifts the floor with it. The depth tracks the imposed depth ~linearly on top of the talker's own 50 Hz content (13.5). Bands narrower than ~2.5 x the hop rate filter the sidebands out (at 50 Hz: everything below ~500 Hz), so they are left out |
+| S5 | A6: "the F0 it had when it was N ms old" | Reported twice: nominally paired and with the `f0_trim_tail` lag taken out | The cache's frame *a* holds the tracker's frame *a + 1 - trim* (§8.4: 10 ms later per trimmed frame beyond 1); the nominal pairing reads that lag as 75-89 cents of RMS error at every age, the lagged pairing shows the real age dependence |
+| S6 | A7: statistics "accumulated over the first N seconds of speech" | Measured once over the whole take and stored (`vox bench drift --store-norm`) | A running accumulation inside the hot loop would change the embed stage's op sequence at the moment it froze (a recapture mid-stream); the stored statistics are what a live mode would load |
+| S7 | A1: "underruns in a 60 s live run with the matrix settings" | As asked, plus the A3 soaks at 120 s | |
+| S8 | Hop p50/p99 "quiet GPU" | The per-render timings were measured while CPU jobs (unit tests, the seam calibration) ran beside them; the quiet numbers come from one dedicated 20 s pass per variant (13.7) | Rendering took ~3 min per variant; waiting for silence between every render would have cost the session |
+
+### 13.2 A1: right context (`extra_right_ms`)
+
+`out/ab/right/live_right_{0,20,40,80,100}.wav`, `live_hop40_right40.wav`, `wholefile.wav`.
+
+| variant | algorithmic latency | L1 (floor 0.254) | click | held | synth GPU p50 |
+|---|---|---|---|---|---|
+| hop 20, right 0 (today) | 50 ms | 0.586 | 1.28 | 20 % | 4.66 ms |
+| right 20 | 70 | 0.568 | 1.37 | | 5.16 |
+| right 40 | 90 | 0.545 | 1.29 | | 5.27 |
+| right 80 | 130 | 0.513 | 1.28 | | 5.04 |
+| right 100 | 150 | 0.509 | 1.32 | | 5.16 |
+| hop 40 + overlap 40 + right 40 | 130 | 0.523 | 1.34 | | 5.12 |
+| hop 200 (brief 17, for scale) | 230 | 0.51 | | | |
+
+Right context moves the metric as far as a 200 ms hop did (0.509 at 100 ms vs 0.51), at
+hop 20 and 150 ms of algorithmic latency instead of 230. The click ratio does not move: the
+seams are still two-render mixes, now of renders that agree better. Live latency and
+underruns: 13.6.
+
+### 13.3 A2: SOLA offset damping (`sola_hold_eps`)
+
+`out/ab/sola_hold/live_eps_{0,0.02,0.05}.wav`, `live_right40_eps_0.05.wav`. Offsets and jumps
+from the engine's histograms (`Sola.offset_hist`, the new `Sola.jump_hist`), all hops.
+
+| variant | held | jump mean / p50 / p95 | offset p50 / p95 | L1 | click |
+|---|---|---|---|---|---|
+| eps 0 (today) | 20 % | 1.23 / 0.15 / 5.6 ms | 4.5 / 9.2 ms | 0.586 | 1.34 |
+| eps 0.02 | 49 % | 1.07 / 0.02 / 5.8 | 4.3 / 9.4 | 0.589 | 1.25 |
+| eps 0.05 | 62 % | 0.85 / 0.00 / 5.2 | 4.2 / 9.3 | 0.588 | 1.28 |
+| right 40 + eps 0.05 | **82 %** | **0.30 / 0.00 / 2.0** | 4.4 / 8.9 | 0.548 | **1.11** |
+
+Damping alone halves the small jumps and leaves the large ones (p95 still 5 ms: when the
+renders disagree, no offset within eps of the best is the old one). With 40 ms of right
+context the renders agree, the hold takes, and the jitter the report called the second
+percept is mostly gone (mean jump 0.3 ms, p95 2 ms) with the lowest click ratio measured on
+this take. The hold is a `torch.where` on device tensors inside the captured stitch; the
+first version indexed the score with a tensor (`score[prev]`), which is a host read-back and
+is refused inside a capture (`tests/unit/test_sola.py::test_hold_never_synchronises_with_the_host`
+now covers eps > 0 on the GPU).
+
+### 13.4 A5: decoder left context 80 -> 120 ms, and the phase vocoder at 30 / 40 ms
+
+| variant | L1 | click | held | synth GPU p50 | algorithmic latency |
+|---|---|---|---|---|---|
+| decoder context 80 (today) | 0.583 | 1.33 | 20 % | 4.72 ms | 50 ms |
+| decoder context 120 | 0.589 | 1.37 | 19 % | 5.86 ms | 50 |
+| plain, overlap 30 (`overlap_beyond_hop`) | 0.597 | 1.05 | 25 % | 4.54 | 60 |
+| **pv**, overlap 30 | 0.596 | 1.03 | 25 % | 4.46 | 60 |
+| plain, overlap 40 | 0.566 | 0.92 | 27 % | 5.48 | 70 |
+| **pv**, overlap 40 | 0.566 | 0.90 | 27 % | 6.54 | 70 |
+
+The full receptive field on the left (report 18 §0.2) changes nothing the metrics see and
+costs 1.1 ms of synth per hop: `out/ab/decctx/live_decctx{80,120}.wav` is in the pack for the
+ear, the default stays 80. The phase vocoder is within 0.02 of plain on every number at both
+overlaps (Q7 again); the overlaps themselves lower the click ratio below 1 at 40 ms (the
+three-render blend). `out/ab/pv/live_{plain,pv}_ov{30,40}.wav`.
+
+### 13.5 A4: the seam-rate modulation prominence (`seam_prominence`)
+
+Per-1/3-octave Hilbert envelopes at 1 kHz, 400 ms Hann blocks at half overlap, the envelope
+spectrum's peak at the hop rate (+-1.5 bins) over the median of +-0.4 x hop rate around it,
+energy-weighted over bands, averaged over speech blocks; also as an AM depth. Calibration on
+the whole-file render with `impose_am` (`out/ab/seam_calibration/`):
+
+| imposed AM | depth | hop-20 metric (50 Hz): dB / depth % | hop-40 (25 Hz) | hop-60 (16.7 Hz) |
+|---|---|---|---|---|
+| none | 0 | 2.29 / 21.2 | 1.56 / 32.5 | -1.29 / 32.8 |
+| 50 Hz | 2 % | 2.34 / 21.3 | 1.55 | -1.28 |
+| 50 Hz | 5 % | 2.55 / 21.8 | 1.53 | -1.28 |
+| 50 Hz | 10 % | 3.33 / 23.6 | 1.52 | -1.27 |
+| 50 Hz | 20 % | 5.24 / 29.6 | 1.49 | -1.26 |
+| 25 Hz | 2 / 5 / 10 / 20 % | 2.28 / 2.26 / 2.23 / 2.16 | 1.60 / 1.72 / 2.02 / 3.00 | -1.28 / -1.27 / -1.30 / -1.48 |
+| 16.7 Hz | 2 / 5 / 10 / 20 % | 2.29 / 2.28 / 2.28 / 2.25 | 1.56 / 1.55 / 1.53 / 1.39 | -1.20 / -1.00 / -0.49 / +0.56 |
+
+Monotonic in depth at every rate and specific to its rate (the other columns stay flat or
+fall), as the acceptance asked; the synthetic test (`tests/unit/test_seam_metric.py`) spans
+> 15 dB at 50 Hz. On real speech the span is small: the talker's own envelope has content at
+50 Hz (depth 21 % with nothing imposed), so a seam train of a few per cent is a sub-dB,
+sub-per-cent excess over the whole-file render of the same take. That is how it is reported
+in 13.7: stream minus whole-file. It is a measurement of the AM mechanism, not of what the
+user hears; the pack decides whether it tracks the ear.
+
+### 13.6 A3: output-ring fill rule, and the live runs
+
+`chunker.fill_target_ms`: `legacy` = 2 x hop + callback (today), `hop_plus` = hop + 20 ms
+(`LiveConfig.fill_rule`, `vox run --fill-rule`, `vox bench underrun --fill-rule`; a live hop
+change re-derives the target from the rule instead of scaling the old one). Paced bench
+(`vox bench underrun --model Mom --pitch 12 --audio <take> --seconds 45 --hops 20,40,60
+--extras 1000 --broadcast-load --auto-level off`) and 120 s live soaks (the take looped as a
+software microphone, VAC exclusive, gate off, auto level off, Broadcast's denoiser held open
+on the GPU):
+
+| hop | rule | fill target | paced: hop p50 / p99, underruns (45 s) | live 120 s: p50 / p99 / window p99 max, underruns | live latency estimate (ring part) |
+|---|---|---|---|---|---|
+| 20 | legacy | 50 ms | 17.1 / 21.8, 0 | 19.4 / 20.9 / 25.5, **1** (one 10 ms refill) | 193 ms (113)* |
+| 20 | hop_plus | 40 | 17.8 / 21.1, **3** | 17.4 / 18.6 / 24.3, **1** | 158 (80)* |
+| 40 | legacy | 90 | 18.0 / 22.3, 0 | 18.4 / 19.7 / 28.7, 0 | 197 (78) |
+| 40 | hop_plus | 60 | 18.1 / 20.4, 0 | 18.3 / 19.3 / 26.1, 0 | **167 (48)** |
+| 60 | legacy | 130 | 18.2 / 21.3, 0 | 19.5 / 23.1 / 25.7, 0 | 257 (116) |
+| 60 | hop_plus | 80 | 19.2 / 22.2, 0 | 19.9 / 23.0 / 24.4, 0 | **206 (66)** |
+
+\* After its one underrun the worker tops the ring back up (§8.2's refill), so the hop 20
+estimates were read with the ring over target (120 / 90 ms); before it they sat at 50 / 40.
+
+Both rules underrun once in two minutes at hop 20 with Broadcast on (hop p99 ~21 ms against
+a 20 ms budget: the same first-hops-after-a-stall effect §8.2 and §8.8 saw); hop 40 and 60
+never do under either rule. As the prompt's rule says: `legacy` stays for hop 20 and
+`hop_plus` is the measured choice from hop 40 up, where it takes 30-50 ms off the live
+estimate for nothing. No default changed; the GUI does not expose the rule yet.
+
+**A1 live, 60 s, matrix settings** (same soak, Broadcast off, which is how the take was
+recorded):
+
+| variant | hop p50 / p99 / window max | underruns | live latency estimate |
+|---|---|---|---|
+| hop 20, right 0 | 17.0 / 18.0 / 24.3 | 0 | 114 ms |
+| right 20 | 18.1 / 19.8 / 22.3 | 0 | 139 |
+| right 40 | 18.8 / 21.8 / 22.2 | 0 | 157 |
+| right 80 | 17.5 / 18.2 / 25.2 | 1 | 260 (ring refilled to 100 after it; 180 before) |
+| right 100 | see below | | |
+| hop 40 + overlap 40 + right 40 | 18.5 / 21.6 / 21.8 | 0 | 235 (legacy fill; ~205 with hop_plus) |
+| eps 0.05 | 17.1 / 17.8 / 23.7 | 0 | 119 |
+| right 40 + eps 0.05 | 17.8 / 18.9 / 21.4 | 0 | 157 |
+| decoder context 120 | 18.0 / 19.2 / 23.3 | 0 | 116 |
+
+The first right-100 run collapsed (1,195 underruns, hop p50 45 ms, 499 refills in 60 s); a
+20 s rerun minutes later ran clean (p50 18.1, p99 19.6, 0 underruns, estimate 221 ms) and the
+60 s rerun is in 13.8. Nothing in the engine distinguishes right 100 from right 80 (two more
+decoded frames); the first timing pass of this session also read 3-4 ms high on every
+variant until something outside the engine let go of the GPU. Treated as external load,
+not reproduced.
+
+### 13.7 A6 and A7: how far the window's features and F0 are from whole-file, and the frozen norm
+
+`vox bench drift --model Mom --pitch 12 --audio <take> --seconds 45 [--right 40] [--norm frozen]`
+(`out/ab/a567_metrics.json`). Ages count from the window's end; with `extra_right_ms` = R the
+kept region's newest frame has age R. 1,769 active frames per age after 1.5 s. The whole-file
+reference is the embedder and RMVPE over the entire take on the window's 50 Hz grid parity.
+
+| age | feature cosine distance mean / p95 | F0 cents RMSE / p95, nominal pairing | the same, trim lag taken out | octave flips | voicing agreement |
+|---|---|---|---|---|---|
+| 0 ms | 0.818 / 1.046 | 89.2 / 102.1 | **46.2 / 38.4** | 0.46 % | 0.920 |
+| 20 | 0.827 / 1.044 | 74.6 / 85.3 | 39.9 / 26.7 | 0.36 % | 0.940 |
+| 40 | 0.459 / 0.891 | 74.9 / 86.6 | **12.3 / 20.0** | 0.26 % | 0.945 |
+| 80 | 0.267 / 0.485 | 83.5 / 86.8 | 12.6 / 19.3 | 0.35 % | 0.946 |
+| 120 | 0.320 / 1.035 | 73.9 / 86.4 | 14.0 / 18.2 | 0.35 % | 0.945 |
+
+Scale, measured directly on one window at 4.0 s (`drift_debug`): adjacent whole-file 50 Hz
+frames are 0.16 apart in cosine; the same frames seen from a 1.1 s window are 0.22 from their
+whole-file values on average (0.1 deep inside, 0.4-0.5 in the last 40 ms, 0.96 for the
+window's first frame); two windows one hop apart agree to 0.025 on their shared frames. So
+the sliding window's features are not "noisy": they carry a steady offset from whole-file
+of the order of a neighbouring frame (GroupNorm + global attention, report 18 §C7) plus a
+large edge zone, the last 20-40 ms, where they are nearly unrelated to the frame's
+whole-file vector. The cached F0 is 46 cents RMS off at the edge and settles to 12 cents by
+40 ms; its 0.3-0.5 % octave flips are RMVPE's. Both say the same thing for the commit-once
+design (report 18 §F9): committing at the edge freezes the worst version of every frame;
+40 ms of lookahead buys most of the settling for F0 and about half of it for the features,
+80 ms most of it. The right-40 run gives the identical table (ages are from the window's
+end), as it should.
+
+**A7, frozen GroupNorm.** Statistics over the 45 s take (`models/_embedders/contentvec/
+frozen_norm.pt`), `contentvec_norm="frozen"`: the drift table is the same to three digits
+(0.817 / 0.826 / 0.461 / 0.267 / 0.322), the whole-file render moves by 0.015 L1 (seed floor
+0.254), the stream reads L1 0.578 vs 0.586, click 1.34 vs 1.28. Conv layer 0's over-time
+statistics barely vary across 1.1 s windows of this talker, so freezing them changes nothing
+measurable; the window dependence is in the attention. `out/ab/frozen_norm/live_frozen.wav`
+is in the pack regardless. The R4 pause inflation at short context is left untested here
+(extra 1000 throughout).
+
+### 13.8 The one table, and the pack
+
+Same take, same settings. Hop p50 / p99 from one quiet pass of 20 s per variant
+(`out/ab/timing.json`); underruns and the live estimate from the 60 s runs of 13.6
+(Broadcast off); "seam" = the stream's seam-rate prominence minus the whole-file render's,
+in dB and in AM depth points (13.5: the whole-file reads 2.29 dB / 21.2 % at 50 Hz on its own,
+1.57 / 32.3 at 25 Hz); click from the render (the hop grid); R3 = L1 vs whole-file over a
+0.254 floor; drift = the kept region's newest frame (age = the lookahead) from 13.7.
+
+| variant | algorithmic | live estimate | hop p50 / p99 | underruns / 60 s | seam excess dB / depth pts | click | R3 (x floor) | feature drift at the kept edge | F0 cents at the kept edge (lag out) |
+|---|---|---|---|---|---|---|---|---|---|
+| whole-file render | - | - | - | - | 0 / 0 | - | 0 | 0 | 0 |
+| hop 20 (today) | 50 ms | 114 ms | 15.7 / 19.9 | 0 | +1.04 / +7.6 | 1.28 | 0.586 (2.31) | 0.82 | 46 |
+| right 20 | 70 | 139 | 16.6 / 19.0 | 0 | +0.69 / +4.9 | 1.37 | 0.568 (2.24) | 0.83 | 40 |
+| right 40 | 90 | 157 | 16.3 / 19.4 | 0 | +0.26 / +3.4 | 1.29 | 0.545 (2.15) | 0.46 | 12 |
+| right 80 | 130 | 180 (260 after its refill) | 16.4 / 19.2 | 1 | -0.03 / +1.6 | 1.28 | 0.513 (2.02) | 0.27 | 13 |
+| right 100 | 150 | 221 | 17.1 / 19.2 | 1 (rerun; 0 in 20 s) | -0.33 / +1.4 | 1.32 | 0.509 (2.00) | 0.32 | 14 |
+| hop 40 + overlap 40 + right 40 | 130 | 235 (legacy fill) | 16.4 / 17.9 | 0 | +0.02 / +2.7 | 1.34 | 0.523 (2.06) | 0.46 | 12 |
+| eps 0.05 | 50 | 119 | 15.8 / 17.5 | 0 | +1.16 / +7.4 | 1.28 | 0.588 (2.31) | 0.82 | 46 |
+| **right 40 + eps 0.05** | 90 | 157 | 16.5 / 19.4 | 0 | +0.29 / +3.2 | **1.11** | 0.548 (2.16) | 0.46 | 12 |
+| decoder context 120 | 50 | 116 | 16.6 / 19.5 | 0 | +1.07 / +8.1 | 1.37 | 0.589 (2.32) | 0.82 | 46 |
+| frozen norm | 50 | - | 15.4 / 16.7 | - | +1.25 / +7.9 | 1.34 | 0.578 (2.28) | 0.82 | 46 |
+| plain, overlap 30 (`blend30`) | 60 | - | 17.2 / 19.6 | - | +0.04 / +3.7 | 1.05 | 0.597 (2.35) | 0.82 | 46 |
+| pv, overlap 30 | 60 | - | 15.6 / 17.3 | - | +0.03 / +3.2 | 1.03 | 0.596 (2.35) | 0.82 | 46 |
+| plain, overlap 40 | 70 | - | - | - | +0.17 / +2.8 | 0.92 | 0.566 (2.23) | 0.82 | 46 |
+| pv, overlap 40 | 70 | - | 16.8 / 19.0 | - | +0.32 / +3.1 | 0.90 | 0.566 (2.23) | 0.82 | 46 |
+| hop 40, overlap 20 (brief 17) | 70 | - | 16.0 / 18.7 | - | +1.40 / +14.3 | - | 0.586 (2.31) | 0.82 | 46 |
+| hop 40, overlap 40 (brief 17) | 90 | - | - | - | +1.12 / +6.1 | - | 0.556 (2.19) | 0.82 | 46 |
+
+What the numbers say, before the ear: the seam-rate excess is the one metric that ranks the
+variants the way report 18 predicted. It falls with right context (7.6 -> 4.9 -> 3.4 -> 1.6
+-> 1.4 depth points from 0 to 100 ms), and at 80-100 ms the stream's 50 Hz content is the
+whole-file's own. It does not move with offset damping (eps 0.05: 7.4), because the hold
+changes the time base, not the amplitude of the seam; the click ratio and the jump
+statistics are its measures, and those move only once right context lets the hold take
+(right 40 + eps 0.05: click 1.11, jump 0.3 ms). Longer overlaps lower it too (3-4 points at
+30-40 ms) by spreading each seam, at the same latency as right 20-40 ms which lowers it by
+agreeing instead. Hop 40 at a 20 ms overlap is the worst row (14 points at 25 Hz): fewer
+seams, each twice as deep; its 40 ms overlap halves that; right 40 on top brings it to 2.7.
+Decoder context 120 and the frozen norm do nothing. Hop timings: right context costs
+0.6-1.4 ms of p50 (two to ten more decoded frames), nothing underruns at hop 20 on a quiet
+GPU, hop 20 keeps ~0.5 ms of headroom at p99 in every row.
+
+**The pack.** `out/ab/streaming_a_pairs/` (31 blind pairs, `pairs.md` to fill in,
+`answer_key.json` after): every variant above (level-matched to -14 dBFS active, copies in
+`out/ab/streaming_a/`) against today's hop 20 and against the whole-file render, plus the
+unheard brief-17 files (`blend30`, `hop40`, `hop40_xf40`), plain vs pv at 30 and 40 ms, and
+hop 20 vs whole-file itself. `out/ab/streaming_a/scores.json` holds the table's seam and L1
+numbers per file.
+
+**If the user hears what the report predicts** (right context at 40-100 ms sounds like hop
+200 did, and the hold removes the warble): the default becomes hop 20, `extra_right_ms` 40,
+`sola_hold_eps` 0.05 (90 ms algorithmic, ~157 ms live), with `fill_rule="hop_plus"` from hop
+40 up; 80-100 ms of right context stays the "quality" preset until item 9 (commit once,
+stream the decoder) replaces the crossfade.
+
+### 13.9 Tests
+
+`tests/unit/test_chunker.py` (chunking law with `extra_right_ms`: sizes, latency, p_len,
+hop 40, fill rules), `tests/unit/test_pipeline_math.py` (`dec_right` keeps the tail's length
+and position and changes its rendering), `tests/unit/test_sola.py` (hold within eps, jump
+beyond, eps 0 = argmax, histograms, reset, GPU sync-free at eps > 0),
+`tests/unit/test_seam_metric.py` (monotonic on imposed AM at 50 and 16.7 Hz, rate-specific,
+depth reads the imposed depth, silence is nan), `tests/engine/test_drift.py` (drift ordered
+by age on the test model, CPU or GPU; frozen norm reproduces GroupNorm on its own statistics,
+changes the static key, streams clean through `load_engine`), `tests/engine/test_engine.py`
+(right 40, and hop 40 + right 100 + decoder context 120 run clean).
+
+### 13.10 Not verified
+
+- Listening: none of the 31 pairs has been heard. Every number above is a mechanism
+  measurement; whether the seam-rate excess tracks "stutter" is exactly what the pack tests.
+- The suite: 414 unit and engine tests pass; the five `tests/engine/test_worker.py` live
+  tests failed once when run right after the pack's CPU scoring (underruns) and pass on a
+  quiet machine, as §12.4 recorded for the same tests.
+- The right-100 live collapse (13.6) was seen once and not reproduced.
+- The frozen-norm result (nothing changes) was measured with statistics from this take only
+  and at extra 1000; the R4 pause bias at short context was not re-measured with it.
+- `hop_plus` live at hop 20 with Broadcast underruns once in two minutes, as `legacy` does;
+  the paced bench put 3 underruns in 45 s on `hop_plus` at hop 20 and 0 on `legacy`. The
+  rule's split (legacy at 20, hop_plus from 40) follows the prompt; it is not exposed in the
+  GUI.
+- The seam metric's floor-relative dB compresses on speech (13.5); its depth form is the
+  number used, and both were calibrated on this one take.
+- GoatMommy: nothing in this section was rendered with it.
