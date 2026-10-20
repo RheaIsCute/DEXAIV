@@ -1374,6 +1374,15 @@ numbers per file.
 40 up; 80-100 ms of right context stays the "quality" preset until item 9 (commit once,
 stream the decoder) replaces the crossfade.
 
+**Verdict (2026-10-20).** The user played pair11 blind and called X "much worse"; X was
+`hop20_ref`, Y `right40_eps0.05`. `ShapeParams.extra_right_ms` is now 40 and
+`RuntimeParams.sola_hold_eps` 0.05 by default (algorithmic latency +40 ms); `fill_rule` stays
+legacy. The other 30 pairs are unheard. With OBS, Broadcast, browsers and a media player
+on the GPU (~25 % busy), `tests/engine/test_worker.py` underran in 2 tests on the old
+defaults and in 6 on the new ones (6-11 underruns per test); the gate test's closed-hop
+median read 2.47 ms once and passed on rerun. The new defaults have less headroom under
+load; a quiet-GPU rerun of the worker tests is still owed.
+
 ### 13.9 Tests
 
 `tests/unit/test_chunker.py` (chunking law with `extra_right_ms`: sizes, latency, p_len,

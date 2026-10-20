@@ -50,8 +50,9 @@ class ShapeParams:
     decoder_context_ms: float = 80.0  # decoder left context (0 = upstream); 8.8, Q17
     # Right context / lookahead (docs/DEVIATIONS.md §13, report 18 §F2): the kept region is
     # rendered this many ms before the window's end, so the encoder, flow, F0 tracker and
-    # decoder all see that much audio past it. Pure algorithmic latency. 0 = today.
-    extra_right_ms: float = 0.0
+    # decoder all see that much audio past it. Pure algorithmic latency. 40 chosen by ear
+    # (blind pair11, 2026-10-20); 0 = the pre-phase-A engine.
+    extra_right_ms: float = 40.0
     # A/B settings of the live-quality work (docs/DEVIATIONS.md §7), off by default:
     overlap_beyond_hop: bool = False  # pre-fix SOLA geometry: the crossfade may exceed the hop
     embed_pad_ms: float = 0.0  # replicate-pad the window's right edge before ContentVec
@@ -77,8 +78,9 @@ class RuntimeParams:
     sola_mode: str = "plain"  # "plain" | "pv" (phase-vocoder crossfade, open question Q7)
     # SOLA offset damping (docs/DEVIATIONS.md §13, report 18 §F3): keep the previous hop's
     # offset while its normalised correlation is within this much of the best one (0 = the
-    # argmax every hop, today's behaviour). Hot; device-side only.
-    sola_hold_eps: float = 0.0
+    # argmax every hop, the pre-phase-A behaviour). 0.05 chosen by ear with right 40 (pair11).
+    # Hot; device-side only.
+    sola_hold_eps: float = 0.05
     # A/B setting of the live-quality work (docs/DEVIATIONS.md §7), off by default:
     f0_bridge_ms: float = 0.0  # fill F0 = 0 runs this short between voiced runs (0 = off)
     noise_roll: bool = True  # decoder noise follows the window (on since 8.8; False = upstream)
