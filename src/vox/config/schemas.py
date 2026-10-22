@@ -181,7 +181,7 @@ class VoiceProfile:
 class VadProfile:
     engine: str = "silero"
     threshold: float = 0.5
-    release_ms: int = 350  # hangover after the last speech (Applio: 200; 350 bridges mid-phrase dips)
+    release_ms: int = 500  # hangover after the last speech (Applio: 200; 350 bridged mid-phrase dips, 500 chosen by ear 2026-10-22, docs/DEVIATIONS.md 14.7)
 
 
 @dataclass

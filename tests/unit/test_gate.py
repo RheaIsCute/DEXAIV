@@ -230,10 +230,10 @@ def test_vad_hysteresis_holds_the_gate_while_the_probability_dips():
     assert states[-1] is False  # closes once the dip outlasts the one-hop hangover
 
 
-def test_default_hangover_is_350_ms():
-    assert GateConfig().hangover_ms == 350.0
+def test_default_hangover_is_500_ms():
+    assert GateConfig().hangover_ms == 500.0  # chosen by ear, docs/DEVIATIONS.md 14.7
     _, gate, _ = vad_gate(hangover_ms=GateConfig().hangover_ms)
-    assert gate.hangover_hops == 18  # ceil(350 / 20)
+    assert gate.hangover_hops == 25  # ceil(500 / 20)
 
 
 def test_hangover_never_undercuts_the_stream_delay():

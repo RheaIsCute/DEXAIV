@@ -60,7 +60,7 @@ class GateConfig:
     enabled: bool = True
     threshold_dbfs: float = -48.0  # energy pre-gate (calibration.silence_gate_dbfs)
     vad_threshold: float = 0.5  # Silero speech probability to open
-    hangover_ms: float = 350.0  # keep open this long after the last speech (was 200)
+    hangover_ms: float = 500.0  # keep open this long after the last speech (200 -> 350 -> 500, 14.7)
     use_vad: bool = True  # False: energy gate only
     hysteresis_db: float = 6.0  # once open, stay open down to threshold - this
     vad_hysteresis: float = 0.15  # once open, stay open down to vad_threshold - this

@@ -1412,3 +1412,313 @@ changes the static key, streams clean through `load_engine`), `tests/engine/test
 - The seam metric's floor-relative dB compresses on speech (13.5); its depth form is the
   number used, and both were calibrated on this one take.
 - GoatMommy: nothing in this section was rendered with it.
+
+## 14. Streaming engine, phase B (2026-10-22): polish of the new default
+
+The user heard phase A live (13.8) and called it "a billion times better"; Mom is now the
+main model. Four complaints, each measured before anything was built. Branch
+`feature/streaming-b` off `feature/streaming-a`.
+
+**Step 0, what the user actually runs.** The code defaults are hop 20, `extra_right_ms`
+40, `sola_hold_eps` 0.05, `fill_rule` legacy (c7121fd, chosen by ear from blind pair11 of
+13.8: X = today's hop 20, Y = right 40 + eps 0.05, "X is much worse"; the other 30 pairs
+are unheard). The GUI state (`profiles/default/gui_state.json`) does not run the code
+defaults: **hop 80 ms, extra 2400, gate threshold -28 dBFS, RNNoise on for the Shure,
+auto level on with +6 dB trim, Mom +12, protect 0.35, ceiling 330 Hz, formant -0.5,
+index 0.56 (inert, 12.3)**. Live latency estimate at that shape (legacy fill 170 ms):
+hop 80 + ring ~80-230 + compute ~7-18 + sola 30 + lookahead 40 + devices 11 + RNNoise
+20 = **~300-370 ms** (the 2-minute soaks of 14.1 read the ring at 230 ms after a refill).
+Every number below is at the user's shape unless stated, on the raw-Shure matrix take
+(`recordings/matrix_20261017_192237/shure_gateoff_agcoff_hop20_mic_raw.wav`, 59 s, 18
+phrases) and the sung take 2 (`takes/live/take_20261015_004329_mic_raw.wav`, first 30 s).
+
+### 14.0 Deviations
+
+| # | Prompt said | What was built | Why |
+|---|---|---|---|
+| T1 | B1: verify the lookahead loss, then flush on close | Verified: the loss is 0 ms. No flush. Instead a guard (hangover never under the stream delay), the drift-trim fix, and a hangover A/B | 14.1: the 350 ms hangover already covers the 70 ms lookahead at every close; what cuts the sentence is the gate itself (closes inside trailing voice) and, live, the drift trim |
+| T2 | Commit per item | B1 and B4 share one commit; `schemas.py` carries the B3 fields in it | gate.py, worker.py, sola.py and the schema are touched by both; splitting would leave commits that do not import |
+| T3 | B2 (a): record 20 s of the user laughing | Not possible from here: the harness (`b2_laugh.py`) is built and was run on a typed "hahaha!" proxy; the real take is the user's | the Record button needs the user |
+| T4 | B3: the note detector's reference is the run's first frame | An EMA of the run (`NOTE_REF_ALPHA` 0.1 / frame) | vibrato and a slow drift stay inside the +-1 st; a first-frame reference broke the sung take's held notes into pieces (only 2 runs >= 400 ms in 30 s) |
+| T5 | B3: "switch the ceiling knee and the pitch_range for that note" | Also freezes the auto-pitch register once the run is `note_freeze_ms` (100 ms) old | a running mean slides a held note toward the target: measured 14.3 |
+| T6 | B4: a 60 s take with deliberate creaks, bumps and taps | A synthetic proxy (`out/ab/phase_b/b4/proxy_take.wav`: the take's phrases with 1.5 s pauses and one creak / bump / tap per pause at 0 / +4 / +8 dB over the voice's p95) | no such take exists; the real one is the user's to record, the runner (`b4_leaks.py`) takes any take plus its event list |
+| T7 | B4: "suppression strength ... a stronger max setting if the current one is capped" | `suppression_strength = "max"`: RNNoise's per-frame speech probability gates its residual (-20 dB under 0.5, 50 ms one-pole) | RNNoise has no strength knob; the user's mix is already 1.0 |
+| T8 | B4: onset probation "for 2 chunks" | `onset_persist_chunks` counts completed 32 ms VAD chunks, hop-independent | at hop 80 a hop holds 2.5 chunks, at hop 20 it holds 0.6; a hop count would mean different things |
+| T9 | Live soaks on the virtual cable | On the Realtek second output (device 24) after the first two: device 23 ("Shure MV6x") is what the user monitors and they heard the looped take | VAC "Line 1" is no longer in the device list; nothing in the soak depends on the device |
+
+### 14.1 B1: "my sentence cuts off slightly before it actually ends"
+
+**The lookahead hypothesis, measured** (`b1_lost.py`: simulator, gate on, the user's chain;
+per gate close, the speech frames of the conditioned input between the last emitted
+converted input sample `close * hop - stream_delay` and the first one the reopen renders;
+"speech" = Silero >= 0.35 on 32 ms chunks / RMVPE voiced / energy >= threshold - 6):
+
+| shape | closes | lost in the lookahead (voiced) | lost voiced, total / max per close | lost VAD, total | closes with any voiced loss |
+|---|---|---|---|---|---|
+| hop 80, right 40 (the user) | 11 | **0 ms** | 100 / 100 ms | 40 | 1 |
+| hop 80, right 0 | 11 | 0 | 100 / 100 | 70 | 1 |
+| hop 20, right 40 | 16 | 0 | 100 / 100 | 40 | 1 |
+| hop 20, right 0 | 16 | 0 | 100 / 100 | 40 | 1 |
+| hop 80, right 40, references from the chain without RNNoise | 11 | 0 | 280 / 200 | 220 | 2 |
+| same, RNNoise off in the chain | 8 | 0 | 280 / 200 | 130 | 2 |
+
+Nothing is lost inside the lookahead at any close: the hangover (350 ms) is five times the
+stream delay (70 ms), so the drain comes long after the lookahead has been rendered. The
+hypothesis is wrong for this engine; the flush was not built. A guard went in instead
+(`SilenceGate._set_hops`: the hangover is never shorter than the stream delay, so no
+future setting can make it true; `test_hangover_never_undercuts_the_stream_delay`).
+
+**What does cut the sentence.** Two things, both at the user's -28 dBFS threshold:
+
+1. *The gate closes inside trailing voice.* At 2 of 11 closes RMVPE still finds 80 and
+   200 ms of voiced input after the last rendered sample (the second is the take's last
+   words, spoken softly); by Silero, 4 closes lose 10-110 ms. RNNoise is not the cause:
+   over the last 150 ms of every phrase it changes the level by -0.06 dB (p50; worst
+   -0.3), the same as mid-phrase (-0.15). The take's soft endings fall under -34 dBFS
+   (threshold - hysteresis) with the VAD under 0.35, and 350 ms later the gate drains.
+2. *The gate flickers.* 7 of the 11 closes last 80-240 ms: a pause inside a sentence of
+   ~350 ms closes the gate, the drain plays, and the reopen fades in 5 ms later. That is
+   heard as a bite out of the sentence, not as a pause.
+
+Hangover A/B (same take, same chain; `out/ab/phase_b/b1/`):
+
+| hangover | closes | flickers (closed <= 240 ms) | lost voiced total | lost VAD total | gated hops / 743 |
+|---|---|---|---|---|---|
+| 350 (today) | 11 | 7 | 100 ms | 40 | 84 |
+| 500 | 6 | 1 | 100 | 40 | 64 |
+| 600 | 5 | 0 | 100 | 40 | 58 |
+
+500 ms removes six of the seven flickers and costs 20 more open hops (1.6 s of GPU per
+minute); 600 removes the last one. The 100 ms at the take's end is the soft last word
+under the threshold at every hangover; only a lower threshold reaches it (the gate's
+threshold is the user's slider). Wavs: `base_hop80_right40.wav` (350) vs
+`hang500_hop80_right40.wav` vs `hang600_hop80_right40.wav`. `vox run --hangover-ms`
+exposes it; the GUI still reads `calibration.json`'s `release_ms`.
+
+**The live-only cut: the drift trim.** `InferenceWorker._hop` trimmed the output ring back
+to its target on the *first* closed hop whenever the ring sat more than one hop over
+target (after an underrun refill it always does, 8.2). `SPSCRing.drop` discards the oldest
+unread samples, and on that hop the oldest queued output is still the hangover's render:
+the end of the sentence when the gate closed inside it. Fixed: the trim waits until every
+queued sample was written by a silent hop (`_silent_run * block >= fill + block`;
+`InferenceWorker.trim_waits_for_silence`, the pre-fix rule kept for the A/B soak). Live
+A/B (120 s, the take looped, gate -28, the ring pushed two hops over target after the
+first hop, `drop` instrumented to peak-read what it discards):
+
+| rule | trims | trimmed samples | peak of what was discarded | silent hops before the trim |
+|---|---|---|---|---|
+| pre-fix | 1 | 4320 (90 ms) | 0.0004 (-68 dBFS: the hangover's render of room tone) | 0 |
+| fixed | 1 | 4320 | 0.0 (digital silence) | 10 |
+
+On this take the discarded 90 ms was the converted room tone of the hangover, not voice
+(-68 dBFS); with a hangover shorter than the ring (80 ms, `test_drift_trim_waits_until_
+the_queued_output_is_silence`) it is the sentence, which the test checks sample for sample
+against the simulator. A bug fix, not a flag.
+
+**2-minute live soaks** (hop 80 / right 40, gate -28, RNNoise, Broadcast's denoiser on the
+GPU, the take looped, output on device 24):
+
+| hangover / onset rule | hops | closes in 120 s | gated hops | underruns | hop p50 / p99 / window-p99 max (ms, closed hops included) | ring (ms) | live estimate |
+|---|---|---|---|---|---|---|---|
+| 350, persist 1 (today) | 1503 | 22 | 181 | **0** | 7.2 / 31.5 / 36.6 | 177 | 376 ms |
+| 500, persist 1 | 1503 | 13 | 142 | **0** | 6.9 / 26.8 / 36.2 | 170 | 369 |
+| 500, persist 2 | 1503 | 13 | 142 | **0** | 7.4 / 30.8 / 35.6 | 170 | 369 |
+
+(hop p50 is low because a closed hop costs ~1 ms; the open-hop cost is the 17-19 ms of
+13.6. The estimate is hop 80 + ring 170 + compute + sola 30 + lookahead 40 + devices 22 +
+RNNoise 20: the hop-80 shape the user chose costs ~210 ms more than the code default.)
+
+Acceptance: lost speech per close <= 10 ms by the lookahead definition (it is 0); the
+final-consonant test (`test_gate_renders_the_final_consonant_of_a_sentence`: speech, then
+120 ms of noise 20 dB down, then silence: the noise is rendered within 30 dB of the
+speech and the close comes after it); no underruns in the 2-minute soaks (table above).
+
+### 14.2 B2: "I'd love a way to laugh"
+
+(a) Live. The harness `b2_laugh.py` runs a take through the user's chain in Speak and in
+Natural and reports, per laugh-like segment (>= 3 voiced pulses of 40-300 ms inside 1.2 s,
+or segments given on the command line): gate closes and opens inside it, the share of
+unvoiced frames RMVPE gives the pulses, the pulses' F0 p10/p90, and how far the auto-pitch
+register moves across it. No recording of the user laughing exists; on the typed
+"hahaha!" proxy (not a laugh: three TTS syllables) it finds one segment of 2 pulses,
+28 % unvoiced, F0 192-268 Hz, 0 gate closes, register move +0.2 st. The real
+measurement waits for a Record-button take of the user laughing and talking (20 s).
+
+(b) Typed. Neither backend has a laugh tag (Kokoro has no expressive markup; edge-tts
+strips SSML), so the insert is the spelling. `[laugh]`, `[laughs]`, `[laughing]`,
+`*laughs*`, `(laughs)` now become the same spoken "haha" as `lol` (set off by commas,
+dropped with `--laughter drop`; `test_an_explicit_laugh_insert_is_said_like_lol`).
+Spellings rendered through Mom for the ear, `out/ab/phase_b/b2/`: `typed_haha.wav`
+("haha", the insert's rendering), `typed_ha_ha_ha.wav`, `typed_hahaha_bang.wav`
+("hahaha!"), `typed_heh_heh.wav`, `typed_laugh_tag.wav` ("[laugh]", identical in text to
+the first), `typed_laugh_dropped.wav` (the same sentence with the laugh dropped). If none
+convinces, the answer is "the backend cannot", and the insert stays a comma-set "haha".
+
+### 14.3 B3: "the singing option doesn't seem to do much"
+
+**What Sing changes on Mom** (`b3_presets.py`: open stream at the user's shape, Speak =
+pitch 12 / protect 0.35 / ceiling 330 / formant -0.5 / index 0 (inert) / trim +6; Sing =
+the user's Sing entry: pitch 12 (they set it), protect 0.5 (= off), ceiling 360, index 0.3
+(inert), trim 0 / max gain +10):
+
+| take | preset | output F0 p50 / p95 / max (Hz) | voiced frames above the ceiling's knee | click | level |
+|---|---|---|---|---|---|
+| sung (30 s) | Speak | 310 / 330 / 346 | **96 %** (knee 262) | 1.11 | -16.1 |
+| sung | Sing | 321 / 358 / 366 | 87 % (knee 286) | 1.02 | -16.9 |
+| speech (30 s) | Speak | 209 / 266 / 320 | 6.4 % | 0.99 | -14.2 |
+| speech | Sing | 208 / 265 / 337 | 2.3 % | 1.21 | -14.2 |
+
+Sing differs from Speak by 30 Hz of ceiling and protect off (the user set both pitches to
++12; the index is inert on Mom); on speech that moves 4 % of voiced frames, which is why
+it "doesn't do much". The sung take's real problem is the transposition: +12 st puts a
+sung line at 310-360 Hz, above Mom's register (194.5 Hz median), and the soft ceiling
+is compressing 87-96 % of every voiced frame. (The seam metric is undefined at hop 80's
+12.5 Hz seam rate with 400 ms blocks and is left out.)
+
+**Natural** (`PRESETS` gains "natural"; `NoteDetector` in `pitch/base.py`;
+`RuntimeParams.note_detect / note_min_ms 400 / note_tolerance_st 1 / note_ceiling_hz /
+note_pitch_range / note_freeze_ms 100`): Speak's sliders and input chain, auto pitch on
+with `target_f0_hz` = the model's own (194.5), the ceiling always armed (Speak's, else the
+Sing ceiling), protect at the Speak value; a voiced run of 400 ms within +-1 st of its own
+running pitch is a held note, and while it lasts the Sing ceiling (360) and
+`NATURAL_NOTE_RANGE` (1.0) replace the speech values and the register stops following
+(from 100 ms into the run). All hot (device scalars and a `torch.where` in the F0 stage;
+`test_note.py`, the controller test). Measured on the same takes:
+
+| take | preset | output F0 p50 / p95 / max (Hz) | above the knee | held notes (>= 400 ms, +-1 st) | glide over a note, cents |p50| / |p95| | click | wav (`out/ab/phase_b/b3/`) |
+|---|---|---|---|---|---|---|---|
+| sung | Speak (+12 fixed) | 310 / 330 / 346 | 96 % | 2 (930 ms) | 27 / 52 (the singer's own) | 1.11 | `sung_speak.wav` |
+| sung | Sing | 321 / 358 / 366 | 87 % | 2 | 59 / 71 | 1.02 | `sung_sing.wav` |
+| sung | **Natural** | **197 / 276 / 297** | **11 %** | 2 | 43 / 77 | 1.20 | `sung_natural.wav` |
+| sung | Natural, note range 0.8 | 196 / 276 / 297 | 11 % | 2 | 42 / 70 | 1.15 | `sung_natural_range80.wav` |
+| sung | Natural without the register freeze | 193 / 267 / 291 | 7 % | 2 | 47 / 74 | 1.38 | `sung_natural_nofreeze.wav` |
+| sung | auto pitch alone (no note switch) | 193 / 267 / 291 | 7 % | 2 | 47 / 74 | 1.38 | `sung_natural_nonote.wav` |
+| speech | Speak | 209 / 266 / 320 | 6.4 % | 0 | - | 0.99 | `speech_speak.wav` |
+| speech | **Natural** | 189 / 247 / 291 | 2 % | 0 | - | 0.99 | `speech_natural.wav` |
+
+Auto pitch is what changes the sung take: the register lands on Mom's 194.5 Hz instead of
++12 st's 310, and the ceiling stops working on nearly every frame (96 % -> 7-11 %). The
+note switch is small on top of it on this take (only two runs of >= 400 ms within +-1 st in
+30 s of this singer's vibrato): the freeze keeps the register 4 cents further from the
+note (43 vs 47 cents of glide; the other 27 are the singer's), and the note ceiling
+(360) lets the held notes sit 4 % more often above the 330 knee. Speech under Natural is
+Speak's output 1 st lower (auto pitch puts the user's ~105 Hz median on 194.5 instead of
++12 = 210) with the same click ratio.
+
+The glide column is the output's F0 drift over each held note (400 ms in to the end,
+cents, |p50| / |p95|); in Speak (fixed pitch) it is the singer's own 27 / 52 cents.
+
+Natural is the third button in the Live screen; Speak and Sing are unchanged; no default
+changed. The register's follow (2 s) is still the wrong constant for a sung line that
+changes key mid-phrase (Q-open since §9); the note freeze does not touch it.
+
+### 14.4 B4: "moving the mic or my chair sometimes leaks a tiny bit"
+
+Four options, all flags (`GateConfig.onset_persist_chunks`, `ConditioningConfig
+.suppression_strength`, `.highpass_hz`, `ShapeParams.onset_ramp_energy_ms`; `vox run
+--onset-persist-chunks / --suppression-strength / --onset-ramp-energy-ms`), measured on
+the proxy take (T6) at the user's gate (-28, Silero, hangover 350) and chain. "Leaked" =
+the gate opened during a transient (or within 150 ms after it) with no phrase within
+300 ms; "lost speech" = speech frames (Silero >= 0.35 and energy >= -34 on the dry chain)
+never rendered; onset lag = first rendered input frame after each phrase start.
+
+*Transients at -8 to -2 dB under the voice's p95 (first proxy):* no variant leaked any of
+the 18 (baseline included); lost speech 340 ms / 78 s baseline, 580 with "max"
+suppression, 470 with the 90 Hz high-pass; onset lag p50 0 ms in every variant (the
+lookahead renders the audio before the open); WER 6.0 % baseline (Whisper small.en
+against the script), 6.0-8.0 across variants; UTMOS 2.69-2.74 (the variation of one
+render); sibilant centroid 6541-6549 Hz; conditioned speech level -15.30 to -15.34 dBFS.
+At that level a creak is 6 dB under the energy-only onset (threshold + 6) and Silero
+calls it non-speech, so today's gate already holds.
+
+*Transients at 0 / +4 / +8 dB over the voice's p95 (second proxy):*
+
+| variant | leaked / 18 | lost speech, ms per 60 s | onset lag p50 / p95 | WER | UTMOS |
+|---|---|---|---|---|---|
+| baseline | 0 | 270 | 0 / 5 | 9.3 % | 2.72 |
+| persist 2 | 0 | 270 | 0 / 5 | 7.3 | 2.72 |
+| suppression max | 0 | 416 | 0 / 33 | 8.7 | 2.74 |
+| high-pass 90 | 0 | 293 | 0 / 0 | 7.3 | 2.75 |
+| energy-onset ramp 10 ms | 0 | 270 | 0 / 5 | 6.0 | 2.72 |
+| all four | 0 | 362 | 0 / 61 | 9.3 | 2.74 |
+
+Still nothing leaks, and the reason is in front of the gate: **RNNoise removes the
+synthetic transients before the gate sees them.** Peak 10 ms level of each event after
+the chain, dry vs with RNNoise (dBFS): bumps -6..-11 -> -71..-81, taps -10..-14 -> -76..-81,
+creaks -5..-9 -> -54..-81 with one exception at -22.8 (the energy-only onset needs -22).
+So on this proxy the gate rules are untested by construction, and the leaks the user
+hears are transients RNNoise lets through, i.e. speech-like ones (a harmonic chair
+creak, a bump in the voice band). "Max" suppression costs 150 ms of speech per minute
+(RNNoise's own VAD calls soft onsets non-speech first) and the 90 Hz high-pass 20 ms, both
+without a gain here; the ramp and the persistence cost nothing because no energy-only
+onset ever fired (every phrase opened with the VAD, lag 0-5 ms thanks to the lookahead).
+WER moves 6-9 % between renders of the same take (Whisper on a 78 s proxy; the seed's
+noise), so none of the variants is distinguishable by it; UTMOS 2.72-2.75 likewise.
+
+*RNNoise off in the chain (the transients reach the gate; what the rules do to a leak):*
+
+| variant | leaked / 18 (creak / bump / tap) | gate opens | lost speech, ms per 60 s | onset lag p50 / p95 |
+|---|---|---|---|---|
+| baseline | 18 (6 / 6 / 6) | 36 | 200 | 0 / 48 |
+| **persist 2** | **9 (6 / 1 / 2)** | 27 | 200 | 0 / 48 |
+| high-pass 90 | 18 (6 / 6 / 6) | 36 | 46 | 0 / 0 |
+| energy-onset ramp 10 ms | 18 | 36 | 200 | 0 / 48 |
+| persist 2 + ramp 10 | 9 (6 / 1 / 2) | 27 | 200 | 0 / 48 |
+
+Without RNNoise every transient opens the gate on energy alone. The persistence rule
+stops the 25 ms taps and 60 ms bumps (one chunk each) and none of the 150 ms creaks (two
+chunks loud), at no cost in speech or onset lag. The 90 Hz high-pass stops nothing but
+changes what the auto level sees in pauses (46 vs 200 ms of "lost" speech is the AGC
+settling differently, not the gate). The ramp changes only how an energy-only onset
+fades in (the wav, not the count).
+
+### 14.5 Tests
+
+`tests/unit/test_gate.py` (+2: the hangover guard, onset persistence with the energy-only
+flag), `tests/unit/test_note.py` (new, 5: the detector's timing, vibrato vs jumps,
+unvoiced resets and the disabled state, the register freeze and range override, the
+ceiling switch), `tests/unit/test_suppression.py` (+1: "max" strength),
+`tests/tts/test_normalize.py` (+1 x 7 spellings), `tests/api/test_controller.py` (+1 the
+Natural preset; the Sing expectation grew the four mode fields `set_preset` now sends),
+`tests/engine/test_worker.py` (+1 drift trim), `tests/engine/test_engine.py` (+1 final
+consonant). Suite: 842 passed, 1 skipped, 2 xfail; `test_worker_rebuilds_shape_live_and_keeps_running` failed once in the full run (graphs fell back to eager after the hop change, with the GUI and the desktop apps on the GPU) and passes with `test_worker.py` alone (7 passed), as 12.4 / 13.10 recorded for the same file.
+
+### 14.6 Not verified
+
+- Listening: none of the phase-B wavs has been heard. The B1 hangover A/B, the Natural
+  renders and the typed-laugh spellings are the user's to decide.
+- B2 (a) and B4 on real material: both need a Record-button take (laughing; creaks and
+  bumps). The proxy transients are synthetic; a real creak's spectrum and the VAD's answer
+  to it may differ.
+- The drift-trim fix was shown to discard digital silence instead of the hangover's
+  -68 dBFS render; a case where the pre-fix rule discards voice needs a hangover shorter
+  than the ring (the test) or an underrun during a sentence end (not caught in a soak).
+- The Natural preset's register follow on key changes mid-line (§9's open question).
+- `NATURAL_NOTE_RANGE` is 1.0 (intervals kept); 0.8 was rendered for the ear only.
+
+### 14.7 What the user heard (2026-10-22, the files above, not blind)
+
+- B1: `base_hop20_right0` "ass"; `base_hop20_right40` "a little better but unhuman";
+  `base_hop80_right0` "stutters"; `base_hop80_right40` "nothing actually cut off";
+  **`hang500_hop80_right40` "sounds really good and smooth ... as for pronunciation and
+  cut offs, its great"**; `hang600` "small stutters but no cutoffs". Verdict: hangover
+  500. The hangover default (`VadConfig.release_ms`, and the profile's calibration.json)
+  is now 500 ms.
+- B3: `sung_speak` "sounds so bad"; `sung_natural` "sounds decent actually, but voice did
+  drop in pitch"; `sung_natural_range80` "decent but it dropped the high pitch voice to
+  SUPER low"; `speech_speak` "goat"; `speech_natural` "sounds okay yea". Natural is
+  better than Speak on singing and not worse on speech, but the sung register landing on
+  Mom's *spoken* median (194.5 Hz) is too low for singing: the next step is a sung
+  target above the spoken one (a `note_target_offset_st` on held notes, or a higher
+  `target_f0_hz` in Natural), heard before it becomes a default. Natural stays a preset.
+- B2: `typed_hahaha_bang` "would be great with some improvements"; `typed_haha` "too
+  forced"; `ha_ha_ha` "needs serious improvement"; `heh_heh` no; the dropped one is no
+  laugh. Verdict: the backend's laugh is not convincing yet; "hahaha!" is the best
+  spelling but still "needs improvements", so `LAUGH_SPOKEN` stays "haha" and the laugh
+  (spelling, speed, pitch contour, breath) is open expressive work.
+- B4: `all` (the proxy with its deliberate 1.5 s pauses) "sounds really good ... when the
+  louder part came in it kinda bugged out just a tiny bit"; `persist2_hp90` "sounds great
+  too, almost like narrating a story slowly". No leak to judge on the proxy (14.4); the
+  "louder again" glitch is the auto level's fast-down gain on the shout (8.2), not B4.
+
+**Defaults, one line each, if the user hears what the numbers say:** B1: hangover 500 ms (done, 14.7). B2: no default change (the best spelling is still unconvincing, 14.7); nothing live until the take exists. B3: Natural as the default preset once its sung register is raised (14.7); until then a preset. B4: nothing until a real creak/bump take; `onset_persist_chunks = 2` is the candidate (halves the leaks RNNoise does not catch, costs nothing measurable; the user liked `persist2_hp90` by ear), the high-pass stays 70, "max" suppression stays off (150 ms/min of speech)..
