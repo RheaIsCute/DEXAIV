@@ -74,6 +74,7 @@ class ChunkPlan:
     # Device samples of the fade-in on a gate-onset hop; 0 or >= sola_buffer = the plain
     # overlap fade (engine/sola.py ``mark_onset``).
     onset_ramp: int = 0
+    onset_ramp_energy: int = 0  # the fade-in of an energy-only gate onset (0 = onset_ramp)
 
     def ms(self, device_samples: int) -> float:
         return 1000.0 * device_samples / self.device_sr
@@ -172,14 +173,15 @@ def from_shape(shape, model_sr: int, f0_tail_16k: int = 0) -> ChunkPlan:
     return plan(shape.block_ms, shape.crossfade_ms, shape.extra_ms, shape.sola_search_ms,
                 shape.device_sr, model_sr, f0_tail_16k, shape.decoder_context_ms,
                 shape.overlap_beyond_hop, round(ANALYSIS_SR * shape.embed_pad_ms / 1000.0),
-                shape.onset_ramp_ms, shape.extra_right_ms)
+                shape.onset_ramp_ms, shape.extra_right_ms, shape.onset_ramp_energy_ms)
 
 
 def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: float,
          device_sr: int, model_sr: int, f0_tail_16k: int = 0,
          decoder_context_ms: float = 0.0, overlap_beyond_hop: bool = False,
          embed_pad_16k: int = 0, onset_ramp_ms: float = 0.0,
-         extra_right_ms: float = 0.0) -> ChunkPlan:
+         extra_right_ms: float = 0.0,
+         onset_ramp_energy_ms: float = 0.0) -> ChunkPlan:
     """Derive every size from the four user-facing durations.
 
     ``f0_tail_16k`` is the pitch extractor's tail requirement; when it exceeds the
@@ -241,4 +243,5 @@ def plan(block_ms: float, crossfade_ms: float, extra_ms: float, sola_search_ms: 
         decoder_out=return_length * (model_sr // 100), out_device=return_length * zc,
         embed_pad_16k=embed_pad_16k,
         onset_ramp=max(0, round(device_sr * onset_ramp_ms / 1000.0)),
+        onset_ramp_energy=max(0, round(device_sr * onset_ramp_energy_ms / 1000.0)),
     )

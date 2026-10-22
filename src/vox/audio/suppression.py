@@ -11,7 +11,10 @@ AGC and the gate measure the denoised signal. Runs on the worker thread, one blo
 
 RNNoise's output trails its input by ``DELAY`` samples (20 ms, measured). With
 ``mix`` < 1 the dry part is taken through the same delay so the two stay aligned (no comb
-filter). Switching on or off crossfades over ``FADE_MS`` between the undelayed dry signal
+filter). ``strength = "max"`` (docs/DEVIATIONS.md §14, B4) also uses the speech probability
+RNNoise returns per 10 ms frame: frames it calls non-speech (below ``MAX_VAD``) are taken
+down a further ``MAX_FLOOR`` (one-pole smoothed over frames, so no zipper), which removes
+the residual it leaves on creaks and bumps between sentences. Switching on or off crossfades over ``FADE_MS`` between the undelayed dry signal
 and that delayed mix; after an idle period the network first runs ``WARMUP_MS`` unheard so
 its recurrent state is settled before it is faded in.
 """
@@ -30,6 +33,10 @@ DELAY = 960  # output trails input by 20 ms (measured on speech, corr 0.99)
 SCALE = 32768.0  # RNNoise works on int16-range floats
 FADE_MS = 20.0
 WARMUP_MS = 100.0
+STRENGTHS = ("normal", "max")
+MAX_VAD = 0.5  # "max": frames under this speech probability are attenuated further...
+MAX_FLOOR = 0.1  # ...down to this gain (-20 dB), the gain gliding over MAX_RELEASE_FRAMES
+MAX_RELEASE_FRAMES = 5  # 50 ms one-pole on the extra gain (attack is the same constant)
 
 _LIB: ctypes.CDLL | None = None
 _LIB_ERROR: str | None = None
@@ -79,7 +86,8 @@ class Suppressor:
     """One RNNoise state, a dry delay line and the on/off crossfade. Allocation-free per
     block: every buffer is made in ``resize``; ``process`` only writes into them."""
 
-    def __init__(self, block: int, enabled: bool = False, mix: float = 1.0) -> None:
+    def __init__(self, block: int, enabled: bool = False, mix: float = 1.0,
+                 strength: str = "normal") -> None:
         lib = _library()
         if lib is None:
             raise RuntimeError(_LIB_ERROR or "RNNoise unavailable")
@@ -88,6 +96,9 @@ class Suppressor:
         self.enabled = enabled
         self.mix = float(mix)
         self._mix_now = self.mix
+        self.strength = strength
+        self._vad_gain = 1.0  # "max": the extra per-frame gain, smoothed
+        self.last_vad = 0.0  # RNNoise's speech probability of the last frame (stats)
         self._step = 1.0 / (SR * FADE_MS / 1000.0)  # wet weight change per sample
         self._warmup = int(SR * WARMUP_MS / 1000.0)
         self.resize(block)
@@ -114,6 +125,7 @@ class Suppressor:
         self._line = line
         self._wet = np.zeros(block, dtype=np.float64)
         self._weights = np.zeros(block, dtype=np.float64)
+        self._frame_ramp = np.arange(1, FRAME + 1, dtype=np.float64) / FRAME
         self._ramp = np.arange(1, block + 1, dtype=np.float64)
         self._out = np.zeros(block, dtype=np.float64)
 
@@ -125,13 +137,19 @@ class Suppressor:
         self._w = 1.0 if self.enabled else 0.0
         self._ran = self._warmup if self.enabled else 0
         self._mix_now = self.mix
+        self._vad_gain = 1.0
 
-    def set(self, enabled: bool | None = None, mix: float | None = None) -> None:
+    def set(self, enabled: bool | None = None, mix: float | None = None,
+            strength: str | None = None) -> None:
         """Hot: takes effect over the next blocks (crossfade, mix glide)."""
         if enabled is not None:
             self.enabled = bool(enabled)
         if mix is not None:
             self.mix = min(1.0, max(0.0, float(mix)))
+        if strength is not None:
+            if strength not in STRENGTHS:
+                raise ValueError(f"suppression strength must be one of {STRENGTHS}")
+            self.strength = strength
 
     @property
     def active(self) -> bool:
@@ -162,8 +180,18 @@ class Suppressor:
         frames *= SCALE
         process = self._lib.rnnoise_process_frame
         state = self._state
-        for ptr in self._ptrs:
-            process(state, ptr, ptr)
+        strong = self.strength == "max"
+        gain = self._vad_gain
+        for k, ptr in enumerate(self._ptrs):
+            self.last_vad = vad = process(state, ptr, ptr)
+            if strong:
+                # extra attenuation on frames RNNoise calls non-speech, glided per frame
+                want = 1.0 if vad >= MAX_VAD else MAX_FLOOR
+                nxt = gain + (want - gain) / MAX_RELEASE_FRAMES
+                seg = frames[k * FRAME:(k + 1) * FRAME]
+                seg *= gain + (nxt - gain) * self._frame_ramp
+                gain = nxt
+        self._vad_gain = gain
         wet[:] = frames
         wet *= 1.0 / SCALE
         # "on" signal: the denoised voice, with (1 - mix) of the equally delayed dry input.

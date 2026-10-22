@@ -320,3 +320,24 @@ def test_hot_params_apply_between_hops_without_reallocating(engine, clip_48k):
     pipeline.set_params(engine.params)
     assert high == pytest.approx(2 * low, rel=0.05)
     assert pointers == {k: v.data_ptr() for k, v in pipeline.buffers().items()}
+
+
+def test_gate_renders_the_final_consonant_of_a_sentence(engine, clip_48k):
+    """A sentence that ends in a low consonant: a second of speech followed by 120 ms of
+    quiet noise 20 dB down, then silence. The gate closes on the hangover, after the
+    stream delay has passed, so the consonant is rendered, not drained away
+    (docs/DEVIATIONS.md §14.1, B1)."""
+    rng = np.random.default_rng(0)
+    plan = engine.plan
+    speech = clip_48k[: SR]
+    consonant = (0.1 * np.sqrt(np.mean(speech ** 2)) * rng.standard_normal(int(0.12 * SR)))
+    audio = np.concatenate([speech, consonant, np.zeros(SR)]).astype(np.float32)
+    result = StreamSimulator(engine).run(audio, gate=True, seed=0)
+    closes = [e["hop"] for e in result.events if e["kind"] == "gate_close"]
+    assert closes, "the gate never closed"
+    start = SR + plan.stream_delay  # where the consonant lands in the output
+    rendered = result.audio[start:start + int(0.12 * SR)]
+    assert np.abs(rendered).max() > 0.0  # not digital silence
+    assert np.sqrt(np.mean(rendered ** 2)) > 0.03 * np.sqrt(np.mean(
+        result.audio[int(0.5 * SR):int(0.9 * SR)] ** 2))  # within 30 dB of the speech
+    assert closes[0] * plan.block >= start + len(consonant)  # closed after it was emitted

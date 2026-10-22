@@ -311,3 +311,60 @@ def test_formant_steps_switch_live_without_underruns_once_cached(engine, clip_48
     assert np.abs(live[-SR:]).max() > 0.01  # the voice came back after the capture
     pipe.set_params(base)
     graphs.sync_formant()
+
+
+def test_drift_trim_waits_until_the_queued_output_is_silence(engine, clip_48k):
+    """An output ring sitting over its target (an underrun refill or clock drift) used to be
+    trimmed on the first closed hop, which dropped the oldest queued output: the end of the
+    sentence (docs/DEVIATIONS.md §14.1). Now the trim waits until everything queued was
+    written by silent hops. Short hangover so the ring still holds speech at the close;
+    the stream must then equal the simulator's gated stream (which never trims)."""
+    speech = clip_48k[: 2 * SR]
+    audio = np.concatenate([speech, np.zeros(2 * SR, np.float32), speech, np.zeros(SR, np.float32)])
+    before = engine.gate.config
+    short = dataclasses.replace(before, hangover_ms=80.0, enabled=True)
+    engine.gate.set_config(short)
+    try:
+        torch.manual_seed(0)
+        sim = StreamSimulator(engine).run(audio, gate=True, seed=0)
+        plan = engine.plan
+        in_ring = SPSCRing(2 * SR, guard=4 * CALLBACK)
+        out_ring = SPSCRing(SR, guard=2 * plan.block)
+        hop_event = threading.Event()
+        torch.manual_seed(0)
+        engine.pipeline.reset()
+        engine.sola.reset()
+        engine.gate.reset()
+        engine.conditioner.reset()
+        engine.timers.reset()
+        fill = int(SR * 0.05)
+        # primed with 4 extra hops, as an underrun refill leaves it: over target + block
+        worker = InferenceWorker(engine.pipeline, engine.sola, engine.gate, engine.graphs,
+                                 engine.timers, in_ring, out_ring, hop_event,
+                                 fill + 4 * plan.block, log=lambda *_: None,
+                                 conditioner=engine.conditioner)
+        seconds = len(audio) / SR + 0.5
+        feeder = FileInput(audio, SR, CALLBACK, in_ring, plan.block, hop_event)
+        reader = OutputReader(out_ring, seconds)
+        worker.start()
+        worker.ready.wait(5.0)
+        feeder.start()
+        worker.first_hop.wait(5.0)
+        worker.fill_target = fill  # now the ring is 4 hops over target: the trim is due
+        reader.start()
+        reader.join()
+        feeder.stop()
+        worker.stop()
+        live = np.concatenate(reader.chunks)
+    finally:
+        engine.gate.set_config(before)
+    assert worker.stats.errors == [] and out_ring.underruns == 0
+    assert worker.stats.gate_transitions >= 2
+    assert worker.stats.drift_trims >= 1  # the pause did let it trim...
+    n = min(len(sim.audio), len(live))
+    best = min(range(0, int(0.3 * SR), plan.zc // 2),
+               key=lambda lag: np.mean(np.abs(live[lag:n] - sim.audio[: n - lag])))
+    aligned, reference = live[best:n], sim.audio[: n - best]
+    # ...but the first sentence (its end included) is the simulator's, sample for sample
+    first = slice(int(0.5 * SR), int(2.3 * SR))
+    assert np.mean(np.abs(aligned[first] - reference[first])) < 1e-4

@@ -54,6 +54,9 @@ class ConditioningConfig:
     limit_dbfs: float = -3.0  # soft-limiter ceiling
     suppression: bool = False  # RNNoise after the high-pass (LiveSession resolves it)
     suppression_mix: float = 1.0  # 1 = fully denoised; lower keeps some dry (sung notes)
+    # "normal" = RNNoise as is; "max" also gates its residual on its own frame VAD
+    # (audio/suppression.py; docs/DEVIATIONS.md §14 B4 A/B)
+    suppression_strength: str = "normal"
 
 
 def _alpha(block_ms: float, tau_ms: float) -> float:
@@ -75,7 +78,8 @@ class InputConditioner:
         self.suppressor = None
         if suppression.unavailable_reason(sr) is None and block % suppression.FRAME == 0:
             self.suppressor = suppression.Suppressor(block, self.config.suppression,
-                                                     self.config.suppression_mix)
+                                                     self.config.suppression_mix,
+                                                     self.config.suppression_strength)
         self.resize(block)
         self.reset()
 
@@ -107,7 +111,8 @@ class InputConditioner:
         if redesign:
             self._design()
         if self.suppressor is not None:
-            self.suppressor.set(config.suppression, config.suppression_mix)
+            self.suppressor.set(config.suppression, config.suppression_mix,
+                                config.suppression_strength)
 
     def reset(self) -> None:
         if self._zi is not None:

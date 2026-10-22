@@ -7,9 +7,12 @@ The decision runs on the host from the hop's device-rate block (docs/research/03
 VAD's recurrent state never skip audio. The gate opens on a block at least
 ``threshold_dbfs`` loud that the VAD calls speech, or, before the VAD has caught up, on a
 block ``onset_margin_db`` above the threshold (held only ``ONSET_PROBATION_MS`` unless the
-VAD confirms it). Once open it stays open down to ``threshold_dbfs - hysteresis_db`` and a
-VAD probability of ``vad_threshold - vad_hysteresis`` (Silero's own neg_threshold rule),
-then for ``hangover_ms`` more. No GPU work and no device sync happens here.
+VAD confirms it; with ``onset_persist_chunks`` > 1 the rise must also have lasted that many
+32 ms VAD chunks, docs/DEVIATIONS.md §14). Once open it stays open down to
+``threshold_dbfs - hysteresis_db`` and a VAD probability of ``vad_threshold -
+vad_hysteresis`` (Silero's own neg_threshold rule), then for ``hangover_ms`` more, never
+less than the stream delay (so the speech still inside the lookahead is rendered before the
+drain). No GPU work and no device sync happens here.
 
 What the worker (or the stream simulator) does with a ``GateDecision``:
 
@@ -66,6 +69,11 @@ class GateConfig:
     # most speech-like of them (an onset late in the hop's first chunk still counts),
     # "last" on the newest only (the pre-fix behaviour, docs/DEVIATIONS.md §8).
     vad_reduce: str = "max"
+    # Energy-only onset probation (docs/DEVIATIONS.md §14, B4): the rise must have lasted
+    # this many completed 32 ms VAD chunks before the gate opens without the VAD. 1 = the
+    # block's own level only (today); 2 = one extra chunk, so a 20-50 ms creak or desk tap
+    # does not open the gate.
+    onset_persist_chunks: int = 1
 
 
 @dataclass(frozen=True)
@@ -75,6 +83,7 @@ class GateDecision:
     drain: bool = False  # first closed hop after speech: fade the SOLA tail out
     rms_dbfs: float = -120.0
     vad_prob: float = 0.0
+    energy_only: bool = False  # the onset opened on the energy rule, not the VAD
 
 
 class SileroVad:
@@ -166,11 +175,15 @@ class SilenceGate:
         self._recent = np.full(max(1, math.ceil(ONSET_BACKGROUND_MS / plan.block_ms)), -120.0)
         self._acc = np.zeros(VAD_CHUNK + self._decimate.out_len, dtype=np.float32)
         self._acc_len = 0
+        self._chunk_levels = np.full(4, -120.0)  # dBFS of the last completed VAD chunks
         self.transitions = 0
         self.reset()
 
     def _set_hops(self, config: GateConfig) -> None:
-        self.hangover_hops = max(1, math.ceil(config.hangover_ms / self.plan.block_ms))
+        # Never shorter than the stream delay: the output trails the input by it, so a
+        # shorter hangover would drain before the speech inside the lookahead is rendered.
+        self.hangover_hops = max(1, math.ceil(config.hangover_ms / self.plan.block_ms),
+                                 math.ceil(self.plan.stream_delay / self.plan.block))
         self.probation_hops = min(self.hangover_hops,
                                   max(1, math.ceil(ONSET_PROBATION_MS / self.plan.block_ms)))
 
@@ -181,6 +194,7 @@ class SilenceGate:
         self._acc_len = 0
         self._recent[:] = -120.0  # block levels of the last ONSET_BACKGROUND_MS
         self._recent_pos = 0
+        self._chunk_levels[:] = -120.0
         self._decimate.reset()
         if self.vad is not None:
             self.vad.reset()
@@ -206,10 +220,23 @@ class SilenceGate:
         while self._acc_len >= VAD_CHUNK:
             prob = self.vad.prob(self._acc[:VAD_CHUNK])
             peak = max(peak, prob) if self.config.vad_reduce == "max" else prob
+            # the chunk's own level, for the onset persistence rule
+            self._chunk_levels[:-1] = self._chunk_levels[1:]
+            self._chunk_levels[-1] = rms_dbfs(self._acc[:VAD_CHUNK])
             self._acc[:self._acc_len - VAD_CHUNK] = self._acc[VAD_CHUNK:self._acc_len]
             self._acc_len -= VAD_CHUNK
         if peak >= 0.0:
             self._vad_prob = peak
+
+    def _rise_persisted(self) -> bool:
+        """The energy-only onset's extra rule: the last ``onset_persist_chunks`` completed
+        VAD chunks all stood ``onset_margin_db`` over the threshold (the VAD-less gate has
+        no chunks: the block's level alone decides)."""
+        need = self.config.onset_persist_chunks
+        if need <= 1 or self.vad is None:
+            return True
+        cfg = self.config
+        return bool(np.all(self._chunk_levels[-need:] >= cfg.threshold_dbfs + cfg.onset_margin_db))
 
     def decide(self, block: np.ndarray) -> GateDecision:
         level = rms_dbfs(block)
@@ -235,7 +262,8 @@ class SilenceGate:
         self._recent[self._recent_pos] = level
         self._recent_pos = (self._recent_pos + 1) % len(self._recent)
         strong = (not self.open and level >= cfg.threshold_dbfs + cfg.onset_margin_db
-                  and level >= background + ONSET_RISE_DB)
+                  and level >= background + ONSET_RISE_DB and self._rise_persisted())
+        energy_only = False
         if loud and voiced:
             self._remaining = self.hangover_hops
             speech = True
@@ -244,6 +272,7 @@ class SilenceGate:
             # this level is now the background: a second energy-only open needs a new rise
             self._recent[:] = level
             speech = True
+            energy_only = True
         elif self._remaining > 0:
             self._remaining -= 1  # this hop is inside the hangover: still open
             speech = True
@@ -255,4 +284,4 @@ class SilenceGate:
             self.transitions += 1
         self.open = speech
         return GateDecision(speech, onset=onset, drain=drain, rms_dbfs=level,
-                            vad_prob=self._vad_prob)
+                            vad_prob=self._vad_prob, energy_only=onset and energy_only)

@@ -60,6 +60,10 @@ class ShapeParams:
     # this many ms instead of the whole overlap, so the decoded pre-onset consonant is kept.
     # 0 = the pre-fix fade (the full overlap from a silent SOLA tail).
     onset_ramp_ms: float = 5.0
+    # B4 A/B (docs/DEVIATIONS.md §14): a longer fade-in for an onset the gate opened on the
+    # energy rule alone (the VAD had not confirmed it): a creak or tap that slipped through
+    # then starts softer. 0 = the same ramp as a VAD onset.
+    onset_ramp_energy_ms: float = 0.0
 
 
 @dataclass
@@ -103,6 +107,18 @@ class RuntimeParams:
     target_f0_hz: float = 200.0  # the model's register (vox say's target_f0_hint)
     pitch_follow_s: float = 2.0
     pitch_range: float = 1.0
+    # Sustained-note detection (docs/DEVIATIONS.md §14, the Natural preset): a voiced run
+    # of at least ``note_min_ms`` whose F0 stays within +-``note_tolerance_st`` of the
+    # run's own running pitch is a held note. While one is on, ``note_ceiling_hz`` (0 =
+    # ``f0_ceiling_hz``) and ``note_pitch_range`` replace the speech values, and the auto
+    # pitch register stops following (a running mean would slide a held note toward the
+    # target) once the run is ``note_freeze_ms`` old. All hot, device-side, graph-safe.
+    note_detect: bool = False
+    note_min_ms: float = 400.0
+    note_tolerance_st: float = 1.0
+    note_ceiling_hz: float = 0.0
+    note_pitch_range: float = 1.0
+    note_freeze_ms: float = 100.0
     # Formant (docs/DEVIATIONS.md §12): resonances shifted by this many semitones while the
     # pitch stays put; negative = deeper / bigger, positive = lighter / smaller. -4..+4 in
     # 0.5 st steps (each step is its own decoder shape: a cached synth graph).

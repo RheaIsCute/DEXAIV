@@ -313,7 +313,7 @@ class StreamSimulator:
             try:
                 if decision.speech:
                     if decision.onset and not sola.draining:  # as the live worker does
-                        sola.mark_onset()
+                        sola.mark_onset(decision.energy_only)
                         pipeline.on_onset()
                     infer = pipeline.process_hop()
                     with timers.stage("sola"):

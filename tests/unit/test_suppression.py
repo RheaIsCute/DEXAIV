@@ -122,3 +122,27 @@ def test_conditioner_runs_it_after_the_high_pass_and_reports_its_delay():
         cond.process(x[i:i + BLOCK])
     assert cond.delay_ms == 0.0
     assert InputConditioner(32000, 640).suppressor is None  # 48 kHz only
+
+
+def test_max_strength_takes_non_speech_frames_further_down_and_leaves_speech_alone():
+    """"max" gates RNNoise's residual on its own frame VAD: steady noise between the
+    "words" of a synthetic signal comes out lower than with "normal", the voiced part
+    does not (docs/DEVIATIONS.md §14 B4)."""
+    rng = np.random.default_rng(3)
+    x = noisy_voice(2.0)
+    x[SR:] = 0.01 * rng.standard_normal(SR)  # second half: the fan alone
+    normal = run(suppression.Suppressor(BLOCK, enabled=True), x)
+    strong = run(suppression.Suppressor(BLOCK, enabled=True, strength="max"), x)
+    assert len(normal) == len(strong)
+    voice = slice(SR // 4, SR - SR // 10)
+    noise = slice(SR + SR // 4, 2 * SR - BLOCK)
+    rms = lambda a: float(np.sqrt(np.mean(a * a)) + 1e-12)
+    assert rms(strong[noise]) < 0.5 * rms(normal[noise])
+    assert abs(20 * np.log10(rms(strong[voice]) / rms(normal[voice]))) < 1.0
+    with pytest.raises(ValueError, match="strength"):
+        suppression.Suppressor(BLOCK).set(strength="loud")
+    cond = InputConditioner(SR, BLOCK, ConditioningConfig(auto_level=False, suppression=True,
+                                                          suppression_strength="max"))
+    assert cond.suppressor.strength == "max"
+    cond.set_config(ConditioningConfig(auto_level=False, suppression=True))
+    assert cond.suppressor.strength == "normal"

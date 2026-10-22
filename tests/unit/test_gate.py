@@ -208,11 +208,13 @@ def test_weak_onset_waits_for_the_vad():
 
 
 def test_level_hysteresis_holds_the_gate_through_a_soft_syllable():
-    plan, gate, _ = vad_gate(level=0.9, hangover_ms=20.0)  # hangover of one hop
+    plan, gate, _ = vad_gate(level=0.9, hangover_ms=20.0)  # asks for one hop...
+    assert gate.hangover_hops == 2  # ...but the 30 ms stream delay needs two (the guard)
     open_with(gate, at_dbfs(plan.block, -45.0))
     for _ in range(10):  # 5 dB under the open threshold: still inside the hysteresis
         assert gate.decide(at_dbfs(plan.block, -53.0)).speech
-    gate.decide(at_dbfs(plan.block, -56.0))  # below threshold - 6: the hangover hop
+    gate.decide(at_dbfs(plan.block, -56.0))  # below threshold - 6: the hangover hops
+    assert gate.decide(at_dbfs(plan.block, -56.0)).speech
     assert not gate.decide(at_dbfs(plan.block, -56.0)).speech
     assert not gate.decide(at_dbfs(plan.block, -53.0)).speech  # and -53 cannot reopen it
 
@@ -232,6 +234,53 @@ def test_default_hangover_is_350_ms():
     assert GateConfig().hangover_ms == 350.0
     _, gate, _ = vad_gate(hangover_ms=GateConfig().hangover_ms)
     assert gate.hangover_hops == 18  # ceil(350 / 20)
+
+
+def test_hangover_never_undercuts_the_stream_delay():
+    """The output trails the input by overlap + search + right context: a hangover shorter
+    than that would drain the SOLA tail while the end of the sentence is still inside the
+    lookahead (docs/DEVIATIONS.md §14.1)."""
+    plan = chunker.plan(20, 20, 500, 10, SR, SR, extra_right_ms=40.0)  # delay 70 ms
+    gate = SilenceGate(plan, GateConfig(hangover_ms=20.0, use_vad=False))
+    assert gate.hangover_hops == 4  # ceil(70 / 20)
+    gate = SilenceGate(plan, GateConfig(hangover_ms=350.0, use_vad=False))
+    assert gate.hangover_hops == 18  # the asked-for hangover when it is the longer one
+    gate.set_config(GateConfig(hangover_ms=0.0, use_vad=False))
+    assert gate.hangover_hops == 4
+
+
+def test_energy_only_onset_waits_for_the_rise_to_persist_when_asked():
+    """``onset_persist_chunks = 2``: a one-chunk burst (a desk tap) no longer opens the
+    gate on energy alone; a rise that lasts two chunks still does, and the decision says
+    it was an energy-only onset."""
+    plan, gate, vad = vad_gate(level=0.0, onset_persist_chunks=2)
+    quiet, loud = at_dbfs(plan.block, -70.0), at_dbfs(plan.block, -30.0)
+    for _ in range(12):
+        assert not gate.decide(quiet).speech
+    # one loud 20 ms block: its chunk is loud but the one before it was quiet
+    assert not gate.decide(loud).speech
+    assert not gate.decide(quiet).speech
+    for _ in range(10):
+        gate.decide(quiet)
+    # a rise that keeps going opens once two loud 32 ms chunks have completed: never on
+    # the first 20 ms block, within 64 ms (four blocks) at the latest
+    decisions = [gate.decide(loud) for _ in range(5)]
+    opened = next(i for i, d in enumerate(decisions) if d.speech)
+    assert 1 <= opened <= 3, opened
+    assert decisions[opened].onset and decisions[opened].energy_only
+    assert all(not d.speech for d in decisions[:opened])
+    # and with the default (1 chunk) the single block opens at once, as before
+    plan, gate, vad = vad_gate(level=0.0)
+    for _ in range(12):
+        gate.decide(quiet)
+    d = gate.decide(loud)
+    assert d.speech and d.onset and d.energy_only
+    # a VAD-confirmed onset is never energy-only
+    plan, gate, vad = vad_gate(level=0.9, onset_persist_chunks=2)
+    for _ in range(12):
+        gate.decide(quiet)
+    d = gate.decide(at_dbfs(plan.block, -40.0))
+    assert d.speech and d.onset and not d.energy_only
 
 
 class SequenceVad(ScriptedVad):

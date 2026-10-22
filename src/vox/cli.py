@@ -88,6 +88,14 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                    help="silence gate (energy + Silero VAD, hangover from the profile)")
     p.add_argument("--gate-threshold", type=float, default=None,
                    help="gate energy threshold in dBFS (default: calibration.json)")
+    p.add_argument("--hangover-ms", type=float, default=None,
+                   help="gate hangover after the last speech (default: calibration.json, "
+                        "350; never under the stream delay)")
+    p.add_argument("--onset-persist-chunks", type=int, default=None,
+                   help="energy-only gate onset: the rise must last this many 32 ms chunks "
+                        "(default 1; 2 keeps creaks and taps out, docs/DEVIATIONS.md 14)")
+    p.add_argument("--onset-ramp-energy-ms", type=float, default=None,
+                   help="fade-in of an energy-only gate onset (default: the onset ramp)")
     p.add_argument("--auto-level", choices=("on", "off"), default=None,
                    help="microphone auto level (AGC toward -20 dBFS speech; default on)")
     p.add_argument("--input-gain-db", type=float, default=None,
@@ -96,6 +104,9 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                    help="the whole input chain (high-pass, level, limiter); off = raw mic")
     p.add_argument("--suppression-mix", type=float, default=None,
                    help="RNNoise wet/dry mix 0-1 when suppression is on (default 1)")
+    p.add_argument("--suppression-strength", choices=("normal", "max"), default=None,
+                   help="max: RNNoise's residual is also gated on its own frame VAD "
+                        "(docs/DEVIATIONS.md 14)")
 
 
 def conditioning_config(profile, args: argparse.Namespace):
@@ -109,7 +120,9 @@ def conditioning_config(profile, args: argparse.Namespace):
                               auto_level=getattr(args, "auto_level", None) != "off",
                               trim_db=cal.input_gain_db if trim is None else trim,
                               noise_floor_dbfs=cal.noise_floor_dbfs,
-                              suppression_mix=1.0 if mix is None else mix)
+                              suppression_mix=1.0 if mix is None else mix,
+                              suppression_strength=getattr(args, "suppression_strength", None)
+                              or "normal")
 
 
 def gate_config(profile, args: argparse.Namespace):
@@ -118,10 +131,14 @@ def gate_config(profile, args: argparse.Namespace):
 
     cal = profile.calibration
     threshold = getattr(args, "gate_threshold", None)
+    hangover = getattr(args, "hangover_ms", None)
+    persist = getattr(args, "onset_persist_chunks", None)
     return GateConfig(enabled=args.gate != "off",
                       threshold_dbfs=cal.silence_gate_dbfs if threshold is None else threshold,
-                      vad_threshold=cal.vad.threshold, hangover_ms=cal.vad.release_ms,
-                      use_vad=cal.vad.engine == "silero")
+                      vad_threshold=cal.vad.threshold,
+                      hangover_ms=cal.vad.release_ms if hangover is None else hangover,
+                      use_vad=cal.vad.engine == "silero",
+                      onset_persist_chunks=1 if persist is None else max(1, persist))
 
 
 def resolve(args: argparse.Namespace):
@@ -148,7 +165,7 @@ def resolve(args: argparse.Namespace):
     shape = profile.runtime.shape()
     overrides = {k: getattr(args, k, None)
                  for k in ("block_ms", "crossfade_ms", "extra_ms", "onset_ramp_ms",
-                           "decoder_context_ms")
+                           "onset_ramp_energy_ms", "decoder_context_ms")
                  if getattr(args, k, None) is not None}
     if "block_ms" in overrides:
         snapped = chunker.snap_block_ms(overrides["block_ms"])

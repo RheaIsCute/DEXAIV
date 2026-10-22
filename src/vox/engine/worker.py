@@ -12,9 +12,10 @@ single-slot mailbox and are applied between hops. Shape changes (hop, extra, F0 
 go through ``_rebuild``: the gate is closed and drained, the plan replaced, graphs
 recaptured and verified, then the input backlog is dropped so latency does not pile up.
 
-The output ring is kept near ``fill_target``: zeros are inserted on an underrun, and when
-the gate is closed (output is silence anyway) the fill is trimmed back if clock drift between
-the two devices let it grow. Those corrections are counted separately from underruns.
+The output ring is kept near ``fill_target``: zeros are inserted on an underrun, and once
+the gate has been closed long enough that everything still queued is silence, the fill is
+trimmed back if clock drift between the two devices (or an underrun refill) let it grow.
+Those corrections are counted separately from underruns.
 """
 
 from __future__ import annotations
@@ -93,6 +94,10 @@ class WorkerStats:
 
 
 class InferenceWorker(threading.Thread):
+    # The drift trim waits until the queued output is all silence (docs/DEVIATIONS.md
+    # 14.1). False = the pre-fix rule (trim on the first closed hop), for the A/B soak only.
+    trim_waits_for_silence = True
+
     def __init__(self, pipeline: HopPipeline, sola: Sola, gate: SilenceGate,
                  graphs: StageGraphs, timers: StageTimers, in_ring: SPSCRing,
                  out_ring: SPSCRing, hop_event: threading.Event, fill_target: int,
@@ -141,6 +146,7 @@ class InferenceWorker(threading.Thread):
         # mic and output, one hop at a time. None: not recording.
         self.recorder: SessionRecorder | None = None
         self._cushion = 0  # extra silence queued for the duration of a hold, in samples
+        self._silent_run = 0  # consecutive hops that wrote nothing but zeros (drift trim)
         self._fill_before_hold = 0  # output ring fill when the cushion went in
         self._alloc()
 
@@ -293,7 +299,7 @@ class InferenceWorker(threading.Thread):
             if decision.onset and not sola.draining:
                 # Gate onset: short fade-in (keeps the decoded pre-onset consonant) and the
                 # sine phase restarts, as the first hop of a stream does.
-                sola.mark_onset()
+                sola.mark_onset(decision.energy_only)
                 pipeline.on_onset()
             infer = pipeline.process_hop()
             with timers.stage("sola"):
@@ -362,10 +368,17 @@ class InferenceWorker(threading.Thread):
         recorder = self.recorder  # read once: the control thread starts and stops takes
         if recorder is not None:
             recorder.add(self._host_block, block_in, self._host_out_np, decision.speech)
+        self._silent_run = self._silent_run + 1 if silent and not overriding else 0
         if (not decision.speech and not overriding and not hold and not releasing
                 and not self.out_ring.drop_pending
-                and fill_before > self.fill_target + block):
-            # Silence is playing: trim clock-drift growth without anyone hearing it.
+                and fill_before > self.fill_target + block
+                and (not self.trim_waits_for_silence
+                     or self._silent_run * block >= fill_before + block)):
+            # Everything queued was written by silent hops (the drain is spent and the
+            # speech before it has played out), so trimming clock-drift growth drops
+            # nothing anyone hears. Trimming on the first closed hop dropped the oldest
+            # queued output, which was still the end of the sentence (docs/DEVIATIONS.md
+            # 14.2): the ring then held ``fill`` ms of the hangover's render.
             self.out_ring.drop(fill_before - self.fill_target)
             s.drift_trims += 1
         timers.end_hop()

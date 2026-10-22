@@ -62,13 +62,19 @@ class Sola:
         # the hop in over the whole overlap, and that head is decoded pre-onset audio (the
         # consonant the gate opened on). A short sin^2 ramp keeps it. A 0-dim weight picks
         # the fade inside the captured graph, so an onset never changes the op sequence.
-        r = plan.onset_ramp
-        if 0 < r < n:
-            short = torch.ones(n, device=device)
-            short[:r] = torch.sin(0.5 * math.pi * torch.linspace(0.0, 1.0, r, device=device)) ** 2
-        else:
-            short = self.fade_in.clone()
-        self._fade_onset = short
+        def onset_fade(r: int) -> Tensor:
+            if 0 < r < n:
+                short = torch.ones(n, device=device)
+                short[:r] = torch.sin(0.5 * math.pi
+                                      * torch.linspace(0.0, 1.0, r, device=device)) ** 2
+                return short
+            return self.fade_in.clone()
+
+        # ``_fade_onset`` is the buffer the stitch reads; ``mark_onset`` copies the fade
+        # for the onset's kind into it (a device copy, never a new op in the stitch).
+        self._fade_onset_vad = onset_fade(plan.onset_ramp)
+        self._fade_onset_energy = onset_fade(plan.onset_ramp_energy or plan.onset_ramp)
+        self._fade_onset = self._fade_onset_vad.clone()
         self._onset = torch.zeros((), device=device)
         self._onset_marked = False
         self._fade_w = torch.zeros(n, device=device)
@@ -131,10 +137,12 @@ class Sola:
             self._onset_marked = False
         return out
 
-    def mark_onset(self) -> None:
+    def mark_onset(self, energy_only: bool = False) -> None:
         """The next ``stitch`` is a gate onset: fade in over ``plan.onset_ramp`` samples
-        instead of the overlap. Call only with a silent tail (after a finished drain or a
-        reset); ``plain`` mode only."""
+        (``plan.onset_ramp_energy`` for an onset the gate opened on energy alone) instead
+        of the overlap. Call only with a silent tail (after a finished drain or a reset);
+        ``plain`` mode only."""
+        self._fade_onset.copy_(self._fade_onset_energy if energy_only else self._fade_onset_vad)
         self._onset.fill_(1.0)
         self._onset_marked = True
 
