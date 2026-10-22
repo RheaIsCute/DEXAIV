@@ -37,6 +37,7 @@ from vox.pitch.base import (
     COARSE_F0_MAX,
     COARSE_F0_MIN,
     PitchExtractor,
+    NoteDetector,
     RegisterTracker,
     f0_to_coarse,
     postprocess_f0,
@@ -162,6 +163,11 @@ class HopPipeline:
         self.hop_index = 0
         self.register = RegisterTracker(dev)  # auto pitch (set_params)
         self.register.fresh = p.shift_frames
+        # Held notes (Natural mode): the ceiling and the pitch range they switch to.
+        self.note = NoteDetector(dev)
+        self.note.fresh = p.shift_frames
+        self.note_ceiling_t = torch.full((), math.inf, device=dev)
+        self.note_range_t = torch.ones((), device=dev)
         # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
         # hop's decoded slice starts; written by the synth stage, zeroed at gate onsets.
         self.sine_phase = torch.zeros(1, 1, 1, device=dev)
@@ -216,6 +222,11 @@ class HopPipeline:
         self.f0_ceiling_t.fill_(params.f0_ceiling_hz if params.f0_ceiling_hz > 0 else math.inf)
         self.register.set(params.pitch_mode == "auto", params.target_f0_hz,
                           params.pitch_follow_s, params.pitch_range)
+        self.note.set(params.note_detect, params.note_min_ms, params.note_tolerance_st,
+                      params.note_freeze_ms)
+        note_ceiling = params.note_ceiling_hz if params.note_ceiling_hz > 0 else params.f0_ceiling_hz
+        self.note_ceiling_t.fill_(note_ceiling if note_ceiling > 0 else math.inf)
+        self.note_range_t.fill_(max(params.note_pitch_range, 0.0))
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
         self.set_formant(params.formant_st)
@@ -274,6 +285,7 @@ class HopPipeline:
         self.audio_model.zero_()
         self.sine_phase.zero_()
         self.register.reset()
+        self.note.reset()
         self.hop_index = 0
         # Fresh decoder noise: with ``noise_roll`` the window would otherwise start on the
         # previous stream's draws (and a seeded run would not be reproducible).
@@ -306,6 +318,7 @@ class HopPipeline:
         tensors.append(self.noise_z)
         tensors.append(self.sine_phase)
         tensors.extend(self.register.state_tensors())
+        tensors.extend(self.note.state_tensors())
         return tensors
 
     def static_key(self) -> tuple:
@@ -381,9 +394,14 @@ class HopPipeline:
 
     def _stage_f0(self) -> None:
         f0 = self.extractor.extract(self.f0_tail)
-        ratio = self.register.ratio(f0, self.ratio_t)  # per frame; the fixed ratio unless auto
+        # Held note? Then the note ceiling / range apply and the register holds still.
+        note, frozen = self.note.update(f0)
+        ratio = self.register.ratio(f0, self.ratio_t,  # per frame; the fixed ratio unless auto
+                                    torch.where(note, self.note_range_t, self.register.range),
+                                    frozen)
+        ceiling = torch.where(note, self.note_ceiling_t, self.f0_ceiling_t)
         _, cont = postprocess_f0(f0, ratio, self.f0_min_t, self.f0_max_t,
-                                 self._interp, self._bridge, self.f0_ceiling_t)
+                                 self._interp, self._bridge, ceiling)
         # The excitation keeps the requested pitch; the coarse pitch is that over the
         # formant factor (1 without a shift: the same buckets postprocess_f0 makes).
         coarse = f0_to_coarse(cont * self.formant_inv_t)

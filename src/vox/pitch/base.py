@@ -208,9 +208,12 @@ class RegisterTracker:
         st = 12.0 * (self._target_log_host - level)
         return min(REGISTER_MAX_ST, max(REGISTER_MIN_ST, st))
 
-    def ratio(self, f0: Tensor, fixed: Tensor) -> Tensor:
+    def ratio(self, f0: Tensor, fixed: Tensor, pitch_range: Tensor | None = None,
+              freeze: Tensor | None = None) -> Tensor:
         """Per-frame transposition ratio for ``f0`` (Hz, 0 = unvoiced) after updating the
-        register from its last ``fresh`` frames; ``fixed`` is the 0-dim manual ratio."""
+        register from its last ``fresh`` frames; ``fixed`` is the 0-dim manual ratio.
+        ``pitch_range`` (0-dim) overrides the set range for this hop; ``freeze`` (0-dim
+        bool) keeps the register where it is (a held note, ``NoteDetector``)."""
         tail = f0[-self.fresh:]
         voiced = tail > 0
         count = voiced.sum().to(f0.dtype)
@@ -219,10 +222,75 @@ class RegisterTracker:
         a = 1.0 - torch.exp(-count / self.tau_frames)
         first = (self.heard == 0) & (count > 0)
         level = torch.where(first, mean, self.level + a * (mean - self.level))
-        self.level.copy_(torch.where(count > 0, level, self.level))
+        moving = count > 0
+        if freeze is not None:
+            moving = moving & ~freeze
+        self.level.copy_(torch.where(moving, level, self.level))
         self.heard.copy_((self.heard + count).clamp(max=1e6))
         shift = (self.target_log - self.level).clamp(REGISTER_MIN_ST / 12, REGISTER_MAX_ST / 12)
         # per frame: target * (f0 / level) ** range, as a ratio against f0
-        log_ratio = shift + (self.range - 1.0) * (log_f0 - self.level)
+        r = self.range if pitch_range is None else pitch_range
+        log_ratio = shift + (r - 1.0) * (log_f0 - self.level)
         warmed = (self.auto > 0) & (self.heard >= REGISTER_WARM_FRAMES)
         return torch.where(warmed, torch.exp2(log_ratio), fixed.expand_as(f0))
+
+
+NOTE_REF_ALPHA = 0.1  # per frame: the run's reference pitch follows a slow vibrato
+
+
+class NoteDetector:
+    """Held-note detector on the talker's own F0 (docs/DEVIATIONS.md §14, Natural mode).
+
+    A run of consecutive voiced frames whose log2 F0 stays within ``tolerance`` of the
+    run's reference (an EMA of the run, so vibrato and a slow drift stay inside) is a
+    note once it is ``min_frames`` long. Frame by frame over the hop's ``fresh`` frames
+    (a static count, so the op sequence never changes): unvoiced resets the run, a frame
+    outside the tolerance starts a new run on its own pitch. Graph-safe: 0-dim device
+    state, no host sync. ``update`` returns ``(note, frozen)``: the run is at least
+    ``min_frames`` / ``freeze_frames`` old. ``enabled`` masks both (0 = never a note).
+    """
+
+    def __init__(self, device: torch.device | str) -> None:
+        self.ref = torch.zeros((), device=device)  # log2 Hz of the current run
+        self.run = torch.zeros((), device=device)  # frames in the current run
+        self.enabled = torch.zeros((), device=device)
+        self.min_frames = torch.full((), 40.0, device=device)
+        self.freeze_frames = torch.full((), 10.0, device=device)
+        self.tolerance = torch.full((), 1.0 / 12.0, device=device)  # octaves
+        self.fresh = 1
+        self.notes = torch.zeros((), device=device)  # hops spent inside a note (stats)
+
+    def set(self, enabled: bool, min_ms: float, tolerance_st: float, freeze_ms: float) -> None:
+        self.enabled.fill_(1.0 if enabled else 0.0)
+        self.min_frames.fill_(max(1.0, round(min_ms / 10.0)))
+        self.freeze_frames.fill_(max(1.0, round(freeze_ms / 10.0)))
+        self.tolerance.fill_(max(tolerance_st, 0.0) / 12.0)
+
+    def reset(self) -> None:
+        self.ref.zero_()
+        self.run.zero_()
+        self.notes.zero_()
+
+    def state_tensors(self) -> list[Tensor]:
+        return [self.ref, self.run, self.notes]
+
+    def update(self, f0: Tensor) -> tuple[Tensor, Tensor]:
+        """Advance over the last ``fresh`` frames of ``f0`` (Hz, 0 = unvoiced); returns
+        0-dim bools ``(note, frozen)`` for this hop."""
+        tail = f0[-self.fresh:]
+        log_f0 = torch.log2(tail.clamp(min=1.0))
+        ref, run = self.ref, self.run
+        for k in range(self.fresh):  # static unroll: fresh is a plan constant
+            voiced = tail[k] > 0
+            inside = voiced & ((log_f0[k] - ref).abs() <= self.tolerance) & (run > 0)
+            ref = torch.where(inside, ref + NOTE_REF_ALPHA * (log_f0[k] - ref),
+                              torch.where(voiced, log_f0[k], ref))
+            run = torch.where(inside, run + 1.0, torch.where(voiced, torch.ones_like(run),
+                                                             torch.zeros_like(run)))
+        self.ref.copy_(ref)
+        self.run.copy_(run)
+        on = self.enabled > 0
+        note = on & (run >= self.min_frames)
+        frozen = on & (run >= self.freeze_frames)
+        self.notes.copy_(self.notes + note.to(self.notes.dtype))
+        return note, frozen

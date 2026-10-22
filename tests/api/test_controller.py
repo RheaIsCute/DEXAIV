@@ -627,7 +627,9 @@ def test_speak_and_sing_presets_keep_their_own_values_per_model(env):
     # hot: the four values and the singing input chain, nothing restarted
     assert session.calls == [
         ("params", {"f0_up_key": 6.0, "index_rate": 0.3, "protect": 0.35, "f0_ceiling_hz": 360.0,
-                    "target_f0_hz": 200.0, "pitch_range": 1.0, "formant_st": 0.0}),
+                    "target_f0_hz": 200.0, "pitch_range": 1.0, "formant_st": 0.0,
+                    "pitch_mode": "fixed", "note_detect": False, "note_ceiling_hz": 0.0,
+                    "note_pitch_range": 1.0}),
         ("conditioning", {"auto_level": True, "trim_db": 0.0, "max_gain_db": 10.0})]
     assert len(FakeSession.created) == 1
     c.set_param("pitch", 4)
@@ -652,6 +654,49 @@ def test_speak_and_sing_presets_keep_their_own_values_per_model(env):
     assert (cfg.conditioning.max_gain_db, cfg.conditioning.trim_db) == (10.0, 0.0)
     # the other model is untouched by Alpha's preset
     assert again._params("Beta").f0_ceiling_hz == 0.0
+
+
+def test_natural_preset_is_speak_plus_auto_pitch_and_the_held_note_switch(env):
+    """Natural (docs/DEVIATIONS.md §14 B3): Speak's sliders and input chain, auto pitch on
+    the model's own register, the ceiling always armed (Speak's, else Sing's), and on a
+    held note the Sing ceiling; its own slider moves live under ``natural``."""
+    c = env.make(model="Alpha")  # Speak: pitch +7, ceiling off, protect 0.33
+    c.start()
+    settle(c)
+    session = FakeSession.created[-1]
+    session.calls.clear()
+    assert c.set_preset("natural")["pitch"] == 7.0  # Speak's pitch (until auto pitch warms)
+    p = c.state()["params"]
+    assert (p["preset"], p["pitch"], p["protect"], p["auto_pitch"]) == ("natural", 7.0, 0.33, True)
+    assert p["ceiling_hz"] == 360.0  # armed: Speak had none, so the Sing ceiling
+    assert c.state()["input_level"]["trim_locked"] is False  # Speak's chain, not Sing's
+    sent = dict(session.calls[0][1])
+    assert session.calls[0][0] == "params"
+    assert (sent["pitch_mode"], sent["note_detect"], sent["note_ceiling_hz"],
+            sent["note_pitch_range"], sent["f0_ceiling_hz"]) == \
+        ("auto", True, 360.0, ctl.NATURAL_NOTE_RANGE, 360.0)
+    assert session.calls[1] == ("conditioning", {"auto_level": True, "trim_db": 0.0,
+                                                 "max_gain_db": 18.0})
+    c.set_param("ceiling", 300)  # a Natural slider move: Natural's own, Speak untouched
+    assert c.state()["params"]["ceiling_hz"] == 300.0
+    saved = json.loads((env.profile / ctl.STATE_FILE).read_text())
+    assert saved["models"]["Alpha"] == {"preset": "natural", "natural": {"ceiling": 300.0}}
+    assert c._params().note_ceiling_hz == 360.0  # the held-note ceiling stays Sing's
+    c.set_preset("speak")
+    p = c.state()["params"]
+    assert (p["preset"], p["ceiling_hz"], p["auto_pitch"]) == ("speak", 0.0, False)
+    last = dict(session.calls[-2][1])
+    assert (last["pitch_mode"], last["note_detect"]) == ("fixed", False)
+    c.shutdown()
+    again = env.make()
+    again.set_preset("natural")
+    again.start()
+    settle(again)
+    cfg = FakeSession.created[-1].cfg
+    assert (cfg.params.pitch_mode, cfg.params.note_detect, cfg.params.f0_ceiling_hz,
+            cfg.params.note_ceiling_hz, cfg.params.protect) == ("auto", True, 300.0, 360.0, 0.33)
+    with pytest.raises(ApiError, match="unknown preset"):
+        again.set_preset("shout")
 
 
 def test_formant_is_snapped_kept_per_preset_and_reaches_the_session(env):

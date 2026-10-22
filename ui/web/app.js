@@ -214,8 +214,10 @@ function render() {
   $("pitch").disabled = !params;
   $("formant").disabled = !params;
   document.querySelectorAll("#preset [data-preset]").forEach((b) => { b.disabled = !params; });
-  $("conversion-badge").hidden = !calibrated || sing;
-  $("preset-badge").hidden = !sing;
+  const natural = !!params && params.preset === "natural";
+  $("conversion-badge").hidden = !calibrated || sing || natural;
+  $("preset-badge").hidden = !(sing || natural);
+  $("preset-badge").textContent = natural ? "Natural preset" : "Sing preset";
 
   // gate
   setValue($("gate-threshold"), gate.threshold_dbfs);

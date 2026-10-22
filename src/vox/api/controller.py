@@ -79,10 +79,16 @@ INPUT_GAIN_RANGE = (-12.0, 24.0)  # the input-gain trim slider, dB
 # sits 5-9 semitones above the speaking voice), less index (speech vectors smear sung
 # vowels), more protect, and the soft F0 ceiling on. Sung notes also get a gentler input
 # chain: auto level boosts at most +10 dB and the trim slider is out (0 dB).
-PRESETS = ("speak", "sing")
+PRESETS = ("speak", "sing", "natural")
 SING_PITCH_OFFSET = -5.0  # semitones from the Speak pitch; ``sing_pitch_offset`` overrides
 SING_DEFAULTS = {"index_rate": 0.3, "protect": 0.35, "ceiling": 360.0}
 SING_MAX_GAIN_DB = 10.0
+# Natural (docs/DEVIATIONS.md §14, B3): one mode for speaking and singing. Speak's sliders
+# and input chain, auto pitch on (the register lands on the model's own), the soft ceiling
+# always armed (Speak's, else the Sing ceiling), and on a held note the Sing ceiling and
+# ``NATURAL_NOTE_RANGE`` take over (hot parameters only). Its slider moves live in the
+# model entry's ``natural`` sub-entry, like Sing's.
+NATURAL_NOTE_RANGE = 1.0
 BROADCAST_SING_WARNING = ("Broadcast's noise removal can cut sustained notes — use your mic "
                           "directly or turn its noise removal off for singing.")
 
@@ -264,13 +270,15 @@ class EngineController:
     def _preset(self, name: str | None = None) -> str:
         name = name or self.model
         entry = self.store["models"].get(name, {}) if name else {}
-        return "sing" if entry.get("preset") == "sing" else "speak"
+        preset = entry.get("preset")
+        return preset if preset in PRESETS else "speak"
 
     def _preset_store(self, name: str) -> dict[str, Any]:
         """Where the active preset's slider values live: the model entry itself for Speak
-        (as before presets existed), its ``sing`` sub-entry for Sing."""
+        (as before presets existed), its ``sing`` / ``natural`` sub-entry otherwise."""
         entry = self._model_store(name)
-        return entry.setdefault("sing", {}) if self._preset(name) == "sing" else entry
+        preset = self._preset(name)
+        return entry.setdefault(preset, {}) if preset != "speak" else entry
 
     def _sing_pitch(self, speak_pitch: float) -> float:
         offset = self.store.get("sing_pitch_offset")
@@ -295,8 +303,19 @@ class EngineController:
             params = dataclasses.replace(params, target_f0_hz=target_f0_hint(self.profile, config))
         if not calibrated and entry.get("auto_pitch"):
             params = dataclasses.replace(params, pitch_mode="auto")
-        if calibrated or self._preset(config.name) != "sing":
+        preset = self._preset(config.name)
+        if calibrated or preset == "speak":
             return params
+        if preset == "natural":
+            natural = {field: getattr(params, field) for field in HOT_PARAMS.values()}
+            natural.update({HOT_PARAMS[k]: float(v) for k, v in entry.get("natural", {}).items()
+                            if k in HOT_PARAMS})
+            sing_ceiling = float(entry.get("sing", {}).get("ceiling", SING_DEFAULTS["ceiling"]))
+            armed = natural["f0_ceiling_hz"] if natural["f0_ceiling_hz"] > 0 else sing_ceiling
+            natural["f0_ceiling_hz"] = armed
+            return dataclasses.replace(
+                params, **natural, pitch_mode="auto", note_detect=True,
+                note_ceiling_hz=max(sing_ceiling, armed), note_pitch_range=NATURAL_NOTE_RANGE)
         sing = {**SING_DEFAULTS, "pitch": self._sing_pitch(params.f0_up_key),
                 "target_hz": params.target_f0_hz, "pitch_range": params.pitch_range,
                 "formant": params.formant_st,  # Sing starts from the Speak formant
@@ -877,21 +896,24 @@ class EngineController:
         return {"auto_pitch": params.pitch_mode == "auto", "target_hz": params.target_f0_hz}
 
     def set_preset(self, preset: str) -> dict[str, Any]:
-        """Speak / Sing for the current model: its own pitch, index rate, protect and F0
-        ceiling, and the input chain's singing limits. Hot: nothing is recaptured."""
+        """Speak / Sing / Natural for the current model: its own pitch, index rate, protect
+        and F0 ceiling, the input chain's singing limits, and for Natural the auto pitch
+        and held-note switch. Hot: nothing is recaptured."""
         if preset not in PRESETS:
             raise ApiError(f"unknown preset {preset!r}")
         with self._lock:
             entry = self._model_store(self._config().name)
-            if preset == "sing":
-                entry["preset"] = "sing"
+            if preset != "speak":
+                entry["preset"] = preset
             else:
                 entry.pop("preset", None)
             params = self._params()
             session = self.session
             if session is not None:
                 session.set_params(**{field: getattr(params, field)
-                                      for field in HOT_PARAMS.values()})
+                                      for field in (*HOT_PARAMS.values(), "pitch_mode",
+                                                    "note_detect", "note_ceiling_hz",
+                                                    "note_pitch_range")})
                 config = self._conditioning()
                 session.set_conditioning(auto_level=config.auto_level, trim_db=config.trim_db,
                                          max_gain_db=config.max_gain_db)
