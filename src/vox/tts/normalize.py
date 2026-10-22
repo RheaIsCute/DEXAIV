@@ -58,6 +58,8 @@ _EMOTICON = re.compile(r"(?<![\w:/])[:;=]['^-]?[()\[\]DPpOo/\\|*3]+(?!\w)"
                        r"|(?<!\w)(?:\^_*\^|-_+-|[Tt]_+[Tt]|[oO]_[oO])(?!\w)")
 _LAUGH_WORD = re.compile(r"(?<![\w'])(?:l+o+l+(?:o+l+)*z*|l+m+f*a+o+|r+o+f+l+|(?:a*h+a+){2,}h*"
                          r"|(?:h+e+){2,}h*|x+d+)(?![\w'])", re.IGNORECASE)
+# an explicit insert: "[laugh]", "[laughs]", "*laughs*", "(laughs)" (docs/DEVIATIONS.md §14)
+_LAUGH_TAG = re.compile(r"[\[(*]\s*laugh(?:s|ing|ter)?\s*[\])*]", re.IGNORECASE)
 _CAPS_WORD = re.compile(r"\b[A-Z][A-Z']+\b")
 
 # context rules for the ambiguous table entries
@@ -200,6 +202,7 @@ def _url(match: re.Match) -> str:
 def _symbols(text: str) -> str:
     text = _URL.sub(_url, text)
     text = _LAUGH_EMOJI.sub(f" {_LAUGH} ", text)
+    text = _LAUGH_TAG.sub(f" {_LAUGH} ", text)
     text = _EMOJI.sub(" ", text)
     text = _LOVE.sub(" love ", text)
     text = _EMOTICON.sub(" ", text)

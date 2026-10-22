@@ -292,3 +292,13 @@ def _timed(text):
     start = time.perf_counter()
     normalize(text)
     return time.perf_counter() - start
+
+
+@pytest.mark.parametrize("tag", ["[laugh]", "[laughs]", "[LAUGH]", "*laughs*", "(laughs)",
+                                 "[laughing]", "[ laughter ]"])
+def test_an_explicit_laugh_insert_is_said_like_lol(tag):
+    """``[laugh]`` and its spellings are the typed laugh insert (docs/DEVIATIONS.md §14 B2):
+    the same spoken "haha" as lol, set off by commas, dropped with laughter="drop"."""
+    assert normalize(f"that was wild {tag} anyway") == "That was wild, haha, anyway."
+    assert normalize(f"ok {tag} lol") == "Okay, haha."  # repeats collapse into one
+    assert normalize(f"that was wild {tag} anyway", laughter="drop") == "That was wild anyway."
