@@ -1722,3 +1722,200 @@ consonant). Suite: 842 passed, 1 skipped, 2 xfail; `test_worker_rebuilds_shape_l
   "louder again" glitch is the auto level's fast-down gain on the shout (8.2), not B4.
 
 **Defaults, one line each, if the user hears what the numbers say:** B1: hangover 500 ms (done, 14.7). B2: no default change (the best spelling is still unconvincing, 14.7); nothing live until the take exists. B3: Natural as the default preset once its sung register is raised (14.7); until then a preset. B4: nothing until a real creak/bump take; `onset_persist_chunks = 2` is the candidate (halves the leaks RNNoise does not catch, costs nothing measurable; the user liked `persist2_hp90` by ear), the high-pass stays 70, "max" suppression stays off (150 ms/min of speech)..
+
+## 15. Paralinguistics and transients: the parts that need no new take (2026-10-23)
+
+Report 19 (`docs/research/19_PARALINGUISTICS_AND_TRANSIENTS.md`) ranks its work behind
+three takes the user has not recorded yet (typing, laughing, whispering and kissing). This
+section builds the parts that do not need them, **each behind a flag that is off by
+default**: the in-speech de-clicker (19 §1.4), context-based probation (19 §1.3), the laugh
+guard and ceiling lift (19 §3.3), the breath / click passthrough (19 §3.2), and a bench
+command that runs any take through all of them. **No default changed.** Branch
+`feature/paraling` off `main` @ 439a314.
+
+Every number is at the user's live shape (14, step 0: hop 80, extra 2400, right 40, gate
+-28 dBFS / hangover 500, RNNoise on, auto level +6 dB, Mom +12, protect 0.35, ceiling 330,
+formant -0.5) on the raw-Shure matrix take
+(`recordings/matrix_20261017_192237/shure_gateoff_agcoff_hop20_mic_raw.wav`, 59 s), or on a
+keystroke proxy built from it (15.5), unless stated. Outputs:
+`out/ab/paraling/shure_gateoff_agcoff_hop20_mic_raw/` (`report_run*.json` per run).
+
+### 15.0 Deviations
+
+| # | Report / prompt said | What was built | Why |
+|---|---|---|---|
+| P1 | 19 §1.4: compare the fast envelope with E_slow; "fell back within 6 dB of E_slow" | Candidate: fast vs the slow envelope **2 ms earlier**. Fell back: the signal's **RMS** over [12, 20] ms after the candidate within 6 dB of the **RMS of the 6..2 ms before it** | Measured on the test click and the proxy: the slow envelope rises under the click and hides it; through a stop closure it still remembers the vowel, so a weak aspiration "fell back" (a /p/ was clamped); in a quiet room (-91 dBFS) the 1.5 ms fast envelope's own decay is still 30 dB up at 20 ms, so the keystroke's push was rejected and only its second sub-impulse was clamped (-6 dB instead of -40) |
+| P2 | 19 §1.4: the clamp spans "candidate to where it fell back" | To where the fast envelope is back **for good** within the 12 ms | a keystroke push is two sub-impulses (touch, hit, 19 §1.1); the dip between them is not the end |
+| P3 | 19 §1.4: apply the attenuation retroactively to the ring and `in_tail` | `Declicker` returns a look-back gain; `InputConditioner` splits it across RNNoise's 20 ms delay (the part landing in the current output is applied there) and hands the rest to `HopPipeline.apply_retro`, which scales `in_tail`, the 16 kHz ring and the input resampler's carried window | the clamp is decided on the high-passed signal, before RNNoise; RNNoise moves everything after it 20 ms later. The resampler's window must be scaled too or the next hop's recomputed 10 ms would bring the click back |
+| P4 | 19 §3.3: flicker guard at 3 flips/s | `laugh_flip_rate` **10** flips/s over a **1 s** mean | speech on the matrix take flips 3 flips/s (p50), 5 (p90) over 1 s windows, up to 8.3 in its busiest stretches (15.3): at 3 the register would freeze in ordinary talk. A laugh is ~8.8 flips/s (19 §3.3), inside the speech range: the flicker flag cannot separate them on this data |
+| P5 | 19 §3.3: jump flag on every hop | Only once the register has heard `REGISTER_WARM_FRAMES` | before that the level is the first hop's pitch and every hop "jumps" (weight 0.001 at 3.8 s on the take) |
+| P6 | 19 §1.3: onset flag on "today's rule" sub-frame rise | Sub-frame level >= threshold + 6 dB **and** >= 12 dB over the quietest sub-frame of the last 200 ms; the rise rule is kept but does nothing with RNNoise on | RNNoise puts the room at about -84 dBFS: every logged onset "rose" 61-68 dB |
+| P7 | Prompt: b2_laugh.py | Moved into the repo as `benchmarks/b2_laugh.py` (was a scratch script) | the user's laugh take must find it next session |
+
+### 15.1 In-speech de-clicker (`audio/conditioning.py` `Declicker`, `ConditioningConfig.declick`)
+
+After the high-pass, before RNNoise and the gain. Fast (1.5 ms) and slow (25 ms) one-pole
+power envelopes; a candidate is a rising edge of fast >= 4 x slow-2-ms-earlier (+12 dB) above
+-80 dBFS; 20 ms later (the lookahead the engine already buys, 19 §1.2) it is a click when the
+RMS over [12, 20] ms is within 6 dB of the RMS just before it, and its span is scaled to that
+level + 6 dB with 2 ms cosine ramps (a soft clamp). Numpy, host, per block; zero added
+latency (the look-back samples are inside the 40 ms right context; the engine test
+`test_declick_lookback_rewrites_every_buffer_holding_the_samples` checks all three buffers).
+
+**Clean take (the plosive check).** 25 clamps in 59 s, all false positives by definition (no
+clicks were added). Mapped to Whisper's word timings (input side, `benchmarks/mic_declick.py` -> `mic_declick.json`):
+11 outside words (mouth noises, breath onsets, the take's first and last sample), 14 inside
+or at the edge of words: "and" (-3, -7 dB), "The" (-16 dB, 0.27 of a word *before* it: a lip
+smack), "pickled" /p/ (-4), "big" (0), "the" (-8, -1), "to" (-5, -4), "can" /k/ (-2), "kept"
+final /pt/ (-3), "Thank" (-9, -4). Whisper on the conditioned mic: WER **2.0 % off, 2.0 %
+on**; the earlier (P1-less) version moved it 2.0 -> 4.7 % by punctuation and a hallucinated
+"Thank you for watching", no word changed. On the rendered output: WER 5.3 % both, UTMOS
+2.63 -> 2.57, sibilant centroid 5977 -> 5959 Hz. **Whether the -3..-16 dB clamps on bursts are
+audible is the ear's call** (`mic_declick_off.wav` vs `mic_declick_on.wav`, then
+`base.wav` vs `declick.wav`).
+
+**Keystroke proxy.** With RNNoise on (the user's chain) the synthetic keystrokes do not leak
+at all, de-clicker or not: in pauses RNNoise removes them before the gate (as in 14.4), and
+inside speech the log-mel change they cause is at the measurement floor (median 0.25 vs
+floor p90 0.27-0.30). The de-clicker caught 3 of 18 in-speech clicks at -6 dB re the voice's
+p95 and every click in a pause or the hangover, plus each key's release impulse 80-100 ms
+later. On the input side (no model) with RNNoise off, the median click in the hangover
+drops from **+56 dB to +18 dB** over the click-free input (pause: +49 -> +11); with RNNoise
+on, the clicks were already gone and the de-clicker leaves RNNoise less disturbed (-7.5 ->
+-1.5 dB). On renders with RNNoise off: gate opens on pause clicks **12 -> 3** of 18, hangover
+log-mel change 0.98 -> 0.72 (floor 0.35-0.37), still a leak by the 1.5 x floor rule in 15 of
+18 (the clamp leaves the click 6 dB over the room, and the release impulse is clamped less:
+the slow envelope still holds the push).
+
+### 15.2 Context-based probation (`engine/gate.py`, `GateConfig.onset_confirm_ms`)
+
+`onset_confirm_ms` > 0 replaces the energy-only `strong` rule: a 10 ms sub-frame flag, the
+gate held closed for the next 30 ms (they sit in the lookahead: with the 40 ms right context
+nothing is lost, the open hop still renders the flagged sub-frame), then open if the level
+has not decayed 8 dB from its peak within 20 ms ("held") or Silero's probability rose 0.25
+("vad"); a rejected flag mutes new ones for 120 ms (a key's release). Every flag goes to
+`SilenceGate.onset_log` with its crest factor, HF ratio (energy share above 2 kHz) and
+verdict; the legacy rule logs its energy-only onsets the same way (verdict "legacy").
+
+- Clean take: the same 3 energy-only onsets the legacy rule opened, all "held"; open share
+  91.4 % both; WER 5.3 % and UTMOS 2.63 both. No speech lost.
+- Proxy, RNNoise off (the only chain where clicks reach the gate): gate opens on pause
+  clicks **12 -> 0** of 18; opens 30 -> 18 (the 18 phrases); 18 flags rejected, 9 held, 1 by
+  the VAD rule. Hangover clicks are untouched (17 of 18 leak either way: the gate is already
+  open there, 19 §0 path 1, which is the de-clicker's job).
+- Logged distributions, proxy RNNoise off: rejected clicks crest 5.7 / 8.7 / 12.3 dB
+  (p10/p50/p90), HF ratio 0.44 / 0.54 / 0.70; confirmed speech onsets crest 9.7 / 10.6 /
+  13.9 dB, HF 0.22 / 0.84 / 1.0. **Neither separates clicks from speech** (19 §1.3 said not
+  to threshold on them; the data agrees). With RNNoise on, the rise is 61-68 dB on every
+  onset (P6).
+
+### 15.3 Laugh guard and ceiling lift (`pitch/base.py` `LaughGuard`, `RuntimeParams.laugh_*`)
+
+In the f0 stage, before the note detector: per hop, jump = sigmoid((|mean voiced log2 F0 -
+register| - 0.75 oct) / 1 st) once the register is warm, flicker = sigmoid((flips/s over 1 s
+- 10) / 1); the register's update is multiplied by (1 - jump)(1 - flicker); a lift (0..1,
+~100 ms glide) toward max(jump upward, flicker) raises the soft ceiling log-linearly toward
+`laugh_ceiling_hz` (600; an absent ceiling stays absent, the lift never lowers one). Hot
+0-dim tensors, the same op sequence on or off (off = weight exactly 1, lift exactly 0:
+`test_off_is_an_exact_no_op`), so toggling needs no recapture
+(`test_new_flags_are_off_exact_and_only_passthrough_changes_the_op_sequence`).
+
+- Unit test (`test_a_laugh_an_octave_up_barely_moves_the_register`): 1 s of 272 Hz calls on
+  a 110 Hz register moves it > 4 st unguarded (19 §3.3 predicted ~6), < 1 st guarded.
+- Speech, matrix take (replay of the engine's own classes, `b2_laugh.py --no-render`): the
+  guard still dips on 7 of the 20 bursty stretches the laugh finder flags in plain speech
+  (weight min 0.06 at 3.8 s, just after warm-up; 0.40 at 27.5 s where RMVPE reads 67 Hz
+  creak; >= 0.63 elsewhere), lift <= 0.22 (ceiling up to ~375 Hz briefly), ceiling
+  engagements 20 -> 15 frames. Rendered: WER 5.3 -> 4.7 %, UTMOS 2.63 -> 2.61.
+- Typed "hahaha!" clip (`out/ab/phase_b/b2/typed_hahaha_bang.wav`, a TTS voice, 3 s: only a
+  code-path run; auto pitch never warms in 3 s): **every voiced laugh frame is over the
+  330 Hz ceiling's knee** (31 of 31, output p90 536 Hz vs knee 262 Hz), 19 §3.3 prediction 2.
+  The real effect of the guard on a laugh needs the user's take.
+
+### 15.4 Breath / click passthrough (`engine/postchain.py` `Passthrough`, `RuntimeParams.passthrough*`)
+
+After the RMS mix, in the post stage: per 10 ms frame of `in_tail_ref` (the conditioned mic
+under the decoded tail) and the decoded frames' pitch: energy, centroid; a frame passes when
+unvoiced (`pitchf < 1`), above -55 dBFS, and either a burst (4 x both frames 30 ms away) or a
+breath (unvoiced for >= 150 ms, centroid < 2.5 kHz); never a non-burst frame with a
+centroid > 4 kHz (sibilants: 19 §3.2). Smoothed [1/4, 1/2, 1/4], interpolated to samples,
+band-passed 150 Hz-10 kHz (129-tap FIR), mixed at `passthrough_mix` (0.25). Graph-safe;
+switching it on changes the post stage's op sequence (`set_params` reports it, the worker
+recaptures; the mix is hot). A device counter gives the share of decoded frames it fired on.
+
+- Clean take: fired on **1.9 %** of decoded frames (3.0 % with RNNoise off); sibilant
+  centroid 5977 -> 5974 Hz, active level unchanged, WER 5.3 % both, UTMOS 2.63 -> 2.62.
+- **It cannot tell a kiss from a key.** With RNNoise off, `all` (de-clicker + passthrough)
+  leaks *more* in the hangover than the de-clicker alone (log-mel change 1.19 vs 0.72,
+  excess +3.8 dB): the passthrough mixes the clamped click back in as a "burst". 19 §3.2
+  asked for a "mouth" marker (close source, no release impulse 90 ms later) decided before
+  the de-clicker; it is not built: it needs the kiss + typing take to calibrate. Until
+  then, passthrough and de-clicker should not be on together without RNNoise.
+
+### 15.5 `vox bench paraling` and `benchmarks/b2_laugh.py`
+
+`vox bench paraling --audio TAKE [--variants base,declick,confirm,laugh,passthrough,all]
+[--preset speak|natural] [--proxy-clicks] [--quality] [--set key=value ...]` renders any take
+through the user's chain (`benchmarks/paraling.py` `USER_*`) once per variant into
+`out/ab/paraling/<take>/<variant>.wav` with `report.json` (gate opens / onset log, de-clicker
+clamps, passthrough share, sibilant centroid and level, WER / UTMOS). `--proxy-clicks` builds
+a keystroke proxy from the take (its phrases spaced by 1.2 s of its own room tone; per phrase
+one two-impulse keystroke inside it, per pause one at 0.2 s (inside the hangover) and one at
+0.85 s (gate closed); push 10 ms RMS at -6 / 0 / +6 dB re the take's speech p95, cycling per
+place) and scores every click against the same render without clicks: output energy excess,
+and the log-mel change (a waveform difference is useless: one click nudges the SOLA
+alignment and every later hop shifts by a few samples, so the two renders differ by as much
+as the signal everywhere; the log-mel change on click-free speech windows is the floor).
+
+`benchmarks/b2_laugh.py --take T [--segments a-b,...]` renders Speak / Natural with and
+without the guard, then replays the engine's tracker, guard and ceiling on the conditioned
+input's F0 and reports per laugh segment: register move and peak (st), **recovery time**
+(s until the register is back within 1 st), **ceiling engagements** (voiced frames over the
+knee, share, output F0 p90 vs the knee), **voicing flips/s** (and the speech baseline outside
+every segment), guard weight and lift, gate closes inside.
+
+### 15.6 Placeholders waiting for the user's takes
+
+| Threshold | Value | Waits for |
+|---|---|---|
+| `declick_ratio` (fast/slow) | 4 (+12 dB) | typing take: in-speech clacks quieter than that are not caught (3 of 18 at -6 dB) |
+| `DECLICK_SETTLE_MS` / `DECIDE_MS` / `BACK_DB` / `PRE_MS` / `LAG_MS` | 12 / 20 / 6 dB / 6 / 2 ms | typing take (real clack decay and room level) and the ear on the plosive clamps (15.1) |
+| `onset_confirm_ms`, `onset_decay_db`, `onset_vad_rise`, `onset_pair_ms` | 30 ms, 8 dB, 0.25, 120 ms | typing take (real clacks in pauses, key release spacing); note RNNoise removes the synthetic ones |
+| crest factor, HF ratio | logged only | typing take: on the proxy neither separates clicks from speech |
+| `laugh_jump_st` | 9 st (0.75 oct) | laugh take (laugh F0 vs the register; creak at 67 Hz also trips it) |
+| `laugh_flip_rate` | 10 flips/s, 1 s mean | laugh take: speech here reaches 8.3, a laugh ~8.8 by the literature (P4) |
+| `laugh_ceiling_hz`, lift glide | 600 Hz, ~100 ms | laugh take and the ear: "clamped laugh" vs "cracked laugh" (19 §3.3) |
+| `PASS_*` (burst ratio 4 / 30 ms, breath 150 ms / 2.5 kHz, sibilant 4 kHz, floor -55 dBFS, band 150 Hz-10 kHz), `passthrough_mix` 0.25 | as listed | kiss / breath take, and a "mouth" marker to keep keys out (15.4) |
+
+### 15.7 Tests
+
+`tests/unit/test_declick.py` (5: a clack in a vowel clamped to about the vowel + 6 dB and
+the rest untouched; a /p/ burst followed by aspiration and voicing left alone; a click whose
+decision lands in the next block clamped through the look-back, identical to processing the
+whole signal at once; off by default; the look-back split across RNNoise's delay);
+`tests/unit/test_gate.py` (+2: a click in a pause rejected and logged with crest / HF, a held
+rise opens energy-only within 30 ms; a burst confirmed by a VAD rise);
+`tests/unit/test_laugh_guard.py` (3: off is exact, a laugh barely moves the register,
+flicker lifts the ceiling and speech lets it down); `tests/unit/test_passthrough.py` (3: off
+by default, a breath passes and a sibilant does not, voiced frames never pass and a short
+burst does); `tests/engine/test_engine.py` (+2: `apply_retro` reaches all three buffers;
+laugh guard needs no recapture, passthrough does, mix 0 equals off). Full suite: all pass
+except `tests/engine/test_worker.py`, which fails 1-2 of its tests per run on an underrun or
+a rebuild timing **with these changes stashed too** (the same flakiness 14.5 saw under load;
+the desktop had OBS, browsers and Broadcast running).
+
+### 15.8 Not verified
+
+- Anything on real keystrokes, laughs, kisses, breaths or whispers: no take exists. The
+  proxy's clicks are synthetic and RNNoise removes them, so in the user's chain this
+  session measured the flags' *cost*, not their benefit.
+- Live (worker) behaviour of the look-back under real timing; the simulator path and the
+  engine test cover it, no live soak was run.
+- The audibility of the de-clicker's clamps on plosives (15.1): the ear.
+- Whisper passthrough, a Whisper input mode, the laugh bank (19 §4 items 7-10): not built.
+- UTMOS seed floor for these renders: the -0.03..-0.06 moves are not shown to be outside it.
+
+**Defaults, one line each:** none changed. De-clicker, probation, laugh guard and
+passthrough are flags (`--declick`, `--onset-confirm-ms 30`, `--laugh-guard`,
+`--passthrough` on `vox run`; `--set` / variants on `vox bench paraling`) until the takes in
+15.6 decide them.
