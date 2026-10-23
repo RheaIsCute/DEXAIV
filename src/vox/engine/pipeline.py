@@ -30,12 +30,13 @@ from torch import Tensor
 
 from vox.audio.resample import IncrementalResampler16k, OutputResampler
 from vox.config.schemas import RuntimeParams
-from vox.engine.chunker import ChunkPlan
+from vox.engine.chunker import ANALYSIS_SR, ChunkPlan
 from vox.engine.postchain import PostChain
 from vox.features.base import Embedder
 from vox.pitch.base import (
     COARSE_F0_MAX,
     COARSE_F0_MIN,
+    LaughGuard,
     PitchExtractor,
     NoteDetector,
     RegisterTracker,
@@ -51,6 +52,7 @@ from vox.synthesis.formant import FormantWarp, snap_formant
 from vox.synthesis.rvc_model import RvcModel
 
 FORMANT_WARPS_KEPT = 8  # built FormantWarp objects per plan (cheap: indices + a FIR kernel)
+RETRO_MAX_MS = 50.0  # the longest de-clicker look-back apply_retro takes
 
 # Stage names shared by the pipeline and whoever drives it (worker or stream simulator).
 STAGES = ("upload", "gate", "resample_in", "f0", "embed", "index", "synth", "post", "sola",
@@ -169,6 +171,9 @@ class HopPipeline:
         self.note_ceiling_t = torch.full((), math.inf, device=dev)
         self.note_range_t = torch.ones((), device=dev)
         self.note_lift_oct_t = torch.zeros((), device=dev)  # note_target_offset_st / 12
+        # Laugh guard (§15): register update weight and ceiling lift; hot, always computed.
+        self.laugh = LaughGuard(dev)
+        self.laugh.fresh = p.shift_frames
         # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
         # hop's decoded slice starts; written by the synth stage, zeroed at gate onsets.
         self.sine_phase = torch.zeros(1, 1, 1, device=dev)
@@ -189,7 +194,18 @@ class HopPipeline:
         self.in_tail = torch.zeros(p.out_device + p.right, device=dev)
         self.in_tail_ref = self.in_tail[:p.out_device]
         self._in_tail_tmp = torch.zeros(p.out_device + p.right - p.block, device=dev)
+        # The de-clicker's look-back (apply_retro): device-rate and 16 kHz gains, staged
+        # once per use through one pinned buffer.
+        n = min(round(p.device_sr * RETRO_MAX_MS / 1000.0), p.out_device + p.right)
+        n16 = n * ANALYSIS_SR // p.device_sr
+        self._retro_n, self._retro_n16 = n, n16
+        self._retro_host = torch.ones(n + n16, pin_memory=pin)
+        self._retro_host_np = self._retro_host.numpy()
+        self._retro_dev = torch.ones(n + n16, device=dev)
         self.post = PostChain(p, dev)
+        # the decoded tail's pitch and everything before it (the passthrough's voicing)
+        self._pitchf_dec = (self.pitch_cache.pitchf_view[0, :p.skip_head + p.return_length]
+                            if self.extractor is not None else None)
         self.stage_fns: dict[str, Callable[[], None]] = {
             "resample_in": self._stage_resample_in,
             "f0": self._stage_f0,
@@ -229,14 +245,19 @@ class HopPipeline:
         self.note_ceiling_t.fill_(note_ceiling if note_ceiling > 0 else math.inf)
         self.note_range_t.fill_(max(params.note_pitch_range, 0.0))
         self.note_lift_oct_t.fill_(params.note_target_offset_st / 12.0)
+        self.laugh.set(params.laugh_guard, params.laugh_jump_st, params.laugh_flip_rate,
+                       params.laugh_ceiling_hz)
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
+        passthrough = self.post.passthrough_on
+        self.post.set_passthrough(params.passthrough and self.extractor is not None,
+                                  params.passthrough_mix)
         self.set_formant(params.formant_st)
         interp = params.f0_unvoiced == "interp"
         bridge = round(params.f0_bridge_ms / 10.0)
         trim, carry = params.f0_trim_tail, params.sine_phase_carry
         changed = (interp != self._interp or bridge != self._bridge or trim != self._trim_tail
-                   or carry != self._phase_carry)
+                   or carry != self._phase_carry or passthrough != self.post.passthrough_on)
         self._interp, self._bridge = interp, bridge
         self._trim_tail = self.pitch_cache.trim_tail = trim
         if carry != self._phase_carry:
@@ -288,6 +309,8 @@ class HopPipeline:
         self.sine_phase.zero_()
         self.register.reset()
         self.note.reset()
+        self.laugh.reset()
+        self.post.passthrough.reset_stats()
         self.hop_index = 0
         # Fresh decoder noise: with ``noise_roll`` the window would otherwise start on the
         # previous stream's draws (and a seeded run would not be reproducible).
@@ -321,6 +344,7 @@ class HopPipeline:
         tensors.append(self.sine_phase)
         tensors.extend(self.register.state_tensors())
         tensors.extend(self.note.state_tensors())
+        tensors.extend(self.laugh.state_tensors())
         return tensors
 
     def static_key(self) -> tuple:
@@ -331,7 +355,7 @@ class HopPipeline:
             id(self.index), self._interp, self._bridge, self._trim_tail, self._phase_carry,
             self.model.decoder_fp16,
             getattr(self.embedder, "autocast", None), getattr(self.embedder, "norm_mode", None),
-            self.post.rms_mix.graph_safe,
+            self.post.rms_mix.graph_safe, self.post.passthrough_on,
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32,
             torch.backends.cudnn.benchmark,
         )
@@ -358,6 +382,32 @@ class HopPipeline:
         self.in_block.copy_(self._host_in, non_blocking=True)
         if self._upload_done is not None:
             self._upload_done.record()
+
+    def apply_retro(self, gain: np.ndarray) -> None:
+        """The de-clicker's look-back (audio/conditioning.py ``Declicker``): scale the newest
+        ``len(gain)`` input samples already uploaded, in every buffer that holds them (the
+        device-rate tail, the 16 kHz ring, and the input resampler's carried window, whose
+        last 10 ms the next hop recomputes). Call before the next ``upload``, outside every
+        graph. The samples are inside the right context, so no rendered output used them.
+        """
+        n = min(len(gain), self._retro_n)
+        if n <= 0:
+            return
+        gain = np.asarray(gain[-n:], dtype=np.float32)
+        n16 = n * ANALYSIS_SR // self.plan.device_sr
+        # 16 kHz sample k of the last n16 sits at device position (k + 1) * sr/16k - 1
+        at = (np.arange(n16) + 1) * (n / max(n16, 1)) - 1.0
+        host = self._retro_host_np
+        host[:n] = gain
+        host[n:n + n16] = np.interp(at, np.arange(n), gain)
+        self._retro_dev[:n + n16].copy_(self._retro_host[:n + n16])  # synchronous: rare
+        g, g16 = self._retro_dev[:n], self._retro_dev[n:n + n16]
+        self.in_tail[-n:].mul_(g)
+        window = self.resampler_in._window
+        m = min(n, window.numel())
+        window[-m:].mul_(g[-m:])
+        if n16:
+            self.ring_16k[-n16:].mul_(g16)
 
     def fill_noise(self) -> None:
         """Draw this hop's decoder noise. Outside every graph: RNG never lives in a capture.
@@ -396,12 +446,15 @@ class HopPipeline:
 
     def _stage_f0(self) -> None:
         f0 = self.extractor.extract(self.f0_tail)
+        # A laugh (jump or voicing flicker) barely moves the register and lifts the ceiling
+        # (weight 1, lift 0 while laugh_guard is off: the same ops either way).
+        weight = self.laugh.update(f0, self.register.level, self.register.heard)
         # Held note? Then the note ceiling / range apply and the register holds still.
         note, frozen = self.note.update(f0)
         ratio = self.register.ratio(f0, self.ratio_t,  # per frame; the fixed ratio unless auto
                                     torch.where(note, self.note_range_t, self.register.range),
-                                    frozen, self.note.lift * self.note_lift_oct_t)
-        ceiling = torch.where(note, self.note_ceiling_t, self.f0_ceiling_t)
+                                    frozen, self.note.lift * self.note_lift_oct_t, weight)
+        ceiling = self.laugh.ceiling(torch.where(note, self.note_ceiling_t, self.f0_ceiling_t))
         _, cont = postprocess_f0(f0, ratio, self.f0_min_t, self.f0_max_t,
                                  self._interp, self._bridge, ceiling)
         # The excitation keeps the requested pitch; the coarse pitch is that over the
@@ -443,7 +496,7 @@ class HopPipeline:
 
     def _stage_post(self) -> None:
         self.out.copy_(self.resampler_out.run(self.audio_model))
-        self.post.run(self.out, self.in_tail_ref)
+        self.post.run(self.out, self.in_tail_ref, self._pitchf_dec)
 
     @torch.inference_mode()
     def process_hop(self) -> Tensor:

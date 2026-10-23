@@ -341,3 +341,51 @@ def test_gate_renders_the_final_consonant_of_a_sentence(engine, clip_48k):
     assert np.sqrt(np.mean(rendered ** 2)) > 0.03 * np.sqrt(np.mean(
         result.audio[int(0.5 * SR):int(0.9 * SR)] ** 2))  # within 30 dB of the speech
     assert closes[0] * plan.block >= start + len(consonant)  # closed after it was emitted
+
+
+def test_declick_lookback_rewrites_every_buffer_holding_the_samples(engine):
+    """``apply_retro`` (docs/DEVIATIONS.md §15): the de-clicker's look-back reaches the
+    device-rate tail, the 16 kHz ring and the resampler's carried window, so the next hop
+    recomputes nothing from the unclamped samples."""
+    pipeline, plan = engine.pipeline, engine.plan
+    pipeline.reset()
+    try:
+        for _ in range(3):
+            pipeline.upload(np.full(plan.block, 0.5, np.float32))
+            pipeline.advance_context()
+        n = plan.device_sr * 30 // 1000
+        pipeline.apply_retro(np.zeros(n))
+        assert not pipeline.in_tail[-n:].any() and pipeline.in_tail[-n - 1] != 0
+        assert not pipeline.resampler_in._window[-min(n, 2 * plan.zc):].any()
+        n16 = n * 16000 // plan.device_sr
+        assert pipeline.ring_16k[-n16:].abs().max() < 1e-6
+        assert pipeline.ring_16k[-n16 - 200:-n16 - 100].abs().min() > 0.4
+    finally:
+        pipeline.reset()
+
+
+def test_new_flags_are_off_exact_and_only_passthrough_changes_the_op_sequence(engine, clip_48k):
+    """Laugh guard: hot (no recapture). Passthrough: a recapture to switch on; at mix 0 the
+    stream equals the stream without it; at mix 0.5 it adds the mic on unvoiced frames."""
+    pipeline = engine.pipeline
+    audio = clip_48k[: 3 * SR]
+    sim = StreamSimulator(engine)
+    base = sim.run(audio, seed=5).audio
+    try:
+        assert not pipeline.set_params(dataclasses.replace(engine.params, laugh_guard=True))
+        assert pipeline.set_params(dataclasses.replace(engine.params, passthrough=True,
+                                                       passthrough_mix=0.0))
+        if engine.graphs is not None and engine.mode == "graphs":
+            engine.graphs.release()
+            engine.graphs.capture()
+        zero = sim.run(audio, seed=5).audio
+        assert compare(base, zero, SR, start_s=0.5)["l1"] < 0.05
+        pipeline.set_params(dataclasses.replace(engine.params, passthrough=True,
+                                                passthrough_mix=0.5))
+        mixed = sim.run(audio, seed=5).audio
+        assert np.abs(mixed - zero).max() > 1e-3
+    finally:
+        pipeline.set_params(engine.params)
+        if engine.graphs is not None and engine.mode == "graphs":
+            engine.graphs.release()
+            engine.graphs.capture()

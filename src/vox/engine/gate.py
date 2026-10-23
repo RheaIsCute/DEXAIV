@@ -8,7 +8,8 @@ VAD's recurrent state never skip audio. The gate opens on a block at least
 ``threshold_dbfs`` loud that the VAD calls speech, or, before the VAD has caught up, on a
 block ``onset_margin_db`` above the threshold (held only ``ONSET_PROBATION_MS`` unless the
 VAD confirms it; with ``onset_persist_chunks`` > 1 the rise must also have lasted that many
-32 ms VAD chunks, docs/DEVIATIONS.md §14). Once open it stays open down to
+32 ms VAD chunks, docs/DEVIATIONS.md §14; with ``onset_confirm_ms`` > 0 a 10 ms sub-frame
+flag is confirmed over the next 30 ms instead, §15). Once open it stays open down to
 ``threshold_dbfs - hysteresis_db`` and a VAD probability of ``vad_threshold -
 vad_hysteresis`` (Silero's own neg_threshold rule), then for ``hangover_ms`` more, never
 less than the stream delay (so the speech still inside the lookahead is rendered before the
@@ -53,6 +54,12 @@ ONSET_PROBATION_MS = 100.0
 # it reopened the gate on probation every ~120 ms through a pause.
 ONSET_RISE_DB = 12.0
 ONSET_BACKGROUND_MS = 200.0
+# Context-based probation (``onset_confirm_ms`` > 0, report 19 §1.3): the onset flag and its
+# confirmation run on 10 ms sub-frames; the decay test looks this far past the flag's peak.
+SUB_MS = 10.0
+CONFIRM_DECAY_MS = 20.0
+ONSET_LOG_MAX = 4000  # flagged onsets kept for the bench (crest factor, HF ratio, verdict)
+HF_SPLIT_HZ = 2000.0  # the HF ratio is the energy share above this
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,18 @@ class GateConfig:
     # block's own level only (today); 2 = one extra chunk, so a 20-50 ms creak or desk tap
     # does not open the gate.
     onset_persist_chunks: int = 1
+    # Context-based probation (docs/DEVIATIONS.md §15, report 19 §1.3). 0 = off (the rule
+    # above). > 0 replaces it: a 10 ms sub-frame ``onset_margin_db`` over the threshold and
+    # ONSET_RISE_DB over the quietest sub-frame of the last 200 ms flags an onset; the gate
+    # stays closed while the next ``onset_confirm_ms`` arrive (they sit in the lookahead),
+    # then opens if the energy has not fallen ``onset_decay_db`` from its peak within 20 ms
+    # (a voice holds, a click does not) or Silero's probability rose ``onset_vad_rise``.
+    # A rejected flag mutes new flags for ``onset_pair_ms`` (a key's release impulse).
+    # The thresholds are placeholders until the user's typing take.
+    onset_confirm_ms: float = 0.0
+    onset_decay_db: float = 8.0
+    onset_vad_rise: float = 0.25
+    onset_pair_ms: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -176,6 +195,13 @@ class SilenceGate:
         self._acc = np.zeros(VAD_CHUNK + self._decimate.out_len, dtype=np.float32)
         self._acc_len = 0
         self._chunk_levels = np.full(4, -120.0)  # dBFS of the last completed VAD chunks
+        self._sub = max(1, plan.device_sr * int(SUB_MS) // 1000)
+        self._sub_bg = np.full(max(1, int(ONSET_BACKGROUND_MS / SUB_MS)), -120.0)
+        # Every flagged onset, for calibration (report 19 §1.3: log, do not threshold):
+        # dicts of time, level, rise, crest factor, HF ratio and the verdict.
+        from collections import deque
+
+        self.onset_log: deque[dict] = deque(maxlen=ONSET_LOG_MAX)
         self.transitions = 0
         self.reset()
 
@@ -195,6 +221,11 @@ class SilenceGate:
         self._recent[:] = -120.0  # block levels of the last ONSET_BACKGROUND_MS
         self._recent_pos = 0
         self._chunk_levels[:] = -120.0
+        self._sub_bg[:] = -120.0
+        self._sub_pos = 0  # absolute sub-frame index of the next block's first sub-frame
+        self._cand: dict | None = None  # the flagged onset awaiting confirmation
+        self._mute_until = 0  # sub-frame index before which no new flag is raised
+        self._vad_before = 0.0  # the VAD probability before this block's chunks
         self._decimate.reset()
         if self.vad is not None:
             self.vad.reset()
@@ -238,8 +269,62 @@ class SilenceGate:
         cfg = self.config
         return bool(np.all(self._chunk_levels[-need:] >= cfg.threshold_dbfs + cfg.onset_margin_db))
 
+    def _features(self, x: np.ndarray, start: int) -> dict:
+        """Crest factor (dB) and HF energy share of one flagged sub-frame, logged only."""
+        rms = math.sqrt(float(np.mean(np.square(x, dtype=np.float64)))) + 1e-12
+        spec = np.abs(np.fft.rfft(x)) ** 2
+        freqs = np.fft.rfftfreq(len(x), 1.0 / self.plan.device_sr)
+        return {"t": start * self._sub / self.plan.device_sr,
+                "crest_db": 20.0 * math.log10(float(np.max(np.abs(x))) / rms + 1e-12),
+                "hf_ratio": float(spec[freqs >= HF_SPLIT_HZ].sum() / (spec.sum() + 1e-20))}
+
+    def _confirm(self, block: np.ndarray, armed: bool) -> bool:
+        """Context-based probation over this block's sub-frames: True when a flagged onset
+        is confirmed in it (the gate opens energy-only). Flags are raised only while
+        ``armed`` (the gate closed); the background is tracked either way."""
+        cfg = self.config
+        n = len(block) // self._sub
+        levels = [rms_dbfs(block[k * self._sub:(k + 1) * self._sub]) for k in range(n)]
+        need = max(1, math.ceil(cfg.onset_confirm_ms / SUB_MS))
+        decay_n = max(1, round(CONFIRM_DECAY_MS / SUB_MS))
+        confirmed = False
+        for k, lv in enumerate(levels):
+            j = self._sub_pos + k
+            cand = self._cand
+            if cand is None and armed and not confirmed and j >= self._mute_until:
+                bg = float(self._sub_bg.min())
+                if lv >= cfg.threshold_dbfs + cfg.onset_margin_db and lv >= bg + ONSET_RISE_DB:
+                    x = block[k * self._sub:(k + 1) * self._sub]
+                    cand = self._cand = {"j": j, "levels": [lv], **self._features(x, j),
+                                         "level_db": lv, "rise_db": lv - bg,
+                                         "vad_before": self._vad_before}
+            elif cand is not None:
+                cand["levels"].append(lv)
+            self._sub_bg[j % len(self._sub_bg)] = lv
+            if cand is None or len(cand["levels"]) <= need:
+                continue
+            # decide: the peak is in the flagged sub-frame or the next; did it decay?
+            lvs = cand["levels"]
+            p = int(np.argmax(lvs[:2]))
+            after = lvs[p + 1:p + 1 + decay_n]
+            held = bool(after) and min(after) > lvs[p] - cfg.onset_decay_db
+            vad = self._vad_prob - cand["vad_before"] >= cfg.onset_vad_rise
+            verdict = "held" if held else "vad" if vad else "rejected"
+            entry = {k2: v for k2, v in cand.items() if k2 != "levels"}
+            entry.update(verdict=verdict, levels=[round(v, 1) for v in lvs],
+                         vad_after=self._vad_prob)
+            self.onset_log.append(entry)
+            self._cand = None
+            if verdict == "rejected":
+                self._mute_until = cand["j"] + max(1, round(cfg.onset_pair_ms / SUB_MS))
+            else:
+                confirmed = True
+        self._sub_pos += n
+        return confirmed
+
     def decide(self, block: np.ndarray) -> GateDecision:
         level = rms_dbfs(block)
+        self._vad_before = self._vad_prob
         self._vad_update(block)
         cfg = self.config
         if not cfg.enabled:
@@ -261,8 +346,22 @@ class SilenceGate:
         background = float(self._recent.min())
         self._recent[self._recent_pos] = level
         self._recent_pos = (self._recent_pos + 1) % len(self._recent)
-        strong = (not self.open and level >= cfg.threshold_dbfs + cfg.onset_margin_db
-                  and level >= background + ONSET_RISE_DB and self._rise_persisted())
+        if cfg.onset_confirm_ms > 0:
+            if self.open:
+                self._cand = None  # the gate is open anyway: nothing to confirm
+            strong = self._confirm(block, armed=not self.open) and not self.open
+        else:
+            strong = (not self.open and level >= cfg.threshold_dbfs + cfg.onset_margin_db
+                      and level >= background + ONSET_RISE_DB and self._rise_persisted())
+            if strong:  # log the legacy rule's onsets too (loudest sub-frame)
+                n = len(block) // self._sub
+                k = int(np.argmax([np.mean(np.square(block[i * self._sub:(i + 1) * self._sub]))
+                                   for i in range(n)]))
+                self.onset_log.append({**self._features(block[k * self._sub:(k + 1) * self._sub],
+                                                        self._sub_pos + k),
+                                       "level_db": level, "rise_db": level - background,
+                                       "verdict": "legacy"})
+            self._sub_pos += len(block) // self._sub
         energy_only = False
         if loud and voiced:
             self._remaining = self.hangover_hops

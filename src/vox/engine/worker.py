@@ -247,7 +247,7 @@ class InferenceWorker(threading.Thread):
             if heavy:
                 self._fade_out()
             if self.pipeline.set_params(params):
-                self._recapture("f0_unvoiced changed")
+                self._recapture("a stage op sequence changed")
             self.sola.set_hold_eps(params.sola_hold_eps)
             outcome = self.graphs.sync_formant()
             if heavy:
@@ -277,6 +277,8 @@ class InferenceWorker(threading.Thread):
             if self.conditioner is not None:
                 block_in = self.conditioner.process(block_in)
                 s.input_gain_db = self.conditioner.gain_db
+                if self.conditioner.retro is not None:  # de-clicker look-back (§15)
+                    pipeline.apply_retro(self.conditioner.retro)
             pipeline.upload(block_in)
         with timers.stage("gate"):
             decision: GateDecision = gate.decide(block_in)

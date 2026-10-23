@@ -305,6 +305,8 @@ class StreamSimulator:
             with timers.stage("upload"):
                 if conditioner is not None:
                     host_block = conditioner.process(host_block)
+                    if conditioner.retro is not None:  # de-clicker look-back (§15)
+                        pipeline.apply_retro(conditioner.retro)
                 pipeline.upload(host_block)
             with timers.stage("gate"):
                 decision = silence_gate.decide(host_block) if silence_gate else always

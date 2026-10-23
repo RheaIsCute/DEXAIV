@@ -209,17 +209,21 @@ class RegisterTracker:
         return min(REGISTER_MAX_ST, max(REGISTER_MIN_ST, st))
 
     def ratio(self, f0: Tensor, fixed: Tensor, pitch_range: Tensor | None = None,
-              freeze: Tensor | None = None, lift_oct: Tensor | None = None) -> Tensor:
+              freeze: Tensor | None = None, lift_oct: Tensor | None = None,
+              weight: Tensor | None = None) -> Tensor:
         """Per-frame transposition ratio for ``f0`` (Hz, 0 = unvoiced) after updating the
         register from its last ``fresh`` frames; ``fixed`` is the 0-dim manual ratio.
         ``pitch_range`` (0-dim) overrides the set range for this hop; ``freeze`` (0-dim
-        bool) keeps the register where it is (a held note, ``NoteDetector``)."""
+        bool) keeps the register where it is (a held note, ``NoteDetector``); ``weight``
+        (0-dim, 0..1) scales this hop's update (``LaughGuard``)."""
         tail = f0[-self.fresh:]
         voiced = tail > 0
         count = voiced.sum().to(f0.dtype)
         log_f0 = torch.log2(f0.clamp(min=1.0))
         mean = torch.where(voiced, log_f0[-self.fresh:], 0.0).sum() / count.clamp(min=1.0)
         a = 1.0 - torch.exp(-count / self.tau_frames)
+        if weight is not None:
+            a = a * weight
         first = (self.heard == 0) & (count > 0)
         level = torch.where(first, mean, self.level + a * (mean - self.level))
         moving = count > 0
@@ -235,6 +239,94 @@ class RegisterTracker:
             log_ratio = log_ratio + lift_oct
         warmed = (self.auto > 0) & (self.heard >= REGISTER_WARM_FRAMES)
         return torch.where(warmed, torch.exp2(log_ratio), fixed.expand_as(f0))
+
+
+LAUGH_SLOPE_OCT = 1.0 / 12.0  # sigmoid width of the jump flag (1 st)
+LAUGH_SLOPE_FLIPS = 1.0  # sigmoid width of the flicker flag (flips/s)
+LAUGH_RATE_TAU_FRAMES = 100.0  # the flip rate is a 1 s running mean (a laugh bout's length)
+LAUGH_LIFT_ALPHA = 0.1  # per frame: the ceiling lift glides in / out over ~100 ms
+
+
+class LaughGuard:
+    """Laugh guard and ceiling lift (docs/DEVIATIONS.md §15, report 19 §3.3).
+
+    Two soft flags per hop, from the talker's own F0 (Hz, 0 = unvoiced):
+
+    * jump: the hop's mean voiced log2 F0 is ``jump`` octaves or more from the register
+      (``RegisterTracker.level``, once it has heard ``REGISTER_WARM_FRAMES``):
+      ``sigmoid((|mean - level| - jump) / LAUGH_SLOPE_OCT)``;
+    * flicker: the running voicing flip rate is ``flip_rate`` flips/s or more
+      (``sigmoid((rate - flip_rate) / LAUGH_SLOPE_FLIPS)``); laugh calls alternate voiced and
+      unvoiced at ~4.4 calls/s, about 9 flips/s.
+
+    ``update`` returns the register's update weight ``(1 - jump) (1 - flicker)``, so a laugh
+    barely moves the auto-pitch register. ``lift`` (0..1) glides toward ``max(jump up,
+    flicker)`` and ``ceiling`` raises the soft ceiling toward ``ceiling_hz`` by it, so laugh
+    calls keep their excursion. Graph-safe: 0-dim device state, no host sync, the same op
+    sequence on or off (``enabled`` 0 = weight 1 and lift 0).
+    """
+
+    def __init__(self, device: torch.device | str) -> None:
+        self.enabled = torch.zeros((), device=device)
+        self.jump = torch.full((), 0.75, device=device)  # octaves
+        self.flip_rate = torch.full((), 10.0, device=device)  # flips/s
+        self.ceiling_hz = torch.full((), 600.0, device=device)
+        self.prev = torch.zeros((), device=device)  # voicing of the last frame seen (0/1)
+        self.rate = torch.zeros((), device=device)  # voicing flips per second, running
+        self.lift = torch.zeros((), device=device)
+        self.weight = torch.ones((), device=device)  # the last hop's weight (stats)
+        self.fresh = 1
+
+    def set(self, enabled: bool, jump_st: float, flip_rate: float, ceiling_hz: float) -> None:
+        self.enabled.fill_(1.0 if enabled else 0.0)
+        self.jump.fill_(max(jump_st, 0.0) / 12.0)
+        self.flip_rate.fill_(flip_rate)
+        self.ceiling_hz.fill_(ceiling_hz if ceiling_hz > 0 else math.inf)
+
+    def reset(self) -> None:
+        self.prev.zero_()
+        self.rate.zero_()
+        self.lift.zero_()
+        self.weight.fill_(1.0)
+
+    def state_tensors(self) -> list[Tensor]:
+        return [self.prev, self.rate, self.lift, self.weight]
+
+    def update(self, f0: Tensor, level: Tensor, heard: Tensor) -> Tensor:
+        """Advance over the last ``fresh`` frames; returns the register weight (0-dim).
+        ``level`` / ``heard`` are the register's state before this hop's update."""
+        tail = f0[-self.fresh:]
+        v = (tail > 0).to(f0.dtype)
+        flips = (v[0] - self.prev).abs()
+        if self.fresh > 1:
+            flips = flips + (v[1:] - v[:-1]).abs().sum()
+        self.prev.copy_(v[-1])
+        a = 1.0 - math.exp(-self.fresh / LAUGH_RATE_TAU_FRAMES)
+        rate = self.rate + a * (flips * (100.0 / self.fresh) - self.rate)
+        self.rate.copy_(rate)
+        count = v.sum()
+        log_f0 = torch.log2(tail.clamp(min=1.0))
+        mean = (log_f0 * v).sum() / count.clamp(min=1.0)
+        # the register must have settled first: before it, every hop "jumps"
+        known = (count > 0) & (heard >= REGISTER_WARM_FRAMES)
+        dist = mean - level
+        jump = torch.where(known, torch.sigmoid((dist.abs() - self.jump) / LAUGH_SLOPE_OCT), 0.0)
+        jump_up = torch.where(known, torch.sigmoid((dist - self.jump) / LAUGH_SLOPE_OCT), 0.0)
+        flicker = torch.sigmoid((rate - self.flip_rate) / LAUGH_SLOPE_FLIPS)
+        on = self.enabled
+        weight = 1.0 - on * (1.0 - (1.0 - jump) * (1.0 - flicker))
+        self.weight.copy_(weight)
+        target = on * torch.maximum(jump_up, flicker)
+        b = 1.0 - (1.0 - LAUGH_LIFT_ALPHA) ** self.fresh
+        self.lift.copy_(self.lift + b * (target - self.lift))
+        return weight
+
+    def ceiling(self, ceiling: Tensor) -> Tensor:
+        """The soft ceiling raised toward ``ceiling_hz`` by ``lift`` (log-linear); an
+        absent ceiling (inf) stays absent, and the lift never lowers one."""
+        high = torch.maximum(self.ceiling_hz, ceiling)
+        lifted = ceiling * torch.pow(high / ceiling, self.lift)
+        return torch.where(torch.isfinite(ceiling), lifted, ceiling)
 
 
 NOTE_REF_ALPHA = 0.1  # per frame: the run's reference pitch follows a slow vibrato

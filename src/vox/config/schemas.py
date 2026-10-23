@@ -127,6 +127,23 @@ class RuntimeParams:
     # pitch stays put; negative = deeper / bigger, positive = lighter / smaller. -4..+4 in
     # 0.5 st steps (each step is its own decoder shape: a cached synth graph).
     formant_st: float = 0.0
+    # Laugh guard (docs/DEVIATIONS.md §15, report 19 §3.3). A hop whose mean voiced F0 sits
+    # ``laugh_jump_st`` or more from the register, or that falls inside a voicing flicker of
+    # ``laugh_flip_rate`` flips/s or more, barely moves the auto-pitch register; the same
+    # flags glide the soft ceiling up toward ``laugh_ceiling_hz`` for the bout. Hot,
+    # device-side, graph-safe (sigmoids on existing tensors). Thresholds are placeholders
+    # until the user's laugh take.
+    laugh_guard: bool = False
+    laugh_jump_st: float = 9.0
+    laugh_flip_rate: float = 10.0  # speech here: 3-5 flips/s, bursts up to 8.3 (§15)
+    laugh_ceiling_hz: float = 600.0
+    # Breath / click passthrough (§15, report 19 §3.2): on unvoiced frames that are a short
+    # burst (<= 30 ms) or a long low-centroid breath, the band-passed conditioned mic is mixed
+    # under the converted voice at ``passthrough_mix``. Sustained frames with a centroid
+    # above 4 kHz (sibilants: they carry the talker's sex) never pass. Toggling it changes
+    # the post stage's op sequence (a graph recapture); the mix is hot.
+    passthrough: bool = False
+    passthrough_mix: float = 0.25
 
 
 @dataclass(frozen=True)

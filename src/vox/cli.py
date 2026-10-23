@@ -96,6 +96,20 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
                         "(default 1; 2 keeps creaks and taps out, docs/DEVIATIONS.md 14)")
     p.add_argument("--onset-ramp-energy-ms", type=float, default=None,
                    help="fade-in of an energy-only gate onset (default: the onset ramp)")
+    p.add_argument("--onset-confirm-ms", type=float, default=None,
+                   help="context-based probation: an energy-only onset opens only after "
+                        "this much confirmation (30; default 0 = off, docs/DEVIATIONS.md 15)")
+    p.add_argument("--declick", choices=("on", "off"), default=None,
+                   help="in-speech de-clicker before RNNoise, using the lookahead "
+                        "(default off, docs/DEVIATIONS.md 15)")
+    p.add_argument("--laugh-guard", choices=("on", "off"), default=None,
+                   help="laughs barely move the auto-pitch register and lift the ceiling "
+                        "(default off, docs/DEVIATIONS.md 15)")
+    p.add_argument("--passthrough", choices=("on", "off"), default=None,
+                   help="breaths and mouth clicks from the mic mixed under the voice "
+                        "(never sibilants; default off, docs/DEVIATIONS.md 15)")
+    p.add_argument("--passthrough-mix", type=float, default=None,
+                   help="passthrough level, 0-1 (default 0.25)")
     p.add_argument("--auto-level", choices=("on", "off"), default=None,
                    help="microphone auto level (AGC toward -20 dBFS speech; default on)")
     p.add_argument("--input-gain-db", type=float, default=None,
@@ -122,7 +136,8 @@ def conditioning_config(profile, args: argparse.Namespace):
                               noise_floor_dbfs=cal.noise_floor_dbfs,
                               suppression_mix=1.0 if mix is None else mix,
                               suppression_strength=getattr(args, "suppression_strength", None)
-                              or "normal")
+                              or "normal",
+                              declick=getattr(args, "declick", None) == "on")
 
 
 def gate_config(profile, args: argparse.Namespace):
@@ -138,7 +153,8 @@ def gate_config(profile, args: argparse.Namespace):
                       vad_threshold=cal.vad.threshold,
                       hangover_ms=cal.vad.release_ms if hangover is None else hangover,
                       use_vad=cal.vad.engine == "silero",
-                      onset_persist_chunks=1 if persist is None else max(1, persist))
+                      onset_persist_chunks=1 if persist is None else max(1, persist),
+                      onset_confirm_ms=getattr(args, "onset_confirm_ms", None) or 0.0)
 
 
 def resolve(args: argparse.Namespace):
@@ -154,7 +170,7 @@ def resolve(args: argparse.Namespace):
     args.conditioning_config = conditioning_config(profile, args)
     config = ModelRegistry(args.models_dir).config(args.model)
     overrides_params = dict(vars(args))
-    for flag in ("sine_phase_carry", "noise_roll"):
+    for flag in ("sine_phase_carry", "noise_roll", "laugh_guard", "passthrough"):
         if overrides_params.get(flag) is not None:
             overrides_params[flag] = overrides_params[flag] == "on"
     params = resolve_runtime_params(profile, config, overrides_params)

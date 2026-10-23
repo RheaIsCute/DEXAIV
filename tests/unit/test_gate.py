@@ -320,3 +320,49 @@ def test_a_hop_with_no_finished_vad_chunk_keeps_the_last_probability():
     vad.level = 0.2
     gate.decide(at_dbfs(plan.block, -40.0))  # 128 + 320 < 512: still the 0.9
     assert vad.chunks == 1 and gate._vad_prob == pytest.approx(0.9)
+
+
+def test_context_probation_rejects_a_click_and_confirms_a_held_onset():
+    """``onset_confirm_ms`` (docs/DEVIATIONS.md §15): a 10 ms click in a pause flags an
+    onset that decays at once, so the gate stays closed and the log says why; a rise that
+    holds opens energy-only within the 30 ms confirmation. Off by default."""
+    assert GateConfig().onset_confirm_ms == 0.0
+    plan, gate, vad = vad_gate(level=0.0, onset_confirm_ms=30.0)
+    sub = SR // 100
+    quiet = at_dbfs(plan.block, -70.0)
+    for _ in range(12):
+        assert not gate.decide(quiet).speech
+    clicked = quiet.copy()
+    rng = np.random.default_rng(0)
+    clicked[:sub] = (0.3 * rng.standard_normal(sub)).astype(np.float32)
+    decisions = [gate.decide(clicked)] + [gate.decide(quiet) for _ in range(6)]
+    assert not any(d.speech for d in decisions)
+    entry = gate.onset_log[-1]
+    assert entry["verdict"] == "rejected"
+    assert entry["crest_db"] > 6.0 and 0.0 < entry["hf_ratio"] < 1.0
+    for _ in range(12):
+        gate.decide(quiet)
+    loud = at_dbfs(plan.block, -30.0)
+    decisions = [gate.decide(loud) for _ in range(4)]
+    opened = next(i for i, d in enumerate(decisions) if d.speech)
+    assert opened <= 2  # 30 ms of confirmation is at most two 20 ms hops
+    assert decisions[opened].onset and decisions[opened].energy_only
+    assert gate.onset_log[-1]["verdict"] == "held"
+
+
+def test_context_probation_opens_on_a_vad_rise_after_a_burst():
+    """A burst that decays but is followed by Silero's probability rising (a plosive the
+    VAD recognises) is confirmed by the VAD rule."""
+    plan, gate, vad = vad_gate(level=0.0, onset_confirm_ms=30.0)
+    sub = SR // 100
+    quiet = at_dbfs(plan.block, -70.0)
+    for _ in range(12):
+        gate.decide(quiet)
+    burst = quiet.copy()
+    burst[sub:2 * sub] = (0.3 * np.random.default_rng(1).standard_normal(sub)).astype(np.float32)
+    gate.decide(burst)
+    vad.level = 0.4  # a rise of 0.4 >= 0.25, still under the 0.5 open threshold
+    decisions = [gate.decide(quiet) for _ in range(3)]
+    d = next(d for d in decisions if d.speech)  # once 30 ms after the flag have arrived
+    assert d.onset and d.energy_only
+    assert gate.onset_log[-1]["verdict"] == "vad"
