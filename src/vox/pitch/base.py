@@ -209,7 +209,7 @@ class RegisterTracker:
         return min(REGISTER_MAX_ST, max(REGISTER_MIN_ST, st))
 
     def ratio(self, f0: Tensor, fixed: Tensor, pitch_range: Tensor | None = None,
-              freeze: Tensor | None = None) -> Tensor:
+              freeze: Tensor | None = None, lift_oct: Tensor | None = None) -> Tensor:
         """Per-frame transposition ratio for ``f0`` (Hz, 0 = unvoiced) after updating the
         register from its last ``fresh`` frames; ``fixed`` is the 0-dim manual ratio.
         ``pitch_range`` (0-dim) overrides the set range for this hop; ``freeze`` (0-dim
@@ -231,6 +231,8 @@ class RegisterTracker:
         # per frame: target * (f0 / level) ** range, as a ratio against f0
         r = self.range if pitch_range is None else pitch_range
         log_ratio = shift + (r - 1.0) * (log_f0 - self.level)
+        if lift_oct is not None:  # the sung-register lift, in octaves (NoteDetector)
+            log_ratio = log_ratio + lift_oct
         warmed = (self.auto > 0) & (self.heard >= REGISTER_WARM_FRAMES)
         return torch.where(warmed, torch.exp2(log_ratio), fixed.expand_as(f0))
 
@@ -259,6 +261,14 @@ class NoteDetector:
         self.tolerance = torch.full((), 1.0 / 12.0, device=device)  # octaves
         self.fresh = 1
         self.notes = torch.zeros((), device=device)  # hops spent inside a note (stats)
+        # Sung-register lift (docs/DEVIATIONS.md 14.8): a held note marks the phrase as
+        # sung; ``lift`` (0..1) glides to 1 while it is, back to 0 after ``release``
+        # frames without voice. The pipeline adds lift * note_target_offset_st.
+        self.lift = torch.zeros((), device=device)
+        self.quiet = torch.zeros((), device=device)  # unvoiced frames since the last voice
+        self.sung = torch.zeros((), device=device)
+        self.lift_alpha = 0.05  # per frame: ~200 ms to 63 %
+        self.release = torch.full((), 150.0, device=device)  # 1.5 s of silence ends a sung phrase
 
     def set(self, enabled: bool, min_ms: float, tolerance_st: float, freeze_ms: float) -> None:
         self.enabled.fill_(1.0 if enabled else 0.0)
@@ -270,9 +280,12 @@ class NoteDetector:
         self.ref.zero_()
         self.run.zero_()
         self.notes.zero_()
+        self.lift.zero_()
+        self.quiet.zero_()
+        self.sung.zero_()
 
     def state_tensors(self) -> list[Tensor]:
-        return [self.ref, self.run, self.notes]
+        return [self.ref, self.run, self.notes, self.lift, self.quiet, self.sung]
 
     def update(self, f0: Tensor) -> tuple[Tensor, Tensor]:
         """Advance over the last ``fresh`` frames of ``f0`` (Hz, 0 = unvoiced); returns
@@ -293,4 +306,14 @@ class NoteDetector:
         note = on & (run >= self.min_frames)
         frozen = on & (run >= self.freeze_frames)
         self.notes.copy_(self.notes + note.to(self.notes.dtype))
+        # sung phrase latch and the lift's glide (over the hop's fresh frames)
+        voiced_any = (tail > 0).any()
+        quiet = torch.where(voiced_any, torch.zeros_like(self.quiet), self.quiet + self.fresh)
+        sung = torch.where(note, torch.ones_like(self.sung),
+                           torch.where(quiet >= self.release, torch.zeros_like(self.sung), self.sung))
+        sung = sung * on.to(sung.dtype)
+        a = 1.0 - (1.0 - self.lift_alpha) ** self.fresh
+        self.quiet.copy_(quiet)
+        self.sung.copy_(sung)
+        self.lift.copy_(self.lift + a * (sung - self.lift))
         return note, frozen

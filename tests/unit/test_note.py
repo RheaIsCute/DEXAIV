@@ -110,3 +110,18 @@ def pytest_approx(value, abs_tol):
     import pytest
 
     return pytest.approx(value, abs=abs_tol)
+
+
+def test_a_held_note_lifts_the_phrase_and_silence_releases_it():
+    """Sung-register lift (docs/DEVIATIONS.md 14.8): no lift on speech-like pitch, a glide
+    to 1 after a held note, held through short gaps, back to 0 after 1.5 s of silence."""
+    t = np.arange(300) / 100.0
+    speech = 120.0 * 2 ** (3 / 12 * np.sin(2 * math.pi * 2.5 * t))  # moving, never held
+    _, det = detect(speech)
+    assert det.lift.item() == 0.0 and det.sung.item() == 0.0
+    note = np.full(100, 220.0)
+    gap = np.zeros(40)  # a breath inside the phrase
+    _, det = detect(np.concatenate([note, gap]))
+    assert det.sung.item() == 1.0 and det.lift.item() > 0.9  # still lifted after the breath
+    _, det = detect(np.concatenate([note, np.zeros(200)]))
+    assert det.sung.item() == 0.0 and det.lift.item() < 0.2  # 2 s of silence: released

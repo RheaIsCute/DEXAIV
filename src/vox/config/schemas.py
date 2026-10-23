@@ -119,6 +119,10 @@ class RuntimeParams:
     note_ceiling_hz: float = 0.0
     note_pitch_range: float = 1.0
     note_freeze_ms: float = 100.0
+    # Sung-register lift (14.8): once a held note marks the phrase as sung, auto pitch
+    # aims this many semitones above target_f0_hz (gliding in over ~200 ms, out after
+    # 1.5 s of silence). 0 = off. Auto pitch only.
+    note_target_offset_st: float = 0.0
     # Formant (docs/DEVIATIONS.md §12): resonances shifted by this many semitones while the
     # pitch stays put; negative = deeper / bigger, positive = lighter / smaller. -4..+4 in
     # 0.5 st steps (each step is its own decoder shape: a cached synth graph).

@@ -168,6 +168,7 @@ class HopPipeline:
         self.note.fresh = p.shift_frames
         self.note_ceiling_t = torch.full((), math.inf, device=dev)
         self.note_range_t = torch.ones((), device=dev)
+        self.note_lift_oct_t = torch.zeros((), device=dev)  # note_target_offset_st / 12
         # Experimental ``sine_phase_carry``: the NSF sine's phase (cycles) where the next
         # hop's decoded slice starts; written by the synth stage, zeroed at gate onsets.
         self.sine_phase = torch.zeros(1, 1, 1, device=dev)
@@ -227,6 +228,7 @@ class HopPipeline:
         note_ceiling = params.note_ceiling_hz if params.note_ceiling_hz > 0 else params.f0_ceiling_hz
         self.note_ceiling_t.fill_(note_ceiling if note_ceiling > 0 else math.inf)
         self.note_range_t.fill_(max(params.note_pitch_range, 0.0))
+        self.note_lift_oct_t.fill_(params.note_target_offset_st / 12.0)
         self.sid_t.fill_(params.sid)
         self.post.set_volume_envelope(params.volume_envelope)
         self.set_formant(params.formant_st)
@@ -398,7 +400,7 @@ class HopPipeline:
         note, frozen = self.note.update(f0)
         ratio = self.register.ratio(f0, self.ratio_t,  # per frame; the fixed ratio unless auto
                                     torch.where(note, self.note_range_t, self.register.range),
-                                    frozen)
+                                    frozen, self.note.lift * self.note_lift_oct_t)
         ceiling = torch.where(note, self.note_ceiling_t, self.f0_ceiling_t)
         _, cont = postprocess_f0(f0, ratio, self.f0_min_t, self.f0_max_t,
                                  self._interp, self._bridge, ceiling)
