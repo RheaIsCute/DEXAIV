@@ -38,12 +38,18 @@ the stream simulator; there is no separate batch path.
                                       end) vs the whole-file features and F0 of the same frames;
                                       --store-norm measures the frozen ContentVec norm statistics
 
+    vox bench paraling                report 19 A/B: any take (--audio) through the user's live
+                                      chain with each paralinguistics flag (de-clicker, onset
+                                      confirmation, laugh guard, passthrough) -> wavs + report;
+                                      --proxy-clicks adds synthetic keystrokes and scores leaks
+
 Results are appended to benchmarks/results/<name>.jsonl with the environment fingerprint.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import dataclasses
 import math
 import sys
@@ -1421,6 +1427,84 @@ def _take_audio(args):
     return path, audio[start:start + int(args.seconds * 48000)]
 
 
+def cmd_paraling(args) -> int:
+    """Report 19 A/B (benchmarks/paraling.py): the take through the user's chain once per
+    flag variant; wavs and report.json into out/ab/paraling/<take>/."""
+    import formant_index as fi
+    import paraling as pl
+    from vox.audio.resample import load_audio, save_audio
+
+    take = Path(args.audio if args.audio != DEFAULT_AUDIO else fi.DEFAULT_TAKE)
+    audio, _ = load_audio(take, pl.SR)
+    start = int(args.start * pl.SR)
+    audio = audio[start:start + int(args.seconds * pl.SR)] if args.seconds > 0 else audio[start:]
+    out = Path(args.out_dir or ROOT / "out" / "ab" / "paraling" / take.stem)
+    out.mkdir(parents=True, exist_ok=True)
+    variants = args.variants.split(",") if args.variants else list(pl.VARIANTS)
+    for v in variants:
+        if v not in pl.VARIANTS:
+            raise SystemExit(f"paraling: unknown variant {v!r} (have {', '.join(pl.VARIANTS)})")
+    o = _overrides(args)
+    extra = {"shape": o["shape"], "params": o["params"], "gate": o["gate"],
+             "cond": o["conditioning"]}
+    if args.pitch != 0.0:
+        extra["params"]["f0_up_key"] = args.pitch
+    save_audio(out / "input.wav", audio, pl.SR)
+    proxy = None
+    if args.proxy_clicks:
+        proxy, clean, meta = pl.build_click_proxy(audio)
+        save_audio(out / "proxy_input.wav", proxy, pl.SR)
+        save_audio(out / "proxy_input_noclicks.wav", clean, pl.SR)
+        pl.write_report(out / "proxy_events.json", meta)
+    script = _script_text(args) if args.quality else None
+    report = {"take": str(take), "model": args.model, "preset": args.preset,
+              "overrides": extra, "variants": {}}
+    kit = None
+    for v in variants:
+        print(f"[{v}] loading...", flush=True)
+        engine = pl.load_variant(v, args.models_dir, args.profile, args.model, args.preset, extra)
+        try:
+            delay = pl.output_delay(engine)
+            res = pl.render(engine, audio)
+            save_audio(out / f"{v}.wav", res.audio, pl.SR)
+            aligned = res.audio[delay:delay + len(audio)]
+            row = {"rtf": res.rtf, **pl.gate_summary(engine, res), **pl.declick_summary(engine),
+                   **pl.passthrough_summary(engine),
+                   **pl.sibilant_centroid(aligned)}
+            if args.quality:
+                kit = kit or _quality_kit(args, engine)
+                q = kit.score(aligned, pl.SR, reference_text=script)
+                row.update(wer=q.wer, utmos=q.utmos)
+            if proxy is not None:
+                rp = pl.render(engine, proxy)
+                proxy_gate = pl.gate_summary(engine, rp)
+                proxy_clicks = pl.declick_summary(engine)
+                rc = pl.render(engine, clean)
+                save_audio(out / f"{v}_proxy.wav", rp.audio, pl.SR)
+                save_audio(out / f"{v}_proxy_noclicks.wav", rc.audio, pl.SR)
+                row["proxy"] = {**pl.click_leaks(rp.audio, rc.audio, meta, delay,
+                                                 engine.plan.block, rp.gate_open),
+                                "gate": {k: proxy_gate[k] for k in
+                                         ("opens", "onset_verdicts", "onset_log")},
+                                "declick": proxy_clicks}
+        finally:
+            engine.graphs.release()
+        report["variants"][v] = row
+        brief = {k: row[k] for k in ("opens", "onset_verdicts", "clamps", "passthrough_share",
+                                      "sibilant_centroid_hz", "wer", "utmos") if k in row}
+        if "proxy" in row:
+            brief["leaks"] = {w: row["proxy"][w] for w in ("speech", "hangover", "pause")
+                              if w in row["proxy"]}
+            brief["mel_floor_p90"] = row["proxy"]["mel_floor"]["p90"]
+        print(f"[{v}] " + json.dumps(brief, default=float), flush=True)
+    pl.write_report(out / "report.json", report)
+    _record("paraling", {"take": str(take), "variants": {
+        v: {k: r[k] for k in ("opens", "clamps", "sibilant_centroid_hz") if k in r}
+        for v, r in report["variants"].items()}})
+    print(f"\nwavs and report.json in {out}")
+    return 0
+
+
 def cmd_formant(args) -> int:
     import formant_index as fi
     from vox.audio.resample import resample_array, save_audio
@@ -1942,7 +2026,7 @@ def main() -> int:
                                             "block", "decctx", "envelope", "gate",
                                             "graph-probe", "sing", "onset", "suppress",
                                             "underrun", "quality", "target-f0", "take",
-                                            "formant", "index", "drift"))
+                                            "formant", "index", "drift", "paraling"))
     parser.add_argument("--model", default="base_f0_48k_v2")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--audio", type=Path, default=DEFAULT_AUDIO)
@@ -2058,7 +2142,13 @@ def main() -> int:
                              "(default device: the Shure headphones; speakers would feed the "
                              "microphone)")
     parser.add_argument("--out-dir", type=Path, default=None,
-                        help="take: where the matrix folder goes (default recordings/matrix_*)")
+                        help="take: where the matrix folder goes (default recordings/matrix_*); "
+                             "paraling: where the wavs go (default out/ab/paraling/<take>)")
+    parser.add_argument("--preset", choices=("speak", "natural"), default="speak",
+                        help="paraling: the user's Speak chain, or Natural (auto pitch + "
+                             "held notes)")
+    parser.add_argument("--proxy-clicks", action="store_true",
+                        help="paraling: also score a keystroke proxy built from the take")
     args = parser.parse_args()
     if args.command in ("formant", "index", "drift"):
         if args.model == "base_f0_48k_v2":
@@ -2067,6 +2157,11 @@ def main() -> int:
                 args.pitch = 12.0  # the user's setting for Mom
         if args.seconds == 20.0:
             args.seconds = 45.0
+    if args.command == "paraling":
+        if args.model == "base_f0_48k_v2":
+            args.model = "Mom"  # the user's voice; the chain's pitch is +12 unless --pitch
+        if args.seconds == 20.0:
+            args.seconds = 0.0  # the whole take
     if args.command == "take" and args.monitor:
         args.output = args.monitor
     if args.command == "take" and args.hops == "60,20":
@@ -2084,7 +2179,7 @@ def main() -> int:
                "onset": cmd_onset, "suppress": cmd_suppress,
                "underrun": cmd_underrun, "quality": cmd_quality, "target-f0": cmd_target_f0,
                "take": cmd_take, "formant": cmd_formant, "index": cmd_index,
-               "drift": cmd_drift}[args.command]
+               "drift": cmd_drift, "paraling": cmd_paraling}[args.command]
     return handler(args)
 
 
