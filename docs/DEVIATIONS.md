@@ -1944,3 +1944,16 @@ trace, the bench's clamp and onset logs, the passthrough classifier replayed per
   that the sibilant rule blocks (67 frames); it passed 1.8 % of frames, 16 bursts and 23
   breath frames. So 15.6's `PASS_BURST_REACH` (30 ms) and the 4 kHz rule do not fit this
   user's kisses; nothing is changed before the ear.
+
+**What the user heard (2026-10-23, not blind).** `gate45/base.wav`: "the kisses sound still
+a bit empty but it's a better take definitely ... some do sound like muffled/soft kisses, it
+still lacks a bit of the smack power" ("a really good representation of kisses");
+`passthrough.wav`: "basically the same as the first take, even a bit worse". Where the smack
+goes (scratch `smack.py`; smack = first 40 ms of each of the take's 22 sounds, re the 300 ms
+after it): on the loud kisses (0-6 s) the raw and conditioned mic agree within 1 dB and the
+render loses 2-17 dB (the model); on the quiet ones (7-19 s) RNNoise (mix 0.85) already
+takes 3-16 dB off the smack, and at 9.8, 11.3, 12.9, 14.3 and 18.1 s the gate at -45 is
+still closed when the smack happens. Offline prototype for the ear (not the engine):
+`gate45/smack_raw50.wav` / `smack_raw100.wav` = the -45 render plus the raw, high-passed,
+gain-matched mic over the first 60 ms of every sound at 0.5 / 1.0 (where the gate was closed
+this adds the smack into silence, which the engine's passthrough could not do).
