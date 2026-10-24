@@ -1957,3 +1957,9 @@ still closed when the smack happens. Offline prototype for the ear (not the engi
 `gate45/smack_raw50.wav` / `smack_raw100.wav` = the -45 render plus the raw, high-passed,
 gain-matched mic over the first 60 ms of every sound at 0.5 / 1.0 (where the gate was closed
 this adds the smack into silence, which the engine's passthrough could not do).
+The prototypes, by ear: `smack_raw50` "voids the kiss entirely"; `smack_raw100` "has
+passthrough of my original voice before each kiss": **both worse than `gate45/base.wav`**.
+Mixing the raw mic back in is rejected for kisses (the 60 ms window also carried the start
+of the user's own "m"); the best kiss render so far is the plain gate at -45 dBFS, a GUI
+threshold, not a code default. The remaining loss is the model's (a smack is shorter than a
+ContentVec frame, 19 §3.2): the retraining route (19 §4 item 12), not a host-side mix.
