@@ -1963,3 +1963,22 @@ Mixing the raw mic back in is rejected for kisses (the 60 ms window also carried
 of the user's own "m"); the best kiss render so far is the plain gate at -45 dBFS, a GUI
 threshold, not a code default. The remaining loss is the model's (a smack is shorter than a
 ContentVec frame, 19 §3.2): the retraining route (19 §4 item 12), not a host-side mix.
+
+**Settings A/B on the kiss take (no code change).** All at gate -45, scratch
+`kiss_measure.py` (smack = first 40 ms of each of the 22 sounds re the next 300 ms, lost =
+raw minus render; gap = render level between sounds), wavs in
+`out/ab/paraling/take_20261023_215202_mic_raw/kiss/`:
+
+| render | smacks rendered | smack lost dB (median) | gap dBFS |
+|---|---|---|---|
+| gate -37 (live) | 14 / 22 | 5.3 | -62.0 |
+| gate -45 | 17 / 22 | 5.8 | -60.4 |
+| + `volume_envelope` 0.5 / 0.25 | 17 / 22 | 2.9 / 2.1 | -64.0 / -65.3 |
+| + RNNoise off / mix 0.5 | 22 / 22 | -2.4 / 3.9 | -30.7 / -40.0 |
+| + `onset_confirm_ms` 30, `onset_margin_db` 0 | 19 / 22 | 5.6 | -43.4 |
+| combo: envelope 0.5, RNNoise 0.5, confirm + margin 0 | 22 / 22 | 2.4 | -52.5 |
+| **combo25**: the same with envelope 0.25 | **22 / 22** | **1.4** | -56.6 |
+
+The model's own smack, made to follow the mic's loudness (the RMS mix of `postchain.py`),
+carries most of it back without mixing any mic; RNNoise at 0.5 and the smack-onset gate
+bring back the quiet ones. Awaiting the ear; `volume_envelope` also changes speech loudness.
