@@ -4,6 +4,10 @@ once per paralinguistics flag, so a new recording plugs straight in.
     vox bench paraling --audio TAKE.wav [--variants base,declick,...] [--preset natural]
                        [--proxy-clicks] [--quality] [--out-dir DIR]
 
+A take from the GUI's Record button (``take_X_mic_raw.wav``) is rendered with the chain in
+its ``take_X.json`` (model, params, shape, gate, conditioning: what was live), else with
+the chain below.
+
 Variants (docs/DEVIATIONS.md §15; every flag is off in the code defaults):
 
     base         the user's chain as the GUI runs it (hop 80, extra 2400, right 40, gate
@@ -54,10 +58,37 @@ VARIANTS: dict[str, dict[str, dict]] = {
 # ------------------------------------------------------------------------- the engine
 
 
+def take_json(audio_path: Path) -> Path | None:
+    """The GUI's Record button writes ``take_X.json`` next to ``take_X_mic_raw.wav``."""
+    p = Path(audio_path)
+    for suffix in ("_mic_raw", "_mic_conditioned", "_output"):
+        if p.stem.endswith(suffix):
+            j = p.with_name(p.stem[:-len(suffix)] + ".json")
+            return j if j.exists() else None
+    return None
+
+
+def chain_from_take(path: Path) -> tuple[str, dict[str, dict]]:
+    """(model, the chain that was live) from a take's JSON: its params, shape, gate and
+    input conditioning, keeping only fields this code knows."""
+    from vox.audio.conditioning import ConditioningConfig
+    from vox.config.schemas import RuntimeParams, ShapeParams
+    from vox.engine.gate import GateConfig
+
+    j = json.loads(Path(path).read_text(encoding="utf-8"))
+    keep = lambda d, cls: {k: v for k, v in (d or {}).items()  # noqa: E731
+                           if k in {f.name for f in dataclasses.fields(cls)}}
+    return j.get("model", "Mom"), {"params": keep(j.get("params"), RuntimeParams),
+                                   "shape": keep(j.get("shape"), ShapeParams),
+                                   "gate": keep(j.get("gate"), GateConfig),
+                                   "cond": keep(j.get("conditioning"), ConditioningConfig)}
+
+
 def load_variant(variant: str, models_dir: Path, profile_dir: Path, model: str = "Mom",
-                 preset: str = "speak", extra: dict[str, dict] | None = None):
-    """The user's chain plus one variant's flags (plus ``extra`` overrides by owner:
-    shape / params / gate / cond)."""
+                 preset: str = "speak", extra: dict[str, dict] | None = None,
+                 base: dict[str, dict] | None = None):
+    """The user's chain (or ``base``, e.g. ``chain_from_take``) plus one variant's flags
+    (plus ``extra`` overrides by owner: shape / params / gate / cond)."""
     from vox.audio.conditioning import ConditioningConfig
     from vox.config import defaults
     from vox.config.schemas import RuntimeParams
@@ -66,12 +97,13 @@ def load_variant(variant: str, models_dir: Path, profile_dir: Path, model: str =
 
     v = VARIANTS[variant]
     extra = extra or {}
-    pick = lambda owner, base: {**base, **v.get(owner, {}), **extra.get(owner, {})}  # noqa
-    params = RuntimeParams(**pick("params", NATURAL_PARAMS if preset == "natural"
-                                  else USER_PARAMS))
-    shape = dataclasses.replace(defaults.DEFAULT_SHAPE, **pick("shape", USER_SHAPE))
-    gate = GateConfig(**pick("gate", USER_GATE))
-    cond = ConditioningConfig(**pick("cond", USER_COND))
+    chain = base or {"params": NATURAL_PARAMS if preset == "natural" else USER_PARAMS,
+                     "shape": USER_SHAPE, "gate": USER_GATE, "cond": USER_COND}
+    pick = lambda owner: {**chain[owner], **v.get(owner, {}), **extra.get(owner, {})}  # noqa
+    params = RuntimeParams(**pick("params"))
+    shape = dataclasses.replace(defaults.DEFAULT_SHAPE, **pick("shape"))
+    gate = GateConfig(**pick("gate"))
+    cond = ConditioningConfig(**pick("cond"))
     return load_engine(models_dir, model, shape, params, gate=gate, conditioning=cond,
                        profile_dir=profile_dir, log=lambda *a: None)
 
@@ -103,7 +135,9 @@ def gate_summary(engine, result) -> dict:
         verdicts[e["verdict"]] = verdicts.get(e["verdict"], 0) + 1
     return {"opens": len(opens), "closes": sum(e["kind"] == "gate_close" for e in result.events),
             "open_share": float(result.gate_open.mean()) if result.gate_open is not None else 1.0,
-            "onset_verdicts": verdicts, "onset_log": log}
+            "onset_verdicts": verdicts, "onset_log": log,
+            "gate_open_per_hop": "".join("1" if g else "0" for g in result.gate_open)
+            if result.gate_open is not None else None}
 
 
 def passthrough_summary(engine) -> dict:

@@ -1449,6 +1449,11 @@ def cmd_paraling(args) -> int:
              "cond": o["conditioning"]}
     if args.pitch != 0.0:
         extra["params"]["f0_up_key"] = args.pitch
+    base, model = None, args.model
+    live = pl.take_json(take)
+    if live is not None:
+        model, base = pl.chain_from_take(live)
+        print(f"chain from {live} (model {model})")
     save_audio(out / "input.wav", audio, pl.SR)
     proxy = None
     if args.proxy_clicks:
@@ -1457,12 +1462,14 @@ def cmd_paraling(args) -> int:
         save_audio(out / "proxy_input_noclicks.wav", clean, pl.SR)
         pl.write_report(out / "proxy_events.json", meta)
     script = _script_text(args) if args.quality else None
-    report = {"take": str(take), "model": args.model, "preset": args.preset,
+    report = {"take": str(take), "model": model, "preset": args.preset,
+              "chain": str(live) if live else "user chain (paraling.USER_*)",
               "overrides": extra, "variants": {}}
     kit = None
     for v in variants:
         print(f"[{v}] loading...", flush=True)
-        engine = pl.load_variant(v, args.models_dir, args.profile, args.model, args.preset, extra)
+        engine = pl.load_variant(v, args.models_dir, args.profile, model, args.preset, extra,
+                                 base)
         try:
             delay = pl.output_delay(engine)
             res = pl.render(engine, audio)

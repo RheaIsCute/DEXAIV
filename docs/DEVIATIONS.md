@@ -1919,3 +1919,28 @@ the desktop had OBS, browsers and Broadcast running).
 passthrough are flags (`--declick`, `--onset-confirm-ms 30`, `--laugh-guard`,
 `--passthrough` on `vox run`; `--set` / variants on `vox bench paraling`) until the takes in
 15.6 decide them.
+
+### 15.9 The first real take: kisses (2026-10-23, `recordings/take_20261023_215202`, 21.5 s)
+
+Recorded live in the GUI with what it then ran (its JSON): Mom, Natural (auto pitch,
+target 210 Hz, range 0.75, held notes), gate **-37 dBFS**, trim -3 dB, RNNoise mix 0.85,
+protect 0.3, formant 0, hop 80; every report 19 flag off. `vox bench paraling` now reads a
+take's JSON and renders with exactly that chain; its gate matches the live one on 97.8 % of
+hops. Renders: `out/ab/paraling/take_20261023_215202_mic_raw/` (`gate45/`: the same at -45
+dBFS). Per event (scratch `kiss_report.py`: RMVPE on the live conditioned mic, the live gate
+trace, the bench's clamp and onset logs, the passthrough classifier replayed per frame):
+
+- **The gate is what loses the kisses.** From 7 s on (the quieter ones, raw peak -38..-43
+  dBFS) the gate is open for 0-60 % of each kiss and opens late: the first rendered input
+  is **120-190 ms after the kiss starts** (one at 18.1 s never opens), so the lip smack,
+  the front of the kiss, is not rendered; only the vowel after it. At -45 dBFS: first
+  rendered input -90..+80 ms on 6 of 8 kisses (the one at 18.1 s now renders), 150-190 ms
+  on the other 2; overall open share 0.59 -> 0.68.
+- **Probation does not hurt kisses:** every energy-only kiss onset it judged was "held" (one
+  by the VAD rule), none rejected; opens unchanged (10).
+- **The de-clicker barely touches them:** 5 clamps inside kisses, -1..-5 dB (15 in the take).
+- **Passthrough cannot fire on them:** RMVPE calls most of a "mwa" voiced (0.4-1.0 of its
+  frames), and the smack noise itself is a 100-200 ms high-centroid hiss (5.3-6.6 kHz)
+  that the sibilant rule blocks (67 frames); it passed 1.8 % of frames, 16 bursts and 23
+  breath frames. So 15.6's `PASS_BURST_REACH` (30 ms) and the 4 kHz rule do not fit this
+  user's kisses; nothing is changed before the ear.
