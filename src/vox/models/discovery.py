@@ -62,7 +62,8 @@ def import_model(pth: Path, models_dir: Path, name: str | None = None,
     """Copy a dropped ``.pth`` (and a paired ``.index``) into the layout. Returns the dir."""
     pth = Path(pth)
     meta = inspect_pth(pth)  # raises MetadataError before anything is copied
-    name = name or re.sub(r"[^A-Za-z0-9_.-]+", "_", pth.stem)
+    # a given name (a dropped folder's, or typed) is made folder-safe the same way
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or pth.stem).strip()) or "voice"
     target = Path(models_dir) / name
     if (target / MODEL_FILE).exists():
         raise FileExistsError(f"model {name!r} already exists in {models_dir}")

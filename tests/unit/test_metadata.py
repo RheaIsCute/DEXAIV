@@ -187,3 +187,15 @@ def test_import_rejects_before_copying(tmp_path):
     with pytest.raises(MetadataError):
         discovery.import_model(bad, tmp_path / "models")
     assert not (tmp_path / "models").exists()
+
+
+def test_import_names_a_generic_pth_after_the_given_folder_name(tmp_path):
+    """Training exports are often just ``model.pth``: the GUI passes the dropped folder's
+    name (or a typed one), made folder-safe like a filename."""
+    drop = tmp_path / "Gothmommy female"
+    drop.mkdir()
+    torch.save(checkpoint(version="v2", info="e300"), drop / "model.pth")
+    models = tmp_path / "models"
+    target = discovery.import_model(drop / "model.pth", models, "Gothmommy female")
+    assert target.name == "Gothmommy_female"
+    assert discovery.scan(models) == ["Gothmommy_female"]

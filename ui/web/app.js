@@ -426,7 +426,20 @@ function renderModels() {
     + Math.round(total) + " MB on disk · " + folder + "\\";
 }
 
-async function importFiles(files) {
+// A .pth named like this says nothing about the voice (training exports are often just
+// "model.pth"): the folder it came in names it, else the user does.
+const GENERIC_PTH = /^(model|g_\d+|g|weights?|voice|checkpoint)$/i;
+
+function voiceName(pth, folder) {
+  const stem = pth.name.replace(/\.pth$/i, "");
+  if (folder) return folder;
+  if (!GENERIC_PTH.test(stem)) return null; // the server names it after the file
+  let answer = null;
+  try { answer = window.prompt("\"" + pth.name + "\" doesn't say which voice it is. Name it:", ""); } catch (_) { answer = null; }
+  return answer && answer.trim() ? answer.trim() : undefined; // undefined: cancelled
+}
+
+async function importFiles(files, folder = null) {
   const list = [...files];
   const pths = list.filter((f) => f.name.toLowerCase().endsWith(".pth"));
   const indexes = list.filter((f) => f.name.toLowerCase().endsWith(".index"));
@@ -437,18 +450,54 @@ async function importFiles(files) {
     for (const pth of pths) {
       // An index dropped with exactly one .pth belongs to it.
       const index = pths.length === 1 && indexes.length === 1 ? indexes[0] : null;
-      $("dropzone-text").textContent = "Copying " + pth.name + (index ? " + " + index.name : "") + "…";
+      const name = voiceName(pth, pths.length === 1 ? folder : null);
+      if (name === undefined) { toast("Import of " + pth.name + " cancelled", "warn"); continue; }
+      $("dropzone-text").textContent = "Copying " + (name || pth.name) + (index ? " + " + index.name : "") + "…";
       const sent = await upload(pth);
       const sentIndex = index ? await upload(index) : null;
-      await cmd("import_model", { pth: sent, index: sentIndex });
+      await cmd("import_model", { pth: sent, index: sentIndex, name });
     }
     if (indexes.length && pths.length !== 1) toast("Indexes are paired only when dropped with exactly one .pth", "warn");
   } catch (err) {
     toast("Import failed: " + err.message, "error");
   } finally {
     zone.classList.remove("busy");
-    $("dropzone-text").innerHTML = "Drop a <b>.pth</b> — or <b>.pth + .index together</b> and they import as one voice";
+    $("dropzone-text").innerHTML = "Drop a voice's <b>folder</b>, a <b>.pth</b>, or <b>.pth + .index together</b>";
   }
+}
+
+// A dropped folder: its .pth / .index files, named after the folder. Entries must be taken
+// from the DataTransfer synchronously, inside the drop event; reading them can wait.
+function dropEntries(dt) {
+  return [...(dt.items || [])].map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null)).filter(Boolean);
+}
+
+function entryFile(entry) {
+  return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+
+async function folderFiles(dir) {
+  const reader = dir.createReader();
+  const all = [];
+  for (;;) { // readEntries returns the listing in batches until an empty one
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (!batch.length) break;
+    all.push(...batch);
+  }
+  const wanted = all.filter((e) => e.isFile && /\.(pth|index)$/i.test(e.name));
+  return Promise.all(wanted.map(entryFile));
+}
+
+async function importDrop(entries, files) {
+  const dirs = entries.filter((e) => e.isDirectory);
+  if (!dirs.length) { await importFiles(files); return; }
+  for (const dir of dirs) {
+    const inside = await folderFiles(dir);
+    if (!inside.some((f) => /\.pth$/i.test(f.name))) { toast(dir.name + ": no .pth inside", "error"); continue; }
+    await importFiles(inside, dir.name);
+  }
+  const loose = [...files].filter((f) => /\.(pth|index)$/i.test(f.name));
+  if (loose.length) await importFiles(loose);
 }
 
 // performance ------------------------------------------------------------------
@@ -702,7 +751,7 @@ function wire() {
     depth = 0;
     $("drop-veil").hidden = true;
     location.hash = "#models";
-    importFiles(e.dataTransfer.files);
+    importDrop(dropEntries(e.dataTransfer), [...e.dataTransfer.files]);
   });
 }
 
